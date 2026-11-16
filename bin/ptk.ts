@@ -54,8 +54,9 @@ function doctor(strict: boolean): number {
   const shadow = existsSync(userAgents) ? readdirSync(userAgents).filter((f) => ["worker.md", "reviewer.md", "scout.md"].includes(f)) : [];
   line(shadow.length ? "warn" : true, "built-in subagents not shadowed", shadow.length ? `${userAgents}: ${shadow.join(", ")} override pi-subagents built-ins` : "");
   const p = probe();
-  line(Boolean(which(p, "rg")), "ripgrep (rg)", which(p, "rg") ?? "run skills/fast-search/scripts/ensure-rg-fd.sh");
-  line(Boolean(which(p, "fd") || which(p, "fdfind")), "fd", which(p, "fd") ?? which(p, "fdfind") ?? "run skills/fast-search/scripts/ensure-rg-fd.sh");
+  const ensure = `pi downloads it on first use; to install now: bash ${join(ROOT, "skills", "fast-search", "scripts", "ensure-rg-fd.sh")}`;
+  line(which(p, "rg") ? true : "warn", "ripgrep (rg)", which(p, "rg") ?? ensure);
+  line(which(p, "fd") || which(p, "fdfind") ? true : "warn", "fd", which(p, "fd") ?? which(p, "fdfind") ?? ensure);
   const browser = spawnSync(process.execPath, ["-e", `import(${JSON.stringify(join(ROOT, "toolbox", "_lib", "browser.mjs"))}).then(m=>{const b=m.findBrowser();console.log(b?b.path:"")})`], { encoding: "utf8" });
   const b = browser.stdout.trim();
   line(b ? true : "warn", "browser for md2pdf/shot", b || "none found (only needed for md2pdf/shot)");
