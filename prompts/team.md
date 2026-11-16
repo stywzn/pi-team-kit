@@ -1,5 +1,5 @@
 ---
-description: Team run: split a goal into conflict-free tasks, run up to 4 workers in parallel with verification and rework
+description: "Team run - split a goal into conflict-free tasks, run up to 4 workers in parallel with verification and rework"
 ---
 Act as the team lead for this goal:
 
