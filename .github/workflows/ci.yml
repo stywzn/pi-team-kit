@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+      - name: toolbox smoke test
+        run: |
+          printf '# hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n' > /tmp/t.md
+          node bin/ptk.ts run md2pdf /tmp/t.md /tmp/t.html --html-only
+          grep -q '<table>' /tmp/t.html
+          node bin/ptk.ts run bg start srv --wait-for :18799 --timeout 20 -- python3 -m http.server 18799
+          node bin/ptk.ts run bg stop srv
+      - run: node bin/ptk.ts doctor

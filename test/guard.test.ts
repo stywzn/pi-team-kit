@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, unsafeRegex, type GuardOptions } from "../lib/guard.ts";
+import { splitSegments } from "../lib/shell.ts";
+
+const base: GuardOptions = {
+  blockLongRunners: true,
+  preferFastSearch: "block",
+  sudoNonInteractive: true,
+  hasRg: true,
+  hasFd: true,
+  builtinSearch: { grep: false, find: false },
+  pitfalls: [],
+  cwd: "/home/u/repo",
+};
+
+const blocked = (cmd: string, opts: Partial<GuardOptions> = {}) => inspectBash(cmd, { ...base, ...opts }).kind === "block";
+
+test("shell splitting honours quotes, redirections and background", () => {
+  const segs = splitSegments(`echo "a && b" && npm test 2>&1 | tee log; sleep 5 & echo done # comment && x`);
+  assert.deepEqual(segs.map((s) => s.text), ['echo "a && b"', "npm test 2>&1", "tee log", "sleep 5", "echo done"]);
+  assert.equal(segs[3].background, true);
+  assert.deepEqual(segs[0].argv, ["echo", "a && b"]);
+});
+
+test("here-document bodies are data, not commands", () => {
+  const cmd = "cat > run.sh <<'EOF'\nnpm run dev\ntail -f log\nEOF\nchmod +x run.sh && echo ok";
+  assert.deepEqual(splitSegments(cmd).map((s) => s.text), ["cat > run.sh <<'EOF'", "chmod +x run.sh", "echo ok"]);
+  assert.ok(!blocked(cmd));
+  assert.ok(blocked("cat <<-END > x\n\tnpm run dev\n\tEND\nnpm run dev"), "commands after the body still count");
+  assert.ok(!blocked("python3 - <<EOF\nimport http.server\nEOF"));
+});
+
+test("servers, watchers, followers, REPLs and TUIs are blocked", () => {
+  for (const cmd of [
+    "npm run dev",
+    "pnpm dev",
+    "yarn start",
+    "cd web && npm run serve",
+    "npx vite",
+    "npx -y next dev",
+    "vite --port 3000",
+    "nodemon server.js",
+    "tsc --watch",
+    "jest --watchAll",
+    "tail -f /var/log/syslog",
+    "docker compose up",
+    "docker-compose up web",
+    "docker run -it ubuntu bash",
+    "kubectl logs -f pod/x",
+    "python -m http.server 8000",
+    "python3 manage.py runserver",
+    "uvicorn app:app --reload",
+    "flask run",
+    "python",
+    "node",
+    "psql -h localhost mydb",
+    "ssh build-box",
+    "vim README.md",
+    "less log.txt",
+    "watch -n1 ls",
+    "FOO=1 sudo npm run dev",
+  ])
+    assert.ok(blocked(cmd), `expected block: ${cmd}`);
+});
+
+test("bounded, detached or one-shot commands are allowed", () => {
+  for (const cmd of [
+    "npm test",
+    "npm run build",
+    "npm run dev &",
+    "nohup npm run dev > dev.log 2>&1 &",
+    "timeout 20 npm run dev",
+    "vite build",
+    "npx vitest run",
+    "docker compose up -d",
+    "docker run --rm alpine echo hi",
+    "tail -n 50 app.log",
+    "python script.py",
+    "python -c 'print(1)'",
+    "node build.js",
+    "psql -c 'select 1' mydb",
+    "sqlite3 db.sqlite 'select 1'",
+    "ssh build-box uptime",
+    "uvicorn --help",
+    "git log --oneline -5",
+  ])
+    assert.ok(!blocked(cmd), `expected allow: ${cmd}`);
+});
+
+test("recursive grep / simple find suggest rg and fd", () => {
+  assert.ok(blocked("grep -rn TODO ."));
+  assert.ok(blocked("grep -R --include=*.ts foo src"));
+  assert.ok(blocked("find . -name '*.md'"));
+  assert.ok(blocked("find src -type f -iname '*.py' -not -path '*/node_modules/*'"));
+  assert.ok(blocked("ls -R src"));
+  assert.ok(!blocked("grep foo file.txt"));
+  assert.ok(!blocked("git diff | grep -n foo"));
+  assert.ok(!blocked("find . -mtime -1 -name '*.log'"), "complex find stays allowed");
+  assert.ok(!blocked("find . -name '*.tmp' -delete"));
+  assert.ok(!blocked("grep -rn TODO .", { hasRg: false }), "no rg, no nagging");
+  const warn = inspectBash("grep -rn TODO .", { ...base, preferFastSearch: "warn" });
+  assert.equal(warn.kind, "allow");
+  assert.match(warn.kind === "allow" ? warn.notes[0] : "", /rg -n/);
+  const reason = inspectBash("grep -rn TODO .", { ...base, builtinSearch: { grep: true, find: true } });
+  assert.match(reason.kind === "block" ? reason.reason : "", /built-in `grep` tool/);
+});
+
+test("sudo becomes sudo -n, other sudo flags untouched", () => {
+  const d = inspectBash("sudo apt-get install -y jq && echo ok", base);
+  assert.equal(d.kind, "allow");
+  assert.equal(d.kind === "allow" && d.command, "sudo -n apt-get install -y jq && echo ok");
+  const same = inspectBash("sudo -n true; echo pseudo", base);
+  assert.equal(same.kind === "allow" && same.command, "sudo -n true; echo pseudo");
+});
+
+test("wrapper options with values are skipped correctly; sudo after env assignments still gets -n", () => {
+  assert.ok(blocked("sudo -u www-data npm run dev"));
+  assert.ok(blocked("env -C web npm run dev"));
+  assert.ok(blocked("nice -n 10 tail -f app.log"));
+  const d = inspectBash("DEBIAN_FRONTEND=noninteractive sudo apt-get install -y jq", base);
+  assert.equal(d.kind === "allow" && d.command, "DEBIAN_FRONTEND=noninteractive sudo -n apt-get install -y jq");
+});
+
+test("pitfall regexes prone to catastrophic backtracking are ignored", () => {
+  assert.ok(unsafeRegex("(a+)+$"));
+  assert.ok(unsafeRegex("(x*y*)*"));
+  assert.ok(!unsafeRegex("npm (i|install)\\b"));
+  const evil = [{ id: "evil", match: "(a+)+$", action: "block" as const, message: "x" }];
+  assert.ok(!blocked("a".repeat(40) + "!", { pitfalls: evil }));
+});
+
+test("pitfalls warn or block, optionally only in matching directories", () => {
+  const pitfalls = [
+    { id: "mnt-install", match: "npm (i|install)\\b", when: "^/mnt/", action: "warn" as const, message: "slow on /mnt" },
+    { id: "prod-db", match: "psql .*prod", action: "block" as const, message: "never touch prod" },
+  ];
+  assert.ok(blocked("psql -h prod-db -c 'select 1'", { pitfalls }));
+  const atMnt = inspectBash("npm install", { ...base, pitfalls, cwd: "/mnt/c/work" });
+  assert.equal(atMnt.kind === "allow" && atMnt.notes.length, 1);
+  const atHome = inspectBash("npm install", { ...base, pitfalls });
+  assert.equal(atHome.kind === "allow" && atHome.notes.length, 0);
+});
+
+test("timeouts: default filled in, ceiling enforced", () => {
+  assert.deepEqual(resolveTimeout(undefined, 180, 1200), { timeout: 180, capped: false });
+  assert.deepEqual(resolveTimeout(600, 180, 1200), { timeout: 600, capped: false });
+  assert.deepEqual(resolveTimeout(3600, 180, 1200), { timeout: 1200, capped: true });
+  assert.deepEqual(resolveTimeout(-1, 180, 1200), { timeout: 180, capped: false });
+  assert.ok(looksLikeTimeout("Error: timeout:180"));
+  assert.ok(looksLikeTimeout("Command timed out after 180 seconds"));
+  assert.ok(!looksLikeTimeout("all tests passed"));
+});
+
+test("longRunnerReason explains itself", () => {
+  const [seg] = splitSegments("npm run dev");
+  assert.match(longRunnerReason(seg) ?? "", /server or watcher/);
+});

@@ -1,0 +1,6 @@
+{
+  "name": "shot",
+  "description": "Screenshot a URL or a local HTML file to PNG with headless Chrome/Edge (show a UI change, capture a report).",
+  "usage": "shot <url|file.html> [output.png] [--width 1280] [--height 800]",
+  "run": ["node", "run.mjs"]
+}

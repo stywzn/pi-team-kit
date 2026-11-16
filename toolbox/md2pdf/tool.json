@@ -1,0 +1,6 @@
+{
+  "name": "md2pdf",
+  "description": "Convert Markdown or HTML to a clean PDF (GitHub-like style, Chinese fonts, local images inlined) using headless Chrome/Edge.",
+  "usage": "md2pdf <input.md|input.html> [output.pdf] [--css extra.css] [--html-only]",
+  "run": ["node", "run.mjs"]
+}

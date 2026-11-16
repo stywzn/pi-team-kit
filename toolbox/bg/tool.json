@@ -1,0 +1,6 @@
+{
+  "name": "bg",
+  "description": "Run servers, watchers and other never-ending commands in the background without blocking: start, wait until ready (log regex, :port or URL), read logs, stop.",
+  "usage": "bg start <name> [--cwd dir] [--wait-for <regex|:port|url>] [--timeout 60] -- <command...> | bg logs <name> | bg stop <name> | bg list",
+  "run": ["node", "run.mjs"]
+}
