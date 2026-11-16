@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] - 2026-11-17
+
+- `/team` prompt template: quoted the description so its YAML frontmatter parses without a warning.
+- `ptk doctor`: missing rg/fd on a fresh install is a warning with the install command, not a failure (pi downloads them on first use).
+
 ## [0.1.0] - 2026-11-17
 
 First release.
