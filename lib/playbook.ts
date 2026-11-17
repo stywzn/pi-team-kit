@@ -46,7 +46,8 @@ const SECRETS: [string, RegExp][] = [
   ["GitHub token", /\bgh[pousr]_[A-Za-z0-9]{20,}/],
   ["AWS key", /\bAKIA[0-9A-Z]{16}\b/],
   ["Slack token", /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
-  ["password or token", /\b(?:password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*["']?(?![$<{%])[^\s"'<>]{6,}/i],
+  // also DB_PASSWORD=, OPENAI_API_KEY=, JWT_SECRET= (a word boundary does not fall after "_")
+  ["password or token", /(?<![A-Za-z0-9])[A-Za-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key)[A-Za-z0-9_]*\s*[:=]\s*["']?(?![$<{%])[^\s"'<>]{6,}/i],
   ["credentials in a URL", /:\/\/[^\s/:@]+:[^\s/@]+@/],
 ];
 

@@ -105,9 +105,9 @@ export interface PtkConfig {
     /** Each lane's gate runs only the test files the lane owns, when the gate is a test command and the lane owns
      *  test files; the full gate still runs once on the combined code (team_integrate). */
     laneTests: boolean;
-    /** Untracked files and folders of the repo (virtualenvs, .env, node_modules) linked into each worker's worktree,
-     *  so workers neither reinstall dependencies nor fail on missing local config. [] = off. Uses pi-subagents'
-     *  worktreeSetupHook, which pi-team-kit sets once when it is not set (it never replaces your own hook). */
+    /** Paths of the main checkout that git ignores, made available in each worker's worktree when the worker's
+     *  session starts: a virtualenv is activated, small files (.env) are copied, folders are symlinked (not on
+     *  Windows). Workers then neither reinstall dependencies nor fail on missing local config. [] = off. */
     linkIntoWorktrees: string[];
   };
   /** Lead sessions on this machine see each other's status and tell each other what they changed (the leads tool, /leads). */

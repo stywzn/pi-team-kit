@@ -64,7 +64,7 @@ cd ~/code/ptk-demo && pi
 { "team": { "models": { "planner": "deepseek/deepseek-flash", "worker": "deepseek/deepseek-flash", "verifier": "deepseek/deepseek-flash" } } }
 ```
 
-思考强度默认：拆任务、审查 `max`，worker `high`。临时改直接跟主会话说（"这次 worker 用 medium"），或者 `/team-thinking worker=medium`，`/team-thinking reset` 恢复；只对当前会话有效，不改全局。想改默认值再写 `team.thinking`。可选 off、minimal、low、medium、high、xhigh、max，模型不支持的档位 pi 会自动降。主会话自己的思考强度用 pi 的 `/thinking`。
+思考强度默认：拆任务、审查 `max`，worker `high`。临时改直接跟主会话说（"这次 worker 用 medium"），或者 `/team-thinking worker=medium`，`/team-thinking reset` 恢复；只对当前会话有效，不改全局。想改默认值再写 `team.thinking`。可选 off、minimal、low、medium、high、xhigh、max，模型不支持的档位 pi 会自动降。思考强度是挂在模型名后面传的：某个角色没在 `team.models` 里配模型时，调它的强度会让它用主会话的模型（确认框里能看到每个角色实际用的模型），所以建议像上面那样把三个角色的模型都写上。主会话自己的思考强度用 pi 的 `/thinking`。
 
 ### 让 team 跑得更快的几件事（默认都开着）
 

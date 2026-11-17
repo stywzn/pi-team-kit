@@ -5,7 +5,41 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
-import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, prepareWorktree } from "../lib/worktree.ts";
+import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
+
+test("worktrees named by another allocator (Worktrunk) are prepared too; a named pipe is never copied", (t) => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "ptk-wt2-")));
+  const main = join(root, "app");
+  mkdirSync(main);
+  writeFileSync(join(main, ".gitignore"), ".env\n");
+  writeFileSync(join(main, "a.txt"), "a\n");
+  git(root, "init", "-q", "-b", "main", main);
+  git(main, "add", "-A");
+  git(main, "commit", "-q", "-m", "init");
+  const wt = join(root, "app.feature-login");
+  git(main, "worktree", "add", "-q", "-b", "feature-login", wt);
+  assert.equal(isWorkerWorktree(wt), true, "any linked worktree, whatever its name");
+  if (process.platform === "win32") return t.diagnostic("named pipe check skipped on Windows");
+  assert.equal(spawnSync("mkfifo", [join(main, ".env")]).status, 0);
+  const ignored = (rel: string) => spawnSync("git", ["-C", wt, "check-ignore", "-q", "--", rel]).status === 0;
+  const started = Date.now();
+  const prep = prepareWorktree(main, wt, [".env"], ignored, "linux");
+  assert.ok(Date.now() - started < 2000, "did not block on the pipe");
+  assert.deepEqual(prep.skipped, [".env: not a regular file"]);
+  assert.equal(existsSync(join(wt, ".env")), false);
+});
+
+test("the worker's own code comes first on PYTHONPATH, ahead of an editable install of the main checkout", () => {
+  const wt = mkdtempSync(join(tmpdir(), "ptk-src-"));
+  mkdirSync(join(wt, "src"));
+  const env: NodeJS.ProcessEnv = { PYTHONPATH: ["/opt/lib", join(wt, "src")].join(delimiter) };
+  preferWorktreeCode(wt, env);
+  assert.deepEqual(env.PYTHONPATH?.split(delimiter), [join(wt, "src"), wt, "/opt/lib"]);
+  const flat = mkdtempSync(join(tmpdir(), "ptk-flat-"));
+  const env2: NodeJS.ProcessEnv = {};
+  preferWorktreeCode(flat, env2);
+  assert.equal(env2.PYTHONPATH, flat, "no src/: just the worktree");
+});
 
 const git = (cwd: string, ...args: string[]) => {
   const r = spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@localhost", ...args], { cwd, encoding: "utf8" });
@@ -37,7 +71,9 @@ test("a pi-subagents worktree gets the virtualenv activated, ignored files copie
   assert.equal(isWorkerWorktree(wt), true);
   assert.equal(isWorkerWorktree(main), false, "the main checkout is no worker worktree");
   const ignored = (rel: string) => spawnSync("git", ["-C", wt, "check-ignore", "-q", "--", rel]).status === 0;
-  const prep = prepareWorktree(main, wt, [".venv", ".env", "node_modules", "build", "notes.txt", "../escape", "missing.cfg"], ignored, "linux");
+  const prep = prepareWorktree(main, wt, [".venv", ".env", "node_modules", "build", "notes.txt", "../escape", "C:evil", ".env:stream", "missing.cfg"], ignored, "linux");
+  assert.ok(prep.skipped.some((s) => s.startsWith("C:evil: must be a path inside the repo")), "a drive-relative name is refused");
+  assert.ok(prep.skipped.some((s) => s.startsWith(".env:stream: must be a path inside the repo")), "an NTFS stream name is refused");
   assert.equal(prep.venv, join(main, ".venv"), "the virtualenv is activated, not copied");
   assert.equal(existsSync(join(wt, ".venv")), false);
   assert.deepEqual(prep.copied, [".env"]);

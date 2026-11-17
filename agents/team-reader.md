@@ -29,4 +29,4 @@ What you looked for and could not find, or what contradicts itself.
 ## Sources
 Every file you relied on, one path per line (relative to the repository root when inside one). Nothing else in this section.
 
-Rules: report only what you read. No advice the material does not support, nothing generic, no file contents beyond short quotes.
+Rules: report only what you read. No advice the material does not support, nothing generic, no file contents beyond short quotes. Never open .env files or anything holding credentials, and never copy a password, token or key: name the variable instead.

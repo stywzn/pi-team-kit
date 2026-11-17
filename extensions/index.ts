@@ -20,7 +20,7 @@ import { Type } from "typebox";
 import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions, sessionEvidence } from "../lib/harvest.ts";
 import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
-import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, prepareWorktree } from "../lib/worktree.ts";
+import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import {
   appendRetired,
@@ -286,7 +286,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const ignored = (rel: string) => spawnSync("git", ["-C", ctx.cwd, "check-ignore", "-q", "--", rel], { stdio: "ignore", windowsHide: true, timeout: 10_000 }).status === 0;
     try {
       const prep = prepareWorktree(main, ctx.cwd, state.config.team.linkIntoWorktrees, ignored);
-      if (prep.venv) activateVenv(prep.venv, process.env);
+      if (prep.venv) {
+        activateVenv(prep.venv, process.env);
+        preferWorktreeCode(ctx.cwd, process.env);
+      }
       worktreeNote = describePrep(prep);
     } catch {
       /* the worker still works, only slower */

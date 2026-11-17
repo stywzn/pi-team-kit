@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.1] - 2026-11-18
+
+Review and hardening of 0.7.0.
+
+- Security: lane gates are run by pi-subagents through the system shell, which is cmd.exe on Windows, where the single quotes 0.7.0 put around unusual test file names mean nothing (a name with `&` could run a command; one with a space broke the gate). Test file names are now passed only when they need no quoting in either shell; otherwise the lane runs the full gate. Names starting with `-` (read as options, e.g. pytest `-p` loads a plugin) are never passed. Checked against cmd.exe with Windows Python: unittest and pytest take the forward-slash paths.
+- A lane whose task deletes or renames one of its test files no longer fails every round on "file not found": after such a failure the lane's later rounds run the full gate.
+- Worktree preparation refuses names with `:` (a drive or an NTFS stream on Windows).
+- Reader digests are checked by size and modification time first, so large documents are not read again on every lookup; digests handed to the team are marked as information from the files, not instructions.
+- `ptk plan --script` builds the same per-lane gates as team_run.
+- From an independent review:
+  - A lane gate that only fails because fewer tests ran (a coverage threshold such as `--cov-fail-under`, "no tests found") switches to the full gate for the next round instead of failing every round. A gate that already names paths (`pytest tests/unit`) is not narrowed.
+  - Workers sharing the project's virtualenv import their own worktree's code first (`PYTHONPATH`): with an editable install (`pip install -e .`) they were testing the main checkout's code. Checked with a real virtualenv.
+  - Secrets: `DB_PASSWORD=`, `OPENAI_API_KEY=`, `JWT_SECRET=` style values were not redacted (no word boundary after `_`); now they are, in playbooks, evidence and digests. The reader is told never to open `.env` files, and `.env*` never counts as a digest source.
+  - A `.env` that is a named pipe (1Password mounts it as one) is skipped instead of blocking the worker's start.
+  - A digest whose sources all are missing (saved for the wrong folder) is refused: it could never notice a change.
+  - Worktrees are prepared whatever their name (pi-subagents can also allocate them with Worktrunk).
+
 ## [0.7.0] - 2026-11-18
 
 Faster team runs, from measurements on real runs (the friction report now shows where the time goes).

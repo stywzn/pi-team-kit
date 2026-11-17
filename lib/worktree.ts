@@ -37,15 +37,17 @@ export function mainCheckout(worktree: string): string | undefined {
   }
 }
 
-/** pi-subagents names its worktrees pi-worktree-*. */
-export const isWorkerWorktree = (cwd: string) => /^pi-worktree-/.test(basename(cwd)) && mainCheckout(cwd) !== undefined;
+/** A linked worktree of some main checkout. Only checked in subagent processes; pi-subagents' allocators name
+ *  their worktrees differently (pi-worktree-*, Worktrunk), so the name is not relied on. */
+export const isWorkerWorktree = (cwd: string) => mainCheckout(cwd) !== undefined;
 
 /** `isIgnored(rel)` must ask git in the worktree (git -C <worktree> check-ignore -q -- rel). */
 export function prepareWorktree(main: string, worktree: string, names: string[], isIgnored: (rel: string) => boolean, platform = process.platform): WorktreePrep {
   const prep: WorktreePrep = { copied: [], linked: [], skipped: [] };
   for (const raw of names) {
     const rel = raw.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-    if (!rel || isAbsolute(rel) || rel.split("/").includes("..")) {
+    // ":" would be a drive (C:x) or an NTFS stream (file:stream) on Windows
+    if (!rel || isAbsolute(rel) || rel.split("/").includes("..") || rel.includes(":")) {
       prep.skipped.push(`${raw}: must be a path inside the repo`);
       continue;
     }
@@ -67,6 +69,11 @@ export function prepareWorktree(main: string, worktree: string, names: string[],
         continue;
       }
       mkdirSync(dirname(dst), { recursive: true });
+      if (!st.isDirectory() && !st.isFile()) {
+        // a named pipe (1Password mounts .env as one), socket or device: copying would block or leak
+        prep.skipped.push(`${rel}: not a regular file`);
+        continue;
+      }
       if (st.isDirectory()) {
         if (platform === "win32") {
           prep.skipped.push(`${rel}: folders are not linked on Windows`);
@@ -83,6 +90,17 @@ export function prepareWorktree(main: string, worktree: string, names: string[],
     }
   }
   return prep;
+}
+
+/**
+ * In a worker's worktree the shared virtualenv may hold an editable install (pip install -e .) of the main
+ * checkout: imports would then load the original code, not the worker's. The worktree (and its src/) go first
+ * on PYTHONPATH, ahead of site-packages and editable finders.
+ */
+export function preferWorktreeCode(worktree: string, env: NodeJS.ProcessEnv): void {
+  const first = [join(worktree, "src"), worktree].filter((p) => existsSync(p));
+  const rest = (env.PYTHONPATH ?? "").split(delimiter).filter((p) => p && !first.includes(p));
+  env.PYTHONPATH = [...first, ...rest].join(delimiter);
 }
 
 /** Activate a virtualenv for this process and everything it starts (bash commands, the gate). */

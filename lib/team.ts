@@ -184,14 +184,36 @@ function narrowGate(gate, files) {
   if (!PLAN.laneTests || /[;&|<>\`$\n]/.test(gate) || /\bdiscover\b/.test(gate)) return gate;
   var runner = /(^|\s)(pytest|py\.test)(\s|$)|-m\s+(pytest|unittest)(\s|$)|(^|\s)(npx\s+)?(jest|vitest|playwright\s+test)(\s|$)/;
   if (!runner.test(gate)) return gate;
+  // A gate that already names paths (pytest tests/unit) chose what to run: adding files could run tests it left out.
+  var words = gate.replace(/playwright\s+test/, "playwright").split(/\s+/).filter(function (w) { return w && w.charAt(0) !== "-"; });
+  if (words.some(function (w) { return /[\/\\]/.test(w) || /\.(py|[cm]?[jt]sx?)$/.test(w) || /^(tests?|specs?|__tests__|e2e|testing)$/.test(w); })) return gate;
   var tests = (files || []).filter(function (f) {
-    return !/[*?[{]/.test(f) && /(^|\/)(test_[^\/]*\.py|[^\/]*_test\.py|[^\/]*\.(test|spec)\.[cm]?[jt]sx?)$/.test(f);
+    // a name starting with "-" would be read as an option (pytest -p loads a plugin): never passed
+    return !/[*?[{]/.test(f) && !/^-/.test(f) && /(^|\/)(test_[^\/]*\.py|[^\/]*_test\.py|[^\/]*\.(test|spec)\.[cm]?[jt]sx?)$/.test(f);
   });
   if (!tests.length) return gate;
-  return gate + " " + tests.map(function (f) { return /^[\w@%+=:,.\/-]+$/.test(f) ? f : "'" + f.split("'").join("'\\''") + "'"; }).join(" ");
+  // pi-subagents runs the gate through the system shell: sh on Linux/macOS, cmd.exe on Windows. No quoting is
+  // safe in both, so names are passed only when they need none; one name that would, and the lane runs the full gate.
+  if (!tests.every(function (f) { return /^[\w@+=:,.\/-]+$/.test(f); })) return gate;
+  return gate + " " + tests.join(" ");
 }
 function laneGate(lane) {
-  return GATE ? { command: narrowGate(GATE.command, lane.files), timeoutMs: GATE.timeoutMs } : undefined;
+  if (!GATE) return undefined;
+  return { command: lane.fullGate ? GATE.command : narrowGate(GATE.command, lane.files), timeoutMs: GATE.timeoutMs };
+}
+// A lane that deletes or renames one of its test files cannot pass a gate naming that file: when the lane's
+// own gate fails because a named file or module is missing, later rounds run the full gate instead.
+function missingNamedFile(lane, text) {
+  var narrowed = laneGate(lane);
+  if (!narrowed || narrowed.command === GATE.command) return false;
+  text = String(text || "");
+  // Coverage thresholds and "no tests found" only trip because fewer tests ran: the full gate is the fair check.
+  if (/coverage[^\n]*(not reached|not met|fail)|fail[-_ ]?under|required test coverage|no tests? (were )?(ran|found|collected)|no test files found|no test suite found/i.test(text)) return true;
+  if (!/no such file|not found|cannot find|could not find|does not exist|no module named|failed to import|ENOENT/i.test(text)) return false;
+  return (lane.files || []).some(function (f) {
+    var base = String(f).split("/").pop();
+    return base && (text.indexOf(base) >= 0 || text.indexOf(base.replace(/\.[^.]+$/, "")) >= 0);
+  });
 }
 function gateText(lane) { var g = laneGate(lane); return g ? JSON.stringify(g.command) : ""; }
 // What the verifier checks, given to the worker up front so the first round can already pass.
@@ -308,6 +330,7 @@ function resumeItem(lane, writer, label, task) {
 function afterWrite(lane, writer, round) {
   if (writer.ok) return review(lane, writer, round);
   noteRound(lane, { round: round, gate: clip(writer.error || writer.output, 300) });
+  if (missingNamedFile(lane, (writer.error || "") + "\n" + (writer.output || ""))) lane.fullGate = true;
   if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, null, round, "failed");
   var key = lane.key + "-gatefix-" + round;
   return settle(key, runs.run(key, resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer))))

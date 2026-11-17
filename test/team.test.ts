@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
 
@@ -250,7 +254,7 @@ test("each lane runs only its own test files; the brief carries the verifier's c
   const { calls } = await run("python3 -m pytest -q");
   const gateOf = (key: string) => calls.find((c) => c.key === key)?.item.gate?.command;
   assert.equal(gateOf("login-work"), "python3 -m pytest -q tests/test_login.py");
-  assert.equal(gateOf("cart-work"), "python3 -m pytest -q 'tests/my cart_test.py'", "paths with spaces are quoted");
+  assert.equal(gateOf("cart-work"), "python3 -m pytest -q", "a name that would need quoting: the full gate");
   assert.equal(gateOf("util-work"), "python3 -m pytest -q", "globs: the full gate");
   const fix = calls.find((c) => c.key === "login-fix-1")!;
   assert.equal(fix.item.acceptance?.verify?.[0].command, "python3 -m pytest -q tests/test_login.py", "rework rounds keep the lane's gate");
@@ -261,4 +265,72 @@ test("each lane runs only its own test files; the brief carries the verifier's c
     assert.equal((await run(gate)).calls.find((c) => c.key === "login-work")?.item.gate?.command, gate, `left as written: ${gate}`);
   assert.equal((await run("python -m unittest -q")).calls.find((c) => c.key === "login-work")?.item.gate?.command, "python -m unittest -q tests/test_login.py");
   assert.equal((await run("python3 -m pytest -q", false)).calls.find((c) => c.key === "login-work")?.item.gate?.command, "python3 -m pytest -q", "laneTests off");
+});
+
+test("security: a test file name that a shell could read as code never reaches the gate (sh or cmd.exe)", async (t) => {
+  // pi-subagents runs gates with shell: true, which is cmd.exe on Windows: no quoting is safe in both shells.
+  const hostile = ["tests/test_a';touch PWNED;'.py", "tests/test_$(touch PWNED).py", "tests/test_`touch PWNED`.py", "tests/test_a&calc&.py", "tests/test_%PATH%.py", "tests/test_x\";touch PWNED;\".py", "tests/test_with space.py"];
+  const pass = (key: string) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : {});
+  for (const name of hostile) {
+    const lanes = planLanes([task("evil", [name, "tests/test_ok.py"])]);
+    const { calls } = await simulate({ lanes, gate: "python3 -m pytest -q", laneTests: true }, pass);
+    assert.equal(calls.find((c) => c.key === "evil-work")!.item.gate!.command, "python3 -m pytest -q", `full gate, name left out: ${name}`);
+  }
+  const option = await simulate({ lanes: planLanes([task("opt", ["-p_evil_test.py", "tests/test_ok.py"])]), gate: "python3 -m pytest -q", laneTests: true }, pass);
+  assert.equal(option.calls.find((c) => c.key === "opt-work")!.item.gate!.command, "python3 -m pytest -q tests/test_ok.py", "a name starting with - is never passed (it would be an option)");
+  // what does get through is plain words: run it through sh to be sure nothing is interpreted
+  const ok = await simulate({ lanes: planLanes([task("ok", ["tests/test_a.py", "web/login.spec.ts", "tests/unit/test_b-c.py"])]), gate: "npx vitest run", laneTests: true }, pass);
+  const command = ok.calls.find((c) => c.key === "ok-work")!.item.gate!.command;
+  assert.equal(command, "npx vitest run tests/test_a.py web/login.spec.ts tests/unit/test_b-c.py");
+  if (process.platform === "win32") return t.diagnostic("sh check skipped on Windows");
+  const out = spawnSync("sh", ["-c", `printf '%s\\n' ${command.slice("npx vitest run ".length)}`], { cwd: mkdtempSync(join(tmpdir(), "ptk-quote-")), encoding: "utf8" });
+  assert.deepEqual(out.stdout.trimEnd().split("\n"), ["tests/test_a.py", "web/login.spec.ts", "tests/unit/test_b-c.py"]);
+  assert.equal(existsSync(join(tmpdir(), "PWNED")), false);
+});
+
+test("a lane that deletes its own test file falls back to the full gate instead of failing every round", async () => {
+  const lanes = planLanes([task("cleanup", ["tests/test_old.py", "app/old.py"])]);
+  let works = 0;
+  const { result, calls } = await simulate({ lanes, gate: "python3 -m pytest -q", laneTests: true }, (key) => {
+    if (key.includes("verify")) return { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } };
+    if (key === "cleanup-work") return { ok: false, error: "Acceptance verification 'gate' failed: ERROR: file or directory not found: tests/test_old.py" };
+    works++;
+    return {};
+  });
+  assert.equal(calls.find((c) => c.key === "cleanup-work")!.item.gate!.command, "python3 -m pytest -q tests/test_old.py");
+  const fix = calls.find((c) => c.key === "cleanup-gatefix-1")!;
+  assert.equal(fix.item.acceptance?.verify?.[0].command, "python3 -m pytest -q", "next round: the full gate");
+  assert.equal(result.lanes[0].state, "passed");
+  assert.equal(works, 1);
+  // an ordinary test failure keeps the lane's own gate
+  const lanes2 = planLanes([task("login", ["tests/test_login.py"])]);
+  const r2 = await simulate({ lanes: lanes2, gate: "python3 -m pytest -q", laneTests: true }, (key) =>
+    key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : key === "login-work" ? { ok: false, error: "1 failed: tests/test_login.py::test_x - AssertionError" } : {},
+  );
+  assert.equal(r2.calls.find((c) => c.key === "login-gatefix-1")!.item.acceptance?.verify?.[0].command, "python3 -m pytest -q tests/test_login.py");
+});
+
+test("lane gates that only fail because fewer tests ran go back to the full gate; gates naming paths are kept", async () => {
+  const pass = { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } };
+  const firstRound = (error: string) =>
+    simulate({ lanes: planLanes([task("login", ["tests/test_login.py"])]), gate: "python3 -m pytest -q", laneTests: true }, (key) =>
+      key.includes("verify") ? pass : key === "login-work" ? { ok: false, error } : {},
+    );
+  for (const error of [
+    "FAIL Required test coverage of 80% not reached. Total coverage: 12.50%",
+    "ERROR: Coverage failure: total of 12 is less than fail-under=80",
+    'Jest: "global" coverage threshold for lines (80%) not met: 10%',
+    "No tests found, exiting with code 1",
+    "no tests ran in 0.01s",
+    "Error: No test files found, exiting with code 1",
+  ]) {
+    const { calls } = await firstRound(error);
+    assert.equal(calls.find((c) => c.key === "login-gatefix-1")!.item.acceptance?.verify?.[0].command, "python3 -m pytest -q", `full gate after: ${error}`);
+  }
+  const keep = (gate: string, files: string[]) =>
+    simulate({ lanes: planLanes([task("l", files)]), gate, laneTests: true }, (key) => (key.includes("verify") ? pass : {})).then((r) => r.calls.find((c) => c.key === "l-work")!.item.gate!.command);
+  assert.equal(await keep("pytest -q tests/unit", ["tests/integration/test_db.py"]), "pytest -q tests/unit", "the gate chose its paths");
+  assert.equal(await keep("pytest tests", ["tests/test_a.py"]), "pytest tests");
+  assert.equal(await keep("npx playwright test", ["e2e/login.spec.ts"]), "npx playwright test e2e/login.spec.ts", "playwright's own test subcommand is not a path");
+  assert.equal(await keep("uv run python -m pytest -q", ["tests/test_a.py"]), "uv run python -m pytest -q tests/test_a.py");
 });

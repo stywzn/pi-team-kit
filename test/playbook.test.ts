@@ -112,6 +112,12 @@ test("secrets: found and redacted; placeholders are not secrets", () => {
   assert.deepEqual(findSecrets("git clone https://bob:pa55word@git.corp/x.git"), ["credentials in a URL"]);
   assert.deepEqual(findSecrets("password=$TEST_PASSWORD from the CI secret; token: <ask the admin>"), []);
   assert.equal(redact("export GH=ghp_abcdefghijklmnopqrstuvwxyz0123 && run"), "export GH=[redacted] && run");
+  // names with a prefix: a word boundary does not fall after "_", these slipped through before
+  for (const line of ["DB_PASSWORD=Sup3rS3cret!", "OPENAI_API_KEY=abcdef123456", "JWT_SECRET: 'h4ppyb1rthday'", "export GITLAB_TOKEN=glpat-xyz123456", "admin_pwd = hunter2hunter2"]) {
+    assert.ok(findSecrets(line).length, `found: ${line}`);
+    assert.doesNotMatch(redact(line), /Sup3r|abcdef123456|h4ppy|glpat|hunter2/, `redacted: ${line}`);
+  }
+  assert.deepEqual(findSecrets("DB_PASSWORD=${DB_PASSWORD}; JWT_SECRET=<from vault>; the token count is small"), [], "references and prose are not secrets");
 });
 
 test("files: listed across folders, metadata kept, templates copied only from inside the repo", () => {
