@@ -97,6 +97,16 @@ cd ~/code/ptk-demo && pi
 - 规划员、worker、审查员：每个任务都是新会话，不继承；返工时继续用同一个 worker（它需要知道自己改过什么），最多 3 轮。
 - 想让子 agent 也严格按预算：`ptk caps --apply`，pi 会在两轮之间按角色窗口自动压缩。
 
+### 把一次项目的经验带到下一次（playbook）
+
+1. 项目做完：`/harvest web-e2e-automation 给 Web 应用写自动化用例`。它从这个项目的会话记录、团队运行（含审查员每轮打回的原因）和 git 里取证据，写一份 playbook，弹编辑框给你改，存到 `~/.pi/agent/ptk/playbooks/`。
+2. 下次同类任务：什么都不用说。主会话看到匹配的 playbook 会先读它，开工前问它的"Ask first"，`/team` 时把它带给规划员、worker、审查员。
+3. 跑完：合并结果里会提示"用了哪个 playbook"，主会话在报告末尾提最多 3 条修改（新坑、又验证一次的、错的），你同意后它用 `playbook` 工具改单行。也可以 `/skill:retro`。
+
+写短是硬规则：描述 200 字符内；每节最多 5～8 条，每条一行（160 字符内），全文 60 行内。写满了只能替换或删掉旧的；删掉的进 `references/retired.md`，证据在 `references/sources.md`，可复用的文件在 `templates/`。
+
+团队共享：建一个 playbook 仓库，大家 clone 下来，在 `~/.pi/agent/ptk.json` 里加 `"playbooks": { "dirs": ["~/code/team-playbooks"] }`；改动走 PR，CI 里跑 `ptk playbooks check .` 检查长度。`ptk playbooks` 列出现有的和使用次数。
+
 ## 8. 多个 pi 会话怎么分
 
 终端标题是「会话名 · 目录」，会话名默认取你的第一句话，运行中前面带 `●`。跑完超过 30 秒会弹桌面通知（WSL 下是 Windows 通知，在 tmux 里也能弹）。tmux 里可以让窗口名跟随标题（`automatic-rename-format '#{pane_title}'`）。

@@ -1,7 +1,7 @@
 {
   "name": "pi-team-kit",
-  "version": "0.4.0",
-  "description": "Team workflow (lead + up to 4 workers + verifier + rework), lead-to-lead messages, anti-hang command guard, auto-detected environment facts, plain-language output and a reusable toolbox for the pi coding agent.",
+  "version": "0.5.0",
+  "description": "Team workflow (lead + up to 4 workers + verifier + rework), lead-to-lead messages, playbooks from past projects, anti-hang command guard, auto-detected environment facts, plain-language output and a reusable toolbox for the pi coding agent.",
   "type": "module",
   "license": "MIT",
   "author": "stywzn",

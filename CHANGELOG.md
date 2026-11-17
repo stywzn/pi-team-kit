@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-11-18
+
+- Playbooks: what one project taught about a kind of task, reused by the next one (`lib/playbook.ts`, `lib/harvest.ts`, the `playbook` tool, `/harvest`, `ptk playbooks`).
+  - `/harvest <name>` writes one from evidence: the project's sessions (corrections, failures, guard stops), team runs (every round's reviewer findings, now kept in each lane's `history`), the lead record and git. Secrets are redacted; the evidence is kept in `references/sources.md`, reusable files in `templates/`.
+  - Saved as an Agent Skill and loaded through `resources_discover`, so a matching playbook is read without being asked. `team_run` takes `playbook`; its steps, tips, pitfalls and never-list travel with the goal. `team_integrate` records the use and asks for at most 3 one-line changes.
+  - Short by rule, enforced by code: description under 200 characters, 5 to 8 items per section, one line each, 60 lines in all. Changes are single-line edits (add, bump, replace, retire) applied by code, never a rewrite; a full section needs a replace or retire first. Retired lines go to `references/retired.md`.
+  - `ptk playbooks check <dir>` for a team playbook repo's CI; `playbooks.dirs` loads a team checkout.
+- `test/e2e/playbook.sh`: harvest from a real team run, then a similar task picks the playbook by itself and passes review in round 1 instead of 2, then the lead refines it.
+
 ## [0.4.0] - 2026-11-17
 
 - Lead sessions on related tasks see each other and tell each other what changed (`lib/board.ts`, the `leads` tool, `/leads`). Plain files under `~/.pi/agent/ptk/board`, no daemon; only lead sessions join (workers keep talking to their own lead).

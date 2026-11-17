@@ -8,14 +8,16 @@
 //   ptk demo [dir]              create a throwaway repo to try /team on
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
 //   ptk leads [n]               lead sessions running on this machine, their status and the last n messages
+//   ptk playbooks [check [dir]] list playbooks; check = enforce the length limits (for a team playbook repo's CI)
 
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { formatBoard, formatLog, readCards, readLog } from "../lib/board.ts";
+import { checkPlaybook, listPlaybooks } from "../lib/playbook.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir } from "../lib/config.ts";
+import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir } from "../lib/config.ts";
 import { factFilePath, mergeFactFiles, readFactFile, writeFactFile } from "../lib/facts.ts";
 import { detectEnv, formatEnv, realProbe, which } from "../lib/env.ts";
 import { buildTeamScript, planLanes, validateTasks, type TeamTask } from "../lib/team.ts";
@@ -217,7 +219,23 @@ switch (cmd) {
     console.log(`${formatBoard(readCards(dir), "", Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(dir, Number(rest[0]) || 15))}`);
     break;
   }
+  case "playbooks": {
+    const dirs = rest[0] === "check" && rest[1] ? [resolve(rest[1])] : playbookDirs(loadConfig(cwd).config);
+    const all = listPlaybooks(dirs);
+    if (rest[0] !== "check") {
+      console.log(all.length ? all.map((p) => `${p.name}: ${p.description} (${p.uses} use(s)${p.lastUsed ? `, last ${p.lastUsed.slice(0, 10)}` : ""})\n  ${p.dir}`).join("\n") : `no playbooks in ${dirs.join(", ")}`);
+      break;
+    }
+    let bad = 0;
+    for (const p of all) {
+      const c = checkPlaybook(readFileSync(join(p.dir, "SKILL.md"), "utf8"));
+      console.log(`${c.errors.length ? "FAIL" : "ok  "} ${p.name}${[...c.errors, ...c.warnings.map((w) => `warning: ${w}`)].map((e) => `\n     ${e}`).join("")}`);
+      if (c.errors.length) bad++;
+    }
+    if (!all.length) console.log(`no playbooks in ${dirs.join(", ")}`);
+    process.exit(bad ? 1 : 0);
+  }
   default:
-    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n]");
+    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n] | playbooks [check [dir]]");
     process.exit(cmd ? 2 : 0);
 }

@@ -13,6 +13,8 @@ export interface LeadRun {
   gate: string;
   /** pi-subagents async run id, when known, to check on a run that is still going. */
   runId?: string;
+  /** Playbook the run followed, so its use is recorded when it is integrated. */
+  playbook?: string;
   result?: string;
 }
 

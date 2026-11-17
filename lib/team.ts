@@ -262,8 +262,14 @@ function finish(lane, writer, review, rounds, state) {
     error: (writer && writer.error) || null,
     summary: clip((review && review.summary) || (writer && writer.output), 800),
     findings: (review && review.findings) || [],
+    // Why earlier rounds were sent back: the lessons a playbook is made of (/harvest reads them).
+    history: lane.history || [],
     report: clip(writer && writer.output, 1200)
   };
+}
+
+function noteRound(lane, entry) {
+  lane.history = (lane.history || []).concat([entry]).slice(-6);
 }
 
 function resumeItem(writer, label, task) {
@@ -272,6 +278,7 @@ function resumeItem(writer, label, task) {
 
 function afterWrite(lane, writer, round) {
   if (writer.ok) return review(lane, writer, round);
+  noteRound(lane, { round: round, gate: clip(writer.error || writer.output, 300) });
   if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, null, round, "failed");
   var key = lane.key + "-gatefix-" + round;
   return settle(key, runs.run(key, resumeItem(writer, "Fix checks: " + lane.key, gateFixTask(lane, writer))))
@@ -287,6 +294,7 @@ function review(lane, writer, round) {
       var verdict = out.verdict || "rework";
       if (verdict === "pass") return finish(lane, writer, out, round, "passed");
       if (verdict === "blocked") return finish(lane, writer, out, round, "needs-human");
+      noteRound(lane, { round: round, findings: (out.findings || []).slice(0, 5).map(function (f) { return { file: f.file, issue: clip(f.issue, 200), fix: clip(f.fix, 200) }; }) });
       if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, out, round, "needs-human");
       var fixKey = lane.key + "-fix-" + round;
       return settle(fixKey, runs.run(fixKey, resumeItem(writer, "Rework " + lane.key + " #" + round, fixTask(lane, out, round))))

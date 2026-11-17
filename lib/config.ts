@@ -103,6 +103,15 @@ export interface PtkConfig {
     /** This lead's name on the board; "" = the repository (or folder) name. */
     name: string;
   };
+  /** Playbooks: short lessons for a kind of task, saved by /harvest and loaded as skills (lib/playbook.ts). */
+  playbooks: {
+    /** Where /harvest saves; "" = <agentDir>/ptk/playbooks. */
+    dir: string;
+    /** More folders to load playbooks from, e.g. a checkout of the team's playbook repo. */
+    dirs: string[];
+    /** Show a new playbook in an editor before saving, and ask before changing one (2-minute timeout). */
+    confirm: boolean;
+  };
 }
 
 export const DEFAULTS: PtkConfig = {
@@ -147,7 +156,14 @@ export const DEFAULTS: PtkConfig = {
     models: { planner: "", worker: "", verifier: "" },
   },
   leads: { enabled: true, wake: true, name: "" },
+  playbooks: { dir: "", dirs: [], confirm: true },
 };
+
+/** Playbook folders: the one /harvest writes to first, then the configured extra ones. */
+export function playbookDirs(config: PtkConfig, env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = (p: string) => resolve(p.replace(/^~(?=$|[\\/])/, homedir()));
+  return [config.playbooks.dir ? home(config.playbooks.dir) : join(globalDataDir(env), "playbooks"), ...config.playbooks.dirs.filter((d) => typeof d === "string" && d.trim()).map(home)];
+}
 
 export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.PI_CODING_AGENT_DIR?.trim();

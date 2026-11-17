@@ -13,8 +13,9 @@ Run a short retrospective on the session the user names, or on the current one.
    - A pitfall saved with the `remember` tool (kind pitfall, a regex for the command, warn or block), so the guard catches it next time.
    - A fact saved with `remember` (kind fact, with a `check` command when one can confirm it), so the next session does not rediscover it.
    - A toolbox helper saved with `toolbox` action add, if a script was written that will be needed again.
+   - A playbook change (`playbook` action update: add a pitfall or tip, bump an item that held again, retire a wrong one) when the session followed a playbook; or suggest `/harvest <name>` when this kind of task will come again and has none.
    - Only if none of these fits: one line in AGENTS.md, as a pointer to where the information lives. Never paste the information itself.
 
 3. Show the list ranked by time lost, one line each: what happened, the proposed fix, which kind.
 
-4. Apply the `remember` and `toolbox` items the user approves. Do not edit code, tests or config without asking.
+4. Apply the `remember`, `toolbox` and `playbook` items the user approves. Do not edit code, tests or config without asking.

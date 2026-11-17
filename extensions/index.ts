@@ -16,7 +16,23 @@ import { BorderedLoader, convertToLlm, createLocalBashOperations, isToolCallEven
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, projectDataDir, type PtkConfig } from "../lib/config.ts";
+import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir, type PtkConfig } from "../lib/config.ts";
+import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions, sessionEvidence } from "../lib/harvest.ts";
+import {
+  appendRetired,
+  applyChanges,
+  checkPlaybook,
+  copyTemplates,
+  findPlaybook,
+  LIMITS,
+  listPlaybooks,
+  playbookBrief,
+  readMeta,
+  renderPlaybook,
+  validPlaybookName,
+  writeMeta,
+  type Change,
+} from "../lib/playbook.ts";
 import {
   ackInbox,
   claimName,
@@ -283,7 +299,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
         "Clarify first, then run unattended. Before work that changes files, restate the task in one line with how you will know it is done. " +
         "If the goal, the done-criteria or the scope is unclear, ask at most 3 short questions and wait; do not start on guesses. " +
         "Once the user has confirmed, work to the end without asking again: the user may be away. Take the conservative option on minor decisions and list them in your final report. " +
-        "Stop and ask only before something destructive or irreversible (deleting data, force-pushing, touching production, spending money).";
+        "Stop and ask only before something destructive or irreversible (deleting data, force-pushing, touching production, spending money). " +
+        "When a playbook skill (lessons from earlier projects of the same kind) matches the task, read it first: ask its Ask-first items while clarifying, follow its Steps, take its Done-when into doneWhen, and pass playbook=<name> to team_run.";
     if (role === "lead" && lb.name) {
       const peers = peersSection(liveCards(), lb.name, Date.now(), homedir());
       if (peers) sections["leads"] = peers;
@@ -521,10 +538,14 @@ export default function piTeamKit(pi: ExtensionAPI) {
       tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12, description: "Omit to let the team-planner agent split the goal inside the run. At most team.maxTasks (default 8)." })),
       gate: Type.Optional(Type.String({ description: "Command that must pass in every worktree; default: configured or detected test command" })),
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
+      playbook: Type.Optional(Type.String({ description: "Name of a matching playbook (lessons from earlier projects of this kind); its steps, tips, pitfalls and never-list travel with the goal" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = findRepoRoot(ctx.cwd);
       if (!root) throw new Error("team_run needs a git repository (workers use git worktrees).");
+      const pbName = params.playbook?.trim();
+      const pb = pbName ? findPlaybook(playbookDirs(state.config), pbName) : undefined;
+      if (pbName && !pb) throw new Error(`No playbook named "${pbName}". Available: ${listPlaybooks(playbookDirs(state.config)).map((p) => p.name).join(", ") || "none"}.`);
       const dirty = await dirtyFiles(root);
       if (dirty.length) {
         const shared = dirty.some((f) => f.startsWith(".pi/ptk")) ? "\n.pi/ptk holds team-shared facts/tools: commit it (or move it away) first." : "";
@@ -560,12 +581,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
         ...(params.assumptions?.length ? { assumptions: params.assumptions.map((a) => a.trim()).filter(Boolean) } : {}),
       };
       // The goal text travels to planner, workers and verifier, so the done-criteria and limits travel with it.
-      const fullGoal = [brief.goal, `Done when: ${brief.doneWhen}`, brief.outOfScope ? `Out of scope: ${brief.outOfScope}` : "", brief.assumptions?.length ? `Assumptions: ${brief.assumptions.join("; ")}` : ""]
+      const briefText = [brief.goal, `Done when: ${brief.doneWhen}`, brief.outOfScope ? `Out of scope: ${brief.outOfScope}` : "", brief.assumptions?.length ? `Assumptions: ${brief.assumptions.join("; ")}` : ""]
         .filter(Boolean)
         .join("\n");
+      // A playbook is short by construction, so it can travel with the goal to planner, workers and verifier.
+      const fullGoal = pb ? `${briefText}\n${playbookBrief(readFileSync(join(pb.dir, "SKILL.md"), "utf8"), pb.name).block}` : briefText;
       if (t.confirm && ctx.hasUI) {
         const summary = [
-          fullGoal,
+          briefText,
+          ...(pb ? [`Playbook: ${pb.name} (${pb.uses} earlier use(s))`] : []),
           "",
           `Gate: ${gate || "(none: verifier only)"}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
@@ -592,7 +616,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         globalConcurrencyLimit: t.maxParallel,
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
-      saveLead(ctx.cwd, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data) } }, ctx.sessionManager.getSessionFile());
+      saveLead(ctx.cwd, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}) } }, ctx.sessionManager.getSessionFile());
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
       const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
@@ -711,6 +735,20 @@ export default function piTeamKit(pi: ExtensionAPI) {
         setLeadStatus(`integrated${goal ? `: ${goal.slice(0, 140)}` : ` ${params.runDirs.length} lane(s)`}, gate ${gate ? (gatePassed ? "passed" : "FAILED") : "skipped"}, not committed yet`);
         if (clash.size)
           lines.push(`Other leads changed some of the same files in the last 30 minutes: ${[...clash].map(([n, fs]) => `${n} (${fs.slice(0, 5).join(", ")})`).join("; ")}. Tell them with leads send and agree on the result before you commit.`);
+      }
+      if (openRun?.playbook) {
+        // Record the use and ask for the lesson while it is fresh; the user decides what goes in.
+        const used = findPlaybook(playbookDirs(state.config), openRun.playbook);
+        if (used) {
+          try {
+            const meta = readMeta(used.dir);
+            meta.uses.push({ at: new Date().toISOString(), repo: basename(root), outcome: gate ? (gatePassed ? "gate passed" : "gate failed") : "no gate", minutes: Math.round((Date.now() - Date.parse(openRun.startedAt)) / 60_000) });
+            writeMeta(used.dir, meta);
+          } catch {
+            /* stats are a convenience */
+          }
+          lines.push(`Playbook "${used.name}" was used. End your report with at most 3 one-line changes to it from this run (a new pitfall or tip, an item that held again, an item that was wrong). Apply them with the playbook tool only after the user agrees.`);
+        }
       }
       lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
       saveLead(ctx.cwd, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
@@ -877,6 +915,140 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (s.session && s.session === ctx.sessionManager.getSessionFile()) return;
     const open = s.runs.some((r) => r.status === "running");
     ctx.ui.notify(`An earlier lead session left work here (${ageText(s.updatedAt)}${open ? ", a team run may still be running" : ""}): ${s.brief?.goal ?? "see /continue"}. Type /continue to take it over.`, "info");
+  });
+
+  // ---------- playbooks: what one project taught, reused by the next one of the same kind ----------
+  // Saved by /harvest from evidence (lib/harvest.ts), kept short by code (lib/playbook.ts), loaded as skills.
+
+  // pi lists playbooks like any skill (name + description), so a matching one gets read without being asked.
+  pi.on("resources_discover", async () => ({ skillPaths: playbookDirs(state.config).filter((d) => existsSync(d)) }));
+
+  let lastEvidence = "";
+  const limitsText = `Limits: description under ${LIMITS.description} characters; ask ≤5, steps ≤8, done ≤4, tips ≤8, pitfalls ≤8, never ≤5 items; one line each, under ${LIMITS.item} characters.`;
+  const Items = (what: string) => Type.Optional(Type.Array(Type.String(), { description: `create: ${what}` }));
+
+  pi.registerTool({
+    name: "playbook",
+    label: "Playbook",
+    description:
+      "Playbooks are short lessons for a kind of task (test automation, a migration...), saved as skills so the next similar task starts from them. list: what exists. evidence: what actually happened in this project (corrections, failures, reviewer findings, commits) to write one from. create: save a new one. update: small changes to one line at a time (add, bump = it held again, replace, retire).",
+    promptSnippet: "Turn a finished project into a short reusable playbook, or refine one",
+    promptGuidelines: [
+      "Write a playbook only from playbook evidence: what this team learned (corrections, failures, reviewer findings, the checks that proved done). Leave out generic advice the model already knows.",
+      "Keep playbooks short: one line per item, fewer and sharper items. A full section takes a replace or retire, not a longer list.",
+      "Call playbook update only after the user agreed to the proposed changes.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["list", "evidence", "create", "update"] as const),
+      name: Type.Optional(Type.String({ description: "The kind of task, lowercase-with-dashes, e.g. web-e2e-automation" })),
+      description: Type.Optional(Type.String({ description: "create: one sentence: what kind of task, and when to use it" })),
+      ask: Items("what to ask the user before starting"),
+      steps: Items("the order of work that worked"),
+      done: Items("the checks that proved it was done"),
+      tips: Items("what worked"),
+      pitfalls: Items("what went wrong and how to avoid it"),
+      never: Items("what must not be done"),
+      files: Type.Optional(Type.Array(Type.String(), { description: "create: project files worth starting from next time (fixtures, config), relative to the repo" })),
+      changes: Type.Optional(
+        Type.Array(
+          Type.Object({
+            op: StringEnum(["add", "bump", "replace", "retire"] as const),
+            section: Type.Optional(StringEnum(["ask", "steps", "done", "tips", "pitfalls", "never"] as const)),
+            id: Type.Optional(Type.String({ description: "bump/replace/retire: the item id, the (x1) mark at the end of its line" })),
+            text: Type.Optional(Type.String({ description: "add/replace: the new line" })),
+          }),
+          { description: "update: the changes, at most 5" },
+        ),
+      ),
+      days: Type.Optional(Type.Number({ description: "evidence: how many days back to look (default 30)" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const dirs = playbookDirs(state.config);
+      if (params.action === "list") {
+        const all = listPlaybooks(dirs);
+        return text(all.length ? all.map((p) => `- ${p.name}: ${p.description} (${p.uses} use(s)${p.lastUsed ? `, last ${p.lastUsed.slice(0, 10)}` : ""}) ${p.dir}`).join("\n") : `No playbooks yet. /harvest <name> saves one to ${dirs[0]}.`);
+      }
+      if (params.action === "evidence") {
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (!sessionFile) throw new Error("this session is not saved to disk (--no-session), so there is no history to read");
+        const days = Math.max(1, Math.min(365, Math.round(params.days ?? 30)));
+        const files = recentSessions(dirname(sessionFile), days);
+        const items = files.flatMap((f) => {
+          try {
+            return sessionEvidence(readFileSync(f, "utf8"), readRunValue);
+          } catch {
+            return [];
+          }
+        });
+        const lf = leadFile(ctx.cwd);
+        items.push(...leadEvidence(lf ? readLeadState(lf.file) : undefined));
+        const root = findRepoRoot(ctx.cwd);
+        if (root) {
+          const since = `--since=${days}.days`;
+          const log = await pi.exec("git", ["log", since, "-n", "30", "--format=%h %s"], { cwd: root, timeout: 15_000 });
+          const added = await pi.exec("git", ["log", since, "--diff-filter=A", "--name-only", "--format="], { cwd: root, timeout: 15_000 });
+          items.push(...gitEvidence(log.code === 0 ? log.stdout : "", added.code === 0 ? added.stdout : ""));
+        }
+        const pack = formatEvidence(items);
+        lastEvidence = pack.text;
+        return text(
+          `${pack.count} evidence items from ${files.length} session(s) in the last ${days} days${pack.cut ? ` (${pack.cut} less useful ones cut)` : ""}, plus the lead record and git.\n` +
+            `Write the playbook from these only: every item must trace to one of them. ${limitsText}\n\n${pack.text || "(nothing found)"}`,
+        );
+      }
+      const name = params.name?.trim() ?? "";
+      if (!validPlaybookName(name)) throw new Error("name: the kind of task, lowercase letters, digits and single dashes (e.g. web-e2e-automation)");
+      if (params.action === "create") {
+        const dir = join(dirs[0], name);
+        if (existsSync(join(dir, "SKILL.md"))) throw new Error(`playbook ${name} exists already; change it with action update`);
+        let body = renderPlaybook({
+          name,
+          description: params.description ?? "",
+          ask: params.ask,
+          steps: params.steps ?? [],
+          done: params.done ?? [],
+          tips: params.tips,
+          pitfalls: params.pitfalls,
+          never: params.never,
+        });
+        if (state.config.playbooks.confirm && ctx.hasUI) {
+          const edited = await ctx.ui.editor(`Playbook ${name}: edit if needed, then save (empty to cancel)`, body);
+          if (!edited?.trim()) throw new Error("The user cancelled saving the playbook.");
+          const check = checkPlaybook(edited);
+          if (check.errors.length) throw new Error(`Not saved; the edited playbook breaks the limits:\n- ${check.errors.join("\n- ")}`);
+          body = edited.endsWith("\n") ? edited : `${edited}\n`;
+        }
+        mkdirSync(join(dir, "references"), { recursive: true });
+        writeFileSync(join(dir, "SKILL.md"), body);
+        writeMeta(dir, { version: 1, created: new Date().toISOString(), uses: [], log: [] });
+        if (lastEvidence) writeFileSync(join(dir, "references", "sources.md"), `# Evidence this playbook was written from\n\nRepo: ${basename(findRepoRoot(ctx.cwd) ?? ctx.cwd)}, ${new Date().toISOString().slice(0, 10)}\n\n${lastEvidence}\n`);
+        const root = findRepoRoot(ctx.cwd);
+        const t = root && params.files?.length ? copyTemplates(root, params.files, join(dir, "templates")) : { copied: [], skipped: [] };
+        const lines = body.split("\n").filter((l) => l.trim()).length;
+        return text(
+          `Saved ${join(dir, "SKILL.md")} (${lines} lines). Later sessions load it as a skill (open ones after /reload).` +
+            (t.copied.length ? `\nTemplates: ${t.copied.join(", ")}` : "") +
+            (t.skipped.length ? `\nNot copied: ${t.skipped.join("; ")}` : ""),
+        );
+      }
+      // update
+      const pb = findPlaybook(dirs, name);
+      if (!pb) throw new Error(`No playbook named "${name}". Available: ${listPlaybooks(dirs).map((p) => p.name).join(", ") || "none"}.`);
+      const changes = (params.changes ?? []).slice(0, 5) as Change[];
+      if (!changes.length) throw new Error("changes is required: e.g. [{op: \"add\", section: \"pitfalls\", text: \"...\"}] or [{op: \"bump\", id: \"p2\"}]");
+      const file = join(pb.dir, "SKILL.md");
+      const r = applyChanges(readFileSync(file, "utf8"), changes);
+      if (state.config.playbooks.confirm && ctx.hasUI) {
+        const ok = await ctx.ui.confirm(`Update playbook ${pb.name}?`, r.log.map((l) => `${l.op} ${l.id}: ${l.text}`).join("\n"), { timeout: 120_000 });
+        if (!ok) throw new Error("Not applied: the user declined or did not answer within 2 minutes. List the proposed changes in your report instead.");
+      }
+      writeFileSync(file, r.text.endsWith("\n") ? r.text : `${r.text}\n`);
+      appendRetired(pb.dir, r.retired);
+      const meta = readMeta(pb.dir);
+      meta.log.push(...r.log);
+      writeMeta(pb.dir, meta);
+      return text(`Updated ${pb.name}: ${r.log.map((l) => `${l.op} ${l.id}`).join(", ")}. Now ${r.text.split("\n").filter((l) => l.trim()).length} lines.`);
+    },
   });
 
   // ---------- leads: lead sessions on related tasks tell each other what changed ----------
