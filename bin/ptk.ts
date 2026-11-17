@@ -7,10 +7,13 @@
 //   ptk caps [--apply]          per-role context windows through pi's model overrides
 //   ptk demo [dir]              create a throwaway repo to try /team on
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
+//   ptk leads [n]               lead sessions running on this machine, their status and the last n messages
 
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { formatBoard, formatLog, readCards, readLog } from "../lib/board.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir } from "../lib/config.ts";
 import { factFilePath, mergeFactFiles, readFactFile, writeFactFile } from "../lib/facts.ts";
@@ -209,7 +212,12 @@ switch (cmd) {
     }
     break;
   }
+  case "leads": {
+    const dir = join(globalDataDir(), "board");
+    console.log(`${formatBoard(readCards(dir), "", Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(dir, Number(rest[0]) || 15))}`);
+    break;
+  }
   default:
-    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script]");
+    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n]");
     process.exit(cmd ? 2 : 0);
 }

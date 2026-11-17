@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0] - 2026-11-17
+
+- Lead sessions on related tasks see each other and tell each other what changed (`lib/board.ts`, the `leads` tool, `/leads`). Plain files under `~/.pi/agent/ptk/board`, no daemon; only lead sessions join (workers keep talking to their own lead).
+  - `leads list` / `status` / `send`. A message reaches a busy lead before its next model call (steered, nothing interrupted); `update=true` wakes an idle lead to update its own code, docs and status and reply. A turn started by a message can wake the other side once more at most (A → B → A), so replies never ping-pong.
+  - A lead that changes (edit/write) a file another running lead in the same repo, or one of its worktrees, changed in the last 30 minutes is held until it has told that lead. `team_integrate` flags such files too, and team runs update the lead's status.
+  - Names default to the repo folder (`leads.name` to set one); an offline lead's unread mail goes to the next session that takes its name. Settings: `leads.enabled`, `leads.wake`.
+  - One board seat per process: a session created inside the lead's process (pi-subagents' foreground subagents run there; today without ambient extensions) can never take the lead's name and mail. The e2e test runs a foreground subagent and watches the lead's card.
+  - Messages are wrapped in `<lead-messages>` tags a peer cannot forge. Without a clear end, a message waiting for the next turn ran into the user's next prompt and the model mixed the two up (found by the e2e test).
+  - A session suspended (Ctrl+Z) past the stale limit whose name was taken moves to a free name instead of overwriting the newer card; inbox files are removed only after pi accepted the message; the log rotates instead of being rewritten.
+  - `ptk leads [n]` prints the board from a shell (over SSH too).
+- `test/e2e/leads.sh`: two real leads in tmux (one woken by a message updates its code and replies), plus a third lead in a worktree held until it tells the first.
+
 ## [0.3.4] - 2026-11-17
 
 - `bg` on Windows: logs stayed empty, so `bg logs`, `--wait-for <log regex>` and the "last log lines" of a process that died at start all showed nothing. The cause is a detached `cmd.exe`: it drops output redirected to a file (redirecting inside cmd, as first suggested, loses it too). `bg` now starts a small detached node supervisor (`toolbox/bg/win-supervisor.mjs`) that owns the log and runs the command; `bg stop` ends it with its whole process tree. Linux/macOS are unchanged. CI now waits on a log line and checks the logs and the early-exit reason on every platform.

@@ -95,6 +95,14 @@ export interface PtkConfig {
      *  A verifier from a different model family than the workers catches more of their mistakes. */
     models: { planner: string; worker: string; verifier: string };
   };
+  /** Lead sessions on this machine see each other's status and tell each other what they changed (the leads tool, /leads). */
+  leads: {
+    enabled: boolean;
+    /** An update request wakes an idle lead to act on it. Off: it waits for that lead's next turn. */
+    wake: boolean;
+    /** This lead's name on the board; "" = the repository (or folder) name. */
+    name: string;
+  };
 }
 
 export const DEFAULTS: PtkConfig = {
@@ -138,6 +146,7 @@ export const DEFAULTS: PtkConfig = {
     verifierAgent: "team-verifier",
     models: { planner: "", worker: "", verifier: "" },
   },
+  leads: { enabled: true, wake: true, name: "" },
 };
 
 export function agentDir(env: NodeJS.ProcessEnv = process.env): string {

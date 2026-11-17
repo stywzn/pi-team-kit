@@ -1,31 +1,61 @@
-// pi-team-kit: one extension, five jobs.
+// pi-team-kit: one extension, six jobs.
 //   guard     - bash calls get a timeout, never hang on servers/prompts, use rg/fd
 //   facts     - environment detected by code + facts/pitfalls the agent saved, injected every session
 //   plain     - "speak plainly" rules + a check for unexplained abbreviations
 //   toolbox   - reusable helper scripts (md2pdf, shot, bg, and whatever gets saved later)
 //   team      - team_run / team_integrate on top of pi-subagents (lead + workers + verifier + rework)
+//   leads     - lead sessions on related tasks see each other's status and tell each other what changed
 
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { homedir, hostname, tmpdir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, convertToLlm, createLocalBashOperations, isToolCallEventType, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir, type PtkConfig } from "../lib/config.ts";
+import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, projectDataDir, type PtkConfig } from "../lib/config.ts";
+import {
+  ackInbox,
+  claimName,
+  formatBoard,
+  formatIncoming,
+  formatLog,
+  MAX_STATUS,
+  MAX_WAKE_HOPS,
+  OVERLAP_MS,
+  overlaps,
+  peersSection,
+  readCard,
+  readCards,
+  readInbox,
+  readLog,
+  recordFile,
+  removeCard,
+  sendMessage,
+  shouldWake,
+  slugName,
+  validName,
+  writeCard,
+  type ChangedFile,
+  type LeadCard,
+} from "../lib/board.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, planLanes, planWorktreeCleanup, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+/** customType of messages from other leads, so a run they start can be told apart from one a person started. */
+const BOARD_MESSAGE = "ptk-lead-message";
+/** globalThis key of the one session per process that sits on the lead board. */
+const BOARD_SEAT = Symbol.for("pi-team-kit.board-seat");
 
 const HANDOFF_PROMPT = `You write the opening brief for a fresh coding session that continues work from an earlier conversation.
 Include: the goal for the new session; decisions already made and why; constraints; files involved (paths); what was verified and what was not; open questions.
@@ -226,6 +256,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     if (event.messageType === "user") state.lastUserText = event.prompt ?? "";
     role = detectRole(process.env, event.systemPrompt ?? "");
+    // Which chain of lead messages this run belongs to: 0 when a person started it.
+    const startedBy = (event as { message?: { customType?: string } }).message?.customType;
+    lb.turnHops = event.messageType === "custom" && startedBy === BOARD_MESSAGE ? (lb.pendingWakeHops ?? 1) : event.messageType === "user" ? 0 : lb.turnHops;
+    lb.pendingWakeHops = undefined;
     const c = state.config;
     const sections: Record<string, string> = {};
     const env = [state.envText];
@@ -250,6 +284,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
         "If the goal, the done-criteria or the scope is unclear, ask at most 3 short questions and wait; do not start on guesses. " +
         "Once the user has confirmed, work to the end without asking again: the user may be away. Take the conservative option on minor decisions and list them in your final report. " +
         "Stop and ask only before something destructive or irreversible (deleting data, force-pushing, touching production, spending money).";
+    if (role === "lead" && lb.name) {
+      const peers = peersSection(liveCards(), lb.name, Date.now(), homedir());
+      if (peers) sections["leads"] = peers;
+    }
     if (c.plainTalk.enabled) {
       const reminder = state.lastUnexplained.length
         ? `\nYour previous reply used ${state.lastUnexplained.join(", ")} without explaining it. Explain terms like that in plain words this time.`
@@ -555,6 +593,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
       saveLead(ctx.cwd, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data) } }, ctx.sessionManager.getSessionFile());
+      if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
       const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
       return {
@@ -657,6 +696,22 @@ export default function piTeamKit(pi: ExtensionAPI) {
         // Say exactly what was left behind and why, so nobody reports "kept them" for a cleanup that failed.
         if (failed.length) lines.push(`NOT removed (${failed.length}):\n${failed.map((f) => `- ${f.path}: ${f.reason}`).join("\n")}\nRemove by hand with git worktree remove --force <path> if they are not needed.`);
       } else if (!gatePassed) lines.push("Worker worktrees kept so the lanes can be reworked.");
+      if (lb.name) {
+        // The board learns which files this lead now changed; files another lead changed recently are flagged.
+        const st = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: root, timeout: 15_000 });
+        const changed = st.code === 0 ? st.stdout.split("\n").map((l) => (l.slice(3).split(" -> ").pop() ?? "").trim().replace(/^"|"$/g, "")).filter((f) => f && !f.startsWith(".pi/subagents")) : [];
+        const now = Date.now();
+        const cards = liveCards();
+        const clash = new Map<string, string[]>();
+        for (const f of changed) {
+          for (const c of overlaps(cards, lb.name, lb.repo, f, now)) clash.set(c.name, [...(clash.get(c.name) ?? []), f]);
+          lb.files = recordFile(lb.files, f, now);
+        }
+        const goal = lf ? readLeadState(lf.file)?.brief?.goal : undefined;
+        setLeadStatus(`integrated${goal ? `: ${goal.slice(0, 140)}` : ` ${params.runDirs.length} lane(s)`}, gate ${gate ? (gatePassed ? "passed" : "FAILED") : "skipped"}, not committed yet`);
+        if (clash.size)
+          lines.push(`Other leads changed some of the same files in the last 30 minutes: ${[...clash].map(([n, fs]) => `${n} (${fs.slice(0, 5).join(", ")})`).join("; ")}. Tell them with leads send and agree on the result before you commit.`);
+      }
       lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
       saveLead(ctx.cwd, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
       return text(lines.join("\n"));
@@ -824,6 +879,291 @@ export default function piTeamKit(pi: ExtensionAPI) {
     ctx.ui.notify(`An earlier lead session left work here (${ageText(s.updatedAt)}${open ? ", a team run may still be running" : ""}): ${s.brief?.goal ?? "see /continue"}. Type /continue to take it over.`, "info");
   });
 
+  // ---------- leads: lead sessions on related tasks tell each other what changed ----------
+  // Plain files under <agentDir>/ptk/board (lib/board.ts), no daemon. Only lead sessions join: workers and
+  // other subagents talk to their own lead. Mail is checked every 2 s: a busy lead gets it before its next
+  // model call (steer, nothing is interrupted); an idle lead is woken only for an update request.
+
+  const isChildProcess = Boolean(process.env.PI_SUBAGENT_CHILD);
+  const lb = {
+    dir: join(globalDataDir(), "board"),
+    name: "",
+    owner: `${hostname()}:${process.pid}`,
+    startedAt: new Date().toISOString(),
+    root: undefined as string | undefined,
+    repo: undefined as string | undefined,
+    status: "",
+    files: [] as ChangedFile[],
+    busy: false,
+    /** Chain position of the current run (see MAX_WAKE_HOPS); messages it sends carry this. */
+    turnHops: 0,
+    pendingWakeHops: undefined as number | undefined,
+    /** When this lead last messaged each other lead: telling them first unlocks a file they changed. */
+    told: new Map<string, number>(),
+    timer: undefined as ReturnType<typeof setInterval> | undefined,
+    lastBeat: 0,
+    ctx: undefined as ExtensionContext | undefined,
+  };
+  const boardOn = () => state.config.leads.enabled && !isChildProcess;
+  const liveCards = (): LeadCard[] => {
+    try {
+      return readCards(lb.dir);
+    } catch {
+      return [];
+    }
+  };
+  const myCard = (): Omit<LeadCard, "name"> => ({
+    owner: lb.owner,
+    cwd: state.cwd,
+    repo: lb.repo,
+    title: pi.getSessionName() || undefined,
+    status: lb.status,
+    working: lb.busy,
+    files: lb.files,
+    startedAt: lb.startedAt,
+    updatedAt: new Date().toISOString(),
+  });
+  /**
+   * Still the owner of our name? A session suspended (Ctrl+Z) or stalled past the stale limit can find its name
+   * taken by a newer session. Then it moves to a free name instead of overwriting that card or reading its mail.
+   */
+  const ensureSeat = (): boolean => {
+    if (!lb.name) return false;
+    const c = readCard(lb.dir, lb.name);
+    if (!c || c.owner === lb.owner) return true;
+    const old = lb.name;
+    try {
+      lb.name = claimName(lb.dir, state.config.leads.name || basename(lb.root ?? state.cwd), myCard());
+      lb.lastBeat = Date.now();
+    } catch {
+      lb.name = "";
+      return false;
+    }
+    try {
+      lb.ctx?.ui.notify(`Another session took the lead name "${old}" while this one was paused; this lead is now "${lb.name}".`, "warning");
+    } catch {
+      /* ignore */
+    }
+    return true;
+  };
+  const beat = () => {
+    try {
+      if (!ensureSeat()) return;
+      writeCard(lb.dir, { ...myCard(), name: lb.name });
+      lb.lastBeat = Date.now();
+    } catch {
+      /* the board is a convenience; a failed write is retried on the next beat */
+    }
+  };
+  const setLeadStatus = (s: string) => {
+    lb.status = s.replace(/\s+/g, " ").trim().slice(0, MAX_STATUS);
+    beat();
+  };
+  const isIdle = () => {
+    try {
+      return lb.ctx ? lb.ctx.isIdle() : !lb.busy;
+    } catch {
+      return !lb.busy;
+    }
+  };
+
+  let delivering = false;
+  let failedDeliveries = 0;
+  async function deliverMail() {
+    if (delivering) return;
+    delivering = true;
+    try {
+      if (!ensureSeat()) return;
+      // Read without removing: the files go only after pi accepted the message, so a failure is retried.
+      const box = readInbox(lb.dir, lb.name);
+      if (!box.files.length) return;
+      const mail = box.messages;
+      if (!mail.length) return ackInbox(box.files); // only broken files
+      const idle = isIdle() && !lb.busy;
+      const wakers = mail.filter((m) => shouldWake(m, idle, state.config.leads.wake));
+      if (wakers.length) {
+        lb.busy = true; // the next poll must not start a second run before agent_start arrives
+        // The run this starts is part of the chain; set it here too, not only in before_agent_start.
+        lb.pendingWakeHops = lb.turnHops = Math.max(...wakers.map((m) => m.hops)) + 1;
+      }
+      try {
+        // Busy: steered into the running turn. Idle without a wake: stored for the next turn.
+        await pi.sendMessage({ customType: BOARD_MESSAGE, content: formatIncoming(mail), display: true, details: { messages: mail } }, { deliverAs: "steer", triggerTurn: !idle || wakers.length > 0 });
+      } catch (error) {
+        if (wakers.length) lb.busy = false;
+        // Retried on the next polls; after 3 failures they are dropped (they stay readable in /leads).
+        if (++failedDeliveries >= 3) {
+          failedDeliveries = 0;
+          ackInbox(box.files);
+        }
+        try {
+          lb.ctx?.ui.notify(`Could not deliver lead messages (${(error as Error).message}); see /leads.`, "warning");
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      failedDeliveries = 0;
+      ackInbox(box.files);
+      try {
+        if (lb.ctx?.hasUI) lb.ctx.ui.notify(`Message from lead ${[...new Set(mail.map((m) => m.from))].join(", ")}: ${mail[mail.length - 1].text.replace(/\s+/g, " ").slice(0, 140)}`, "info");
+      } catch {
+        /* stale context after a session switch */
+      }
+    } catch {
+      /* board files unreadable right now: next poll */
+    } finally {
+      delivering = false;
+    }
+  }
+
+  /** Path of an edit/write target relative to the repo root, or undefined when it is outside the repo. */
+  const repoRelative = (p: unknown): string | undefined => {
+    if (typeof p !== "string" || !lb.root) return undefined;
+    const abs = resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir()));
+    const rel = relative(lb.root, abs);
+    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel.replace(/\\/g, "/") : undefined;
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    lb.ctx = ctx;
+    if (!boardOn()) return;
+    // One board seat per process. pi-subagents 0.88 runs foreground (async: false) subagents as sessions inside
+    // the lead's own process without PI_SUBAGENT_CHILD; today it loads no ambient extensions into them (checked:
+    // only its async runner does), but any in-process session that did load this one must not take the lead's
+    // name and mail. The lead's session starts first and holds the seat until it shuts down (/new, /reload, exit).
+    const seat = globalThis as unknown as Record<symbol, object | undefined>;
+    if (seat[BOARD_SEAT] && seat[BOARD_SEAT] !== lb) return;
+    seat[BOARD_SEAT] = lb;
+    lb.root = findRepoRoot(ctx.cwd);
+    lb.repo = lb.root ? pathKey(gitCommonDir(lb.root)) : undefined;
+    if (!lb.name) {
+      try {
+        lb.name = claimName(lb.dir, state.config.leads.name || basename(lb.root ?? ctx.cwd), myCard());
+        lb.lastBeat = Date.now();
+      } catch {
+        return; // read-only home or similar: run without the board
+      }
+    } else beat();
+    if (!lb.timer) {
+      lb.timer = setInterval(() => {
+        void deliverMail();
+        if (Date.now() - lb.lastBeat > 30_000) beat();
+      }, 2_000);
+      lb.timer.unref?.();
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    const seat = globalThis as unknown as Record<symbol, object | undefined>;
+    if (seat[BOARD_SEAT] === lb) delete seat[BOARD_SEAT];
+    if (lb.timer) clearInterval(lb.timer);
+    lb.timer = undefined;
+    if (lb.name) {
+      try {
+        removeCard(lb.dir, lb.name, lb.owner); // unread mail stays for the next session with this name
+      } catch {
+        /* ignore */
+      }
+    }
+    lb.name = "";
+  });
+
+  pi.on("agent_start", async () => {
+    lb.busy = true;
+    beat();
+  });
+  // A person typing starts a new chain (also covered in before_agent_start; this does not depend on it).
+  pi.on("input", async (event) => {
+    if (event.source !== "extension") lb.turnHops = 0;
+  });
+  pi.on("agent_settled", async () => {
+    lb.busy = false;
+    beat();
+  });
+
+  // Changing a file another lead changed in the last 30 minutes: tell them first, then it goes through.
+  pi.on("tool_call", async (event) => {
+    if (!lb.name || !lb.repo || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const rel = repoRelative((event.input as { path?: unknown }).path);
+    if (!rel) return;
+    const now = Date.now();
+    const others = overlaps(liveCards(), lb.name, lb.repo, rel, now).filter((c) => now - (lb.told.get(c.name) ?? 0) > OVERLAP_MS);
+    if (!others.length) return;
+    const names = others.map((c) => c.name).join(", ");
+    return {
+      block: true,
+      reason: `${rel} was changed in the last 30 minutes by lead ${others.map((c) => `${c.name} (status: ${c.status || "none"})`).join(", ")}. Tell ${names} first with the leads tool (action send: what you will change in this file and why; update=true if they must adjust), then retry this change.`,
+    };
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (!lb.name || event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const rel = repoRelative((event.input as { path?: unknown }).path);
+    if (!rel) return;
+    lb.files = recordFile(lb.files, rel);
+    beat();
+  });
+
+  if (!isChildProcess)
+    pi.registerTool({
+      name: "leads",
+      label: "Leads",
+      description:
+        'Talk to the other lead sessions on this machine: pi sessions working on related tasks, in this repo or another. list: who is running, where, and their status. status: set the one line others see about you. send: tell another lead (or "all") what you changed; update=true asks them to check the impact and update their code, docs and status now (an idle session is woken for it).',
+      promptSnippet: "See the other lead sessions and tell them what you changed",
+      parameters: Type.Object({
+        action: StringEnum(["list", "status", "send"] as const),
+        text: Type.Optional(Type.String({ description: "status: your new one-line status. send: what changed and where, in one or two lines" })),
+        to: Type.Optional(Type.String({ description: 'send: a lead name from list, or "all"' })),
+        update: Type.Optional(Type.Boolean({ description: "send: ask them to update their code, docs and status now" })),
+      }),
+      async execute(_id, params) {
+        if (role !== "lead") throw new Error("only lead sessions use the board; report to your lead instead");
+        if (!boardOn() || !lb.name) throw new Error("the lead board is off here (leads.enabled in ptk.json, a subagent session, or the home directory is not writable)");
+        const now = Date.now();
+        if (params.action === "list")
+          return text(`${formatBoard(liveCards(), lb.name, now, homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 8))}`);
+        if (params.action === "status") {
+          if (!params.text?.trim()) throw new Error("text is required: one line on what you are doing or what is done");
+          setLeadStatus(params.text);
+          return text(`Status set: "${lb.status}"`);
+        }
+        if (!params.to?.trim()) throw new Error('to is required: a lead name from leads list, or "all"');
+        const update = params.update === true;
+        const r = sendMessage(lb.dir, { from: lb.name, to: params.to.trim(), text: params.text ?? "", update, hops: lb.turnHops }, now);
+        for (const n of r.delivered) lb.told.set(n, now);
+        const notes = [
+          r.offline.length ? `Not running now: ${r.offline.join(", ")}; they get it when a session takes that name.` : "",
+          update && lb.turnHops >= MAX_WAKE_HOPS ? "This reply chain is long enough, so idle leads are not woken; they see it on their next turn." : "",
+        ].filter(Boolean);
+        return text(`Sent to ${r.delivered.join(", ")}.${notes.length ? ` ${notes.join(" ")}` : ""}`);
+      },
+    });
+
+  pi.registerCommand("leads", {
+    description: "Lead sessions on this machine and their recent messages. /leads name <name> renames this lead",
+    handler: async (args, ctx) => {
+      if (!boardOn() || !lb.name) return ctx.ui.notify("The lead board is off here (leads.enabled: false in ptk.json, or this is a subagent).", "info");
+      const [sub, ...rest] = args.trim().split(/\s+/);
+      if (sub === "name") {
+        const want = slugName(rest.join(" "));
+        if (!rest.length || !validName(want)) return ctx.ui.notify("Usage: /leads name <name> (lowercase letters, digits, . _ -)", "error");
+        if (want === lb.name) return ctx.ui.notify(`This lead is already "${want}".`, "info");
+        await deliverMail(); // nothing unread is left behind under the old name
+        const got = claimName(lb.dir, want, myCard());
+        if (got !== want) {
+          if (got !== lb.name) removeCard(lb.dir, got, lb.owner); // undo the fallback claim, never our current card
+          return ctx.ui.notify(`"${want}" belongs to a running lead; pick another name.`, "error");
+        }
+        removeCard(lb.dir, lb.name, lb.owner);
+        lb.name = got;
+        return ctx.ui.notify(`This lead is now "${got}" on the board.`, "info");
+      }
+      ctx.ui.notify(`Leads (you are "${lb.name}"):\n${formatBoard(liveCards(), lb.name, Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 10))}`, "info");
+    },
+  });
+
   // ---------- /ptk ----------
 
   pi.registerCommand("ptk", {
@@ -844,6 +1184,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         `project trust: ${state.trusted ? "yes (project config, facts and toolbox loaded)" : "no (project .pi/ptk.json, facts and toolbox ignored)"}`,
         `guard: ${g.enabled ? `on, timeout ${g.defaultTimeoutSec}s / tests ${g.testTimeoutSec}s / builds ${g.buildTimeoutSec}s (max ${g.maxTimeoutSec}s), search=${g.preferFastSearch}` : "off"}`,
         `pi-subagents: ${subagents}; team gate: ${state.config.team.gate || state.env?.testCommand || "(none)"}; models: ${Object.entries(state.config.team.models).map(([r, m]) => `${r}=${m || "default"}`).join(", ")}`,
+        `leads: ${lb.name ? `you are "${lb.name}", ${liveCards().filter((c) => c.name !== lb.name).length} other lead(s) running (/leads)` : "off"}`,
         `toolbox: ${state.tools.map((t) => `${t.name}[${t.layer}]`).join(", ") || "empty"}`,
         `facts: ${state.facts.length} (${state.facts.filter((f) => f.stale).length} stale; checks ${factChecks}), pitfalls: ${state.pitfalls.length}`,
         ...(() => {

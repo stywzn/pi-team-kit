@@ -100,3 +100,17 @@ cd ~/code/ptk-demo && pi
 ## 8. 多个 pi 会话怎么分
 
 终端标题是「会话名 · 目录」，会话名默认取你的第一句话，运行中前面带 `●`。跑完超过 30 秒会弹桌面通知（WSL 下是 Windows 通知，在 tmux 里也能弹）。tmux 里可以让窗口名跟随标题（`automatic-rename-format '#{pane_title}'`）。
+
+### 几个主会话互相通知
+
+比如一个主会话做后端（`~/code/api`），一个做前端（`~/code/web`）。不用配置，开着就互相看得见，名字默认是仓库文件夹名（`api`、`web`）：
+
+```text
+（在 api 里）把 POST /login 改成 /v2/login，改完告诉 web
+```
+
+- api 改完用 `leads` 工具发消息给 web。要求对方跟着改时带 `update=true`：web 正在跑就在下一步之前收到（不打断），空闲就被叫醒，去改自己的代码、文档、状态，再回 api 一句。
+- 防止来回没完：被消息叫醒的会话再发消息，只能把对方叫醒一次（A→B→A 之后就不再叫醒，消息留着等下一轮看）。
+- 防止改冲突：同一个仓库（包括它的 worktree）里，A 要改 B 最近 30 分钟改过的文件，会先被拦下，提示先告诉 B；告诉之后放行。只认 pi 的 edit/write 工具改的文件，用 bash 命令改的看不到。
+- `/leads`（pi 里）或 `ptk leads`（shell 里，SSH 远程也能看）看谁在线、各自在做什么、最近的消息；`/leads name <名字>` 改名。对方不在线时消息会留着，下一个用这个名字的会话（通常是同一个仓库里 `/continue` 接手的那个）打开时就收到。
+- 关掉：`~/.pi/agent/ptk.json` 里 `"leads": { "enabled": false }`；只想通知、不想叫醒对方：`"wake": false`。
