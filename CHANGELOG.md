@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.3.1] - 2026-11-17
+
+- Windows/WSL desktop notifications: the script is passed with `-EncodedCommand`, so Chinese and other non-ASCII text survives the WSL to Windows code page boundary, and the toast template is filled without the "collection was modified" error that kept it from showing.
+
 ## [0.3.0] - 2026-11-17
 
 - Clarify first, then unattended: `team_run` takes `doneWhen`, `outOfScope` and `assumptions`, and in the terminal shows the brief in a confirmation dialog before starting. After that the lead never waits for the user, takes conservative defaults on minor decisions, integrates and writes a CI-style report. The done-criteria travel to planner, workers and verifier.

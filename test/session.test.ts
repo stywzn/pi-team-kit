@@ -54,7 +54,9 @@ test("notifications pick the right mechanism and escape their text", () => {
   const wsl = buildNotification("pi · it's done", "Done after 42s", "linux", { WSL_DISTRO_NAME: "Ubuntu" }, false);
   assert.equal(wsl.kind, "spawn");
   assert.equal(wsl.kind === "spawn" && wsl.command, "powershell.exe");
-  assert.match(wsl.kind === "spawn" ? wsl.args[3] : "", /'pi · it''s done'/, "single quotes doubled for PowerShell");
+  assert.equal(wsl.kind === "spawn" && wsl.args[2], "-EncodedCommand");
+  const script = Buffer.from(wsl.kind === "spawn" ? wsl.args[3] : "", "base64").toString("utf16le");
+  assert.match(script, /'pi · it''s done'/, "text survives as UTF-16, single quotes doubled for PowerShell");
   const mac = buildNotification('say "hi"', "b", "darwin", {}, false);
   assert.equal(mac.kind === "spawn" && mac.command, "osascript");
   assert.match(mac.kind === "spawn" ? mac.args[1] : "", /with title "say \\"hi\\""/);

@@ -95,12 +95,13 @@ export function buildNotification(title: string, body: string, platform: NodeJS.
     const script = [
       `[${ns}.ToastNotificationManager, ${ns}, ContentType = WindowsRuntime] > $null`,
       `$x = [${ns}.ToastNotificationManager]::GetTemplateContent([${ns}.ToastTemplateType]::ToastText02)`,
-      `$t = $x.GetElementsByTagName('text')`,
-      `$t[0].AppendChild($x.CreateTextNode(${psQuote(t)})) > $null`,
-      `$t[1].AppendChild($x.CreateTextNode(${psQuote(b)})) > $null`,
+      `$x.GetElementsByTagName('text').Item(0).AppendChild($x.CreateTextNode(${psQuote(t)})) > $null`,
+      `$x.GetElementsByTagName('text').Item(1).AppendChild($x.CreateTextNode(${psQuote(b)})) > $null`,
       `[${ns}.ToastNotificationManager]::CreateToastNotifier(${psQuote(appId)}).Show([${ns}.ToastNotification]::new($x))`,
     ].join("; ");
-    return { kind: "spawn", command: platform === "win32" ? "powershell" : "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", script] };
+    // -EncodedCommand (UTF-16LE, base64) keeps non-ASCII text intact across the WSL -> Windows code page boundary.
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return { kind: "spawn", command: platform === "win32" ? "powershell" : "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded] };
   }
   if (platform === "darwin") {
     const q = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
