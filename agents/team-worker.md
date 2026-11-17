@@ -2,7 +2,7 @@
 name: team-worker
 description: Implements one lane of a pi-team-kit team run inside its own git worktree; edits only the files it owns
 acceptanceRole: writer
-thinking: medium
+thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false

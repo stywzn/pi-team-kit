@@ -97,10 +97,18 @@ export interface PtkConfig {
     /** Model per role, "provider/model" as in `pi --list-models`; "" = the agent's default (the main session's model).
      *  A verifier from a different model family than the workers catches more of their mistakes. */
     models: { planner: string; worker: string; verifier: string };
-    /** Thinking level per role (off, minimal, low, medium, high, xhigh, max); "" = the agent's own: planner and verifier
-     *  think the hardest (splitting and checking decide the run), workers less (they follow a detailed brief).
-     *  Levels a model does not support are clamped by pi. */
+    /** Thinking level per role (off, minimal, low, medium, high, xhigh, max); "" = the agent's own: max for the planner
+     *  and the verifier (splitting and checking decide the run), high for workers (they follow a detailed brief).
+     *  Levels a model does not support are clamped by pi. For one session, say it in the conversation instead
+     *  (the lead calls team_thinking) or use /team-thinking. */
     thinking: { planner: string; worker: string; verifier: string };
+    /** Each lane's gate runs only the test files the lane owns, when the gate is a test command and the lane owns
+     *  test files; the full gate still runs once on the combined code (team_integrate). */
+    laneTests: boolean;
+    /** Untracked files and folders of the repo (virtualenvs, .env, node_modules) linked into each worker's worktree,
+     *  so workers neither reinstall dependencies nor fail on missing local config. [] = off. Uses pi-subagents'
+     *  worktreeSetupHook, which pi-team-kit sets once when it is not set (it never replaces your own hook). */
+    linkIntoWorktrees: string[];
   };
   /** Lead sessions on this machine see each other's status and tell each other what they changed (the leads tool, /leads). */
   leads: {
@@ -163,6 +171,8 @@ export const DEFAULTS: PtkConfig = {
     verifierAgent: "team-verifier",
     models: { planner: "", worker: "", verifier: "" },
     thinking: { planner: "", worker: "", verifier: "" },
+    laneTests: true,
+    linkIntoWorktrees: [".venv", "venv", ".env", ".env.local", "node_modules"],
   },
   leads: { enabled: true, wake: true, name: "" },
   playbooks: { dir: "", dirs: [], confirm: true },

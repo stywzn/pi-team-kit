@@ -58,18 +58,24 @@ cd ~/code/ptk-demo && pi
 
 ## 5. 模型怎么搭（DeepSeek + GLM）
 
-在 `~/.pi/agent/ptk.json` 里按角色指定，名字用 `pi --list-models` 里的。推荐全部用快模型，靠思考强度区分：拆任务和审查决定整次运行的质量，思考开到最大；worker 照着详细的任务说明干活，不需要那么强：
+在 `~/.pi/agent/ptk.json` 里按角色指定模型，名字用 `pi --list-models` 里的。推荐全部用快模型：
 
 ```json
-{
-  "team": {
-    "models": { "planner": "deepseek/deepseek-flash", "worker": "deepseek/deepseek-flash", "verifier": "deepseek/deepseek-flash" },
-    "thinking": { "planner": "max", "worker": "medium", "verifier": "max" }
-  }
-}
+{ "team": { "models": { "planner": "deepseek/deepseek-flash", "worker": "deepseek/deepseek-flash", "verifier": "deepseek/deepseek-flash" } } }
 ```
 
-`thinking` 不写时就是这个默认值（写在三个 agent 自己的定义里）；可选 off、minimal、low、medium、high、xhigh、max，模型不支持的档位 pi 会自动降到它支持的最高档。主会话自己的思考强度用 pi 的 `/thinking` 调，写任务书、拆目标时可以临时调高。
+思考强度默认：拆任务、审查 `max`，worker `high`。临时改直接跟主会话说（"这次 worker 用 medium"），或者 `/team-thinking worker=medium`，`/team-thinking reset` 恢复；只对当前会话有效，不改全局。想改默认值再写 `team.thinking`。可选 off、minimal、low、medium、high、xhigh、max，模型不支持的档位 pi 会自动降。主会话自己的思考强度用 pi 的 `/thinking`。
+
+### 让 team 跑得更快的几件事（默认都开着）
+
+- worker 的副本会自动激活项目的 `.venv`、复制被 git 忽略的 `.env`，不用重装依赖、不会因为缺配置返工（`team.linkIntoWorktrees`）。
+- 每一路只跑自己负责的测试文件，合并后再跑一次全套（`team.laneTests`）。
+- 小而明确的目标，主会话会自己拆好任务，跳过规划员。
+- `/feedback` 会显示时间花在哪个角色上。
+
+### 阅读 agent（默认不用）
+
+需要时直接说"让阅读 agent 看一下 xxx（关键词或目录），主题叫 xxx"。它读完给主会话一份带出处的要点（事实、关键文件、怎么跑、缺什么），结果会缓存：同一主题再问，源文件没变就直接用缓存。`/team` 时说"把阅读 agent 的 xxx 交给团队"，规划员和 worker 就不再重读一遍。
 
 审查员最好和 worker 不是同一家模型：不同模型的盲区不一样，互相检查能发现更多问题。GLM 的 key 用 `/login` 登录，或设环境变量 `ZAI_CODING_CN_API_KEY`（国内 Coding Plan）/ `ZAI_API_KEY`（国际版）。
 

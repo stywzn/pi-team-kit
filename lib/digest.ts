@@ -1,0 +1,122 @@
+// Reader digests: what the team-reader agent extracted from documents or a codebase, kept so the lead, the
+// planner and every worker reuse it instead of reading the same material again. A digest names its sources;
+// it stays valid while those files are unchanged (content hash), and says which changed when it is stale.
+//   <dir>/<key>.md     the digest text
+//   <dir>/<key>.json   topic, repository, sources with hashes
+
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+import { redact } from "./playbook.ts";
+
+export const DIGEST_MAX_CHARS = 8_000;
+
+export interface DigestSource {
+  path: string;
+  hash: string;
+}
+
+export interface DigestMeta {
+  topic: string;
+  key: string;
+  root: string;
+  created: string;
+  sources: DigestSource[];
+}
+
+const normTopic = (t: string) => t.toLowerCase().replace(/\s+/g, " ").trim();
+
+export function digestKey(topic: string, root: string): string {
+  const slug = normTopic(topic).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "digest";
+  return `${slug}-${createHash("sha256").update(`${root}\n${normTopic(topic)}`).digest("hex").slice(0, 10)}`;
+}
+
+/** Paths listed under "## Sources". */
+export function digestSources(text: string): string[] {
+  const m = text.replace(/\r\n?/g, "\n").match(/^##\s*Sources\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/m);
+  if (!m) return [];
+  return m[1]
+    .split("\n")
+    .map((l) => l.replace(/^\s*[-*\d.)]+\s+/, "").replace(/`/g, "").replace(/:\d+(-\d+)?$/, "").trim())
+    // paths only: something with a folder separator or a file extension, not a sentence
+    .filter((l) => l && (/[\\/]/.test(l) || /\.[A-Za-z0-9]{1,8}$/.test(l)) && !/\s\S+\s\S+\s/.test(l))
+    // git internals, environments and caches change all the time and are never what a digest is about
+    .filter((l) => !/(^|[\\/])(\.git|\.venv|venv|node_modules|__pycache__|\.pi[\\/]subagents)([\\/]|$)/.test(l))
+    .slice(0, 200);
+}
+
+export function fileHash(path: string): string {
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) return st.isDirectory() ? "dir" : "missing";
+    if (st.size > 20_000_000) return `size:${st.size}:${Math.round(st.mtimeMs)}`;
+    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16);
+  } catch {
+    return "missing";
+  }
+}
+
+export function saveDigest(dir: string, topic: string, root: string, text: string, now = new Date()): DigestMeta {
+  const body = redact(text.trim());
+  if (!body) throw new Error("the digest is empty");
+  if (body.length > DIGEST_MAX_CHARS) throw new Error(`keep a digest under ${DIGEST_MAX_CHARS} characters; ask the reader for a shorter one`);
+  const paths = digestSources(body);
+  if (!paths.length) throw new Error('the digest has no "## Sources" section listing the files it relied on; without it, it cannot tell when it is out of date');
+  const key = digestKey(topic, root);
+  const sources = paths.map((p) => ({ path: p, hash: fileHash(isAbsolute(p) ? p : resolve(root, p)) }));
+  const meta: DigestMeta = { topic: normTopic(topic), key, root, created: now.toISOString(), sources };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${key}.md`), `${body}\n`);
+  writeFileSync(join(dir, `${key}.json`), JSON.stringify(meta, null, 2) + "\n");
+  return meta;
+}
+
+export interface FoundDigest {
+  meta: DigestMeta;
+  text: string;
+  /** Sources that changed or disappeared since the digest was written. */
+  changed: string[];
+}
+
+export function findDigest(dir: string, topic: string, root: string): FoundDigest | undefined {
+  const key = digestKey(topic, root);
+  try {
+    const meta = JSON.parse(readFileSync(join(dir, `${key}.json`), "utf8")) as DigestMeta;
+    const text = readFileSync(join(dir, `${key}.md`), "utf8").trim();
+    const changed = meta.sources.filter((s) => fileHash(isAbsolute(s.path) ? s.path : resolve(meta.root, s.path)) !== s.hash).map((s) => s.path);
+    return { meta, text, changed };
+  } catch {
+    return undefined;
+  }
+}
+
+export function listDigests(dir: string, root?: string): DigestMeta[] {
+  if (!existsSync(dir)) return [];
+  const out: DigestMeta[] = [];
+  for (const f of readdirSync(dir).filter((x) => x.endsWith(".json"))) {
+    try {
+      const m = JSON.parse(readFileSync(join(dir, f), "utf8")) as DigestMeta;
+      if (!root || m.root === root) out.push(m);
+    } catch {
+      /* skip */
+    }
+  }
+  return out.sort((a, b) => b.created.localeCompare(a.created));
+}
+
+/** Digests for a team run's goal: planner and workers get them instead of reading the material again. */
+export function digestBlock(found: FoundDigest[], maxChars = DIGEST_MAX_CHARS): string {
+  const parts: string[] = [];
+  let size = 0;
+  for (const d of found) {
+    const head = `Reader digest "${d.meta.topic}" (${d.meta.created.slice(0, 10)}${d.changed.length ? `; since changed: ${d.changed.slice(0, 5).join(", ")}, check those yourself` : ""}):`;
+    const piece = `${head}\n${d.text}`;
+    if (size + piece.length > maxChars) {
+      parts.push(`Reader digest "${d.meta.topic}" left out (too long together with the others).`);
+      continue;
+    }
+    parts.push(piece);
+    size += piece.length;
+  }
+  return parts.join("\n\n");
+}

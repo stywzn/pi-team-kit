@@ -6,6 +6,7 @@
 //   team      - team_run / team_integrate on top of pi-subagents (lead + workers + verifier + rework)
 //   leads     - lead sessions on related tasks see each other's status and tell each other what changed
 
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
@@ -18,7 +19,9 @@ import { Type } from "typebox";
 
 import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions, sessionEvidence } from "../lib/harvest.ts";
-import { formatFriction, frictionFromFiles, sessionFiles } from "../lib/feedback.ts";
+import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
+import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, prepareWorktree } from "../lib/worktree.ts";
+import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import {
   appendRetired,
   applyChanges,
@@ -64,7 +67,7 @@ import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } fro
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -74,6 +77,9 @@ const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BOARD_MESSAGE = "ptk-lead-message";
 /** globalThis key of the one session per process that sits on the lead board. */
 const BOARD_SEAT = Symbol.for("pi-team-kit.board-seat");
+/** The team agents' own thinking levels (agents/*.md), shown when nothing overrides them. */
+const AGENT_THINKING = { planner: "max", worker: "high", verifier: "max" } as const;
+type TeamRole = keyof typeof AGENT_THINKING;
 
 const HANDOFF_PROMPT = `You write the opening brief for a fresh coding session that continues work from an earlier conversation.
 Include: the goal for the new session; decisions already made and why; constraints; files involved (paths); what was verified and what was not; open questions.
@@ -190,14 +196,14 @@ export default function piTeamKit(pi: ExtensionAPI) {
    * Run a shell command the way pi's own bash tool does (Git Bash on Windows, bash elsewhere),
    * instead of assuming `sh` is on PATH. `missingShell` means no bash could be started at all.
    */
-  async function runShell(command: string, cwd: string, timeoutSec: number, signal?: AbortSignal) {
+  async function runShell(command: string, cwd: string, timeoutSec: number, signal?: AbortSignal, env: NodeJS.ProcessEnv = process.env) {
     let out = "";
     const append = (d: Buffer) => {
       if (out.length < 400_000) out += d.toString();
     };
     try {
       const ops = createLocalBashOperations();
-      const r = await ops.exec(command, cwd, { onData: append, timeout: timeoutSec, signal, env: process.env });
+      const r = await ops.exec(command, cwd, { onData: append, timeout: timeoutSec, signal, env });
       return { code: r.exitCode, output: out, timedOut: false, missingShell: false };
     } catch (error) {
       const msg = String((error as Error)?.message ?? error);
@@ -269,6 +275,24 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.setStatus("ptk", `ptk: ${state.tools.length} tools, ${state.facts.length} facts${warn}`);
   });
 
+  // A team worker starts in a fresh worktree: activate the project's virtualenv and copy its ignored local config
+  // (lib/worktree.ts) before the first turn, so it neither reinstalls dependencies nor fails on a missing .env.
+  let worktreeNote = "";
+  pi.on("session_start", async (_event, ctx) => {
+    worktreeNote = "";
+    if (!process.env.PI_SUBAGENT_CHILD || !state.config.team.linkIntoWorktrees.length || !isWorkerWorktree(ctx.cwd)) return;
+    const main = mainCheckout(ctx.cwd);
+    if (!main) return;
+    const ignored = (rel: string) => spawnSync("git", ["-C", ctx.cwd, "check-ignore", "-q", "--", rel], { stdio: "ignore", windowsHide: true, timeout: 10_000 }).status === 0;
+    try {
+      const prep = prepareWorktree(main, ctx.cwd, state.config.team.linkIntoWorktrees, ignored);
+      if (prep.venv) activateVenv(prep.venv, process.env);
+      worktreeNote = describePrep(prep);
+    } catch {
+      /* the worker still works, only slower */
+    }
+  });
+
   // ---------- prompt sections ----------
 
   pi.on("before_agent_start", async (event) => {
@@ -285,6 +309,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       env.push("Saved facts and pitfalls (from earlier sessions):", formatFacts(state.facts, state.pitfalls));
     if (c.facts.enabled)
       env.push("This is already known: do not spend tool calls rediscovering it. When something costs you several tool calls to find and will still be true next week, save it with the remember tool.");
+    if (worktreeNote) env.push(worktreeNote);
     sections["environment"] = env.join("\n");
     if (c.guard.enabled)
       sections["command-rules"] =
@@ -516,6 +541,85 @@ export default function piTeamKit(pi: ExtensionAPI) {
   // `repo` parameter, the session folder, or the previous run in this session.
   let lastTeamRepo: string | undefined;
   const workRepo = (cwd: string) => findRepoRoot(cwd) ?? lastTeamRepo;
+
+  // Thinking per role for this session only, said in the conversation: over ptk.json, over the agents' defaults.
+  // Kept as a session entry, so it survives /reload and /resume of this session but no other session sees it.
+  let sessionThinking: Partial<Record<TeamRole, string>> = {};
+  const effectiveThinking = (): Partial<Record<TeamRole, string>> => {
+    const out: Partial<Record<TeamRole, string>> = {};
+    for (const r of ["planner", "worker", "verifier"] as const) {
+      const level = sessionThinking[r] || state.config.team.thinking[r];
+      if (level) out[r] = level;
+    }
+    return out;
+  };
+  const thinkingTable = () => (["planner", "worker", "verifier"] as const).map((r) => `${r} ${effectiveThinking()[r] ?? AGENT_THINKING[r]}${sessionThinking[r] ? " (this session)" : ""}`).join(", ");
+  const setSessionThinking = (patch: Partial<Record<TeamRole, string>> | "reset") => {
+    if (patch === "reset") sessionThinking = {};
+    else
+      for (const [r, level] of Object.entries(patch) as [TeamRole, string][]) {
+        if (!level) continue;
+        if (!(THINKING_LEVELS as readonly string[]).includes(level)) throw new Error(`"${level}" is not a thinking level; use one of ${THINKING_LEVELS.join(", ")}`);
+        sessionThinking[r] = level;
+      }
+    pi.appendEntry("ptk-team-thinking", { ...sessionThinking });
+  };
+  pi.on("session_start", async (_event, ctx) => {
+    sessionThinking = {};
+    try {
+      for (const e of ctx.sessionManager.getBranch() as { type?: string; customType?: string; data?: Partial<Record<TeamRole, string>> }[])
+        if (e.type === "custom" && e.customType === "ptk-team-thinking" && e.data) sessionThinking = { ...e.data };
+    } catch {
+      /* no session history */
+    }
+  });
+
+  pi.registerTool({
+    name: "team_thinking",
+    label: "Team thinking",
+    description:
+      "Change how hard the team-run roles think, for this session only, when the user asks (\"workers can think less\", \"max for everything\"). Levels: off, minimal, low, medium, high, xhigh, max. Defaults: planner max, worker high, verifier max. reset=true goes back to the defaults.",
+    parameters: Type.Object({
+      planner: Type.Optional(StringEnum(THINKING_LEVELS)),
+      worker: Type.Optional(StringEnum(THINKING_LEVELS)),
+      verifier: Type.Optional(StringEnum(THINKING_LEVELS)),
+      reset: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params) {
+      setSessionThinking(params.reset ? "reset" : { planner: params.planner, worker: params.worker, verifier: params.verifier });
+      return text(`Team thinking for this session: ${thinkingTable()}.`);
+    },
+  });
+
+  pi.registerCommand("team-thinking", {
+    description: "Team-run thinking for this session: /team-thinking [planner=max] [worker=high] [verifier=max] | reset",
+    handler: async (args, ctx) => {
+      const words = args.trim().split(/\s+/).filter(Boolean);
+      try {
+        if (words[0] === "reset") setSessionThinking("reset");
+        else if (words.length) {
+          const patch: Partial<Record<TeamRole, string>> = {};
+          for (const w of words) {
+            const [role, level] = w.split("=");
+            if (!["planner", "worker", "verifier"].includes(role) || !level) throw new Error(`"${w}": write role=level, e.g. worker=medium`);
+            patch[role as TeamRole] = level;
+          }
+          setSessionThinking(patch);
+        }
+        ctx.ui.notify(`Team thinking: ${thinkingTable()}`, "info");
+      } catch (error) {
+        ctx.ui.notify((error as Error).message, "error");
+      }
+    },
+  });
+  /** Environment for running the project's gate from the lead: its virtualenv active when it has one (as in workers). */
+  const gateEnv = (root: string): NodeJS.ProcessEnv => {
+    const venv = state.config.team.linkIntoWorktrees.map((n) => join(root, n)).find((p) => existsSync(join(p, "pyvenv.cfg")));
+    if (!venv) return process.env;
+    const env = { ...process.env };
+    activateVenv(venv, env);
+    return env;
+  };
   const repoFor = (cwd: string, repo?: string) => resolveTeamRepo(cwd, repo, lastTeamRepo, findRepoRoot, homedir(), resolve);
   const envCache = new Map<string, EnvFacts>();
   /** Environment facts of the run's repo (for the detected test command), not of the session folder. */
@@ -548,6 +652,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
     promptSnippet: "Run a goal with a planner, parallel workers, a verifier and automatic rework",
     promptGuidelines: [
       "Before team_run, settle the brief with the user: goal, doneWhen (the checks that prove it), outOfScope and your assumptions. Ask about anything unclear and wait; team_run shows the brief to the user for confirmation.",
+      "The user often names a project by a keyword, not a path: find its folder yourself, pass it as repo, and say which folder you picked in the brief.",
+      "For a small, clear goal (one to three tasks whose files you already know), pass tasks yourself: it skips the planner run. Leave tasks out for anything larger or unclear.",
+      "Leave gate out unless the detected test command is wrong. Do not work around the environment in it: workers' worktrees already have the project's virtualenv active and its ignored local files (.env) copied, and each lane runs only its own test files with a plain test command (a compound command runs whole in every lane).",
       "Once a team run is confirmed it runs unattended: the user may be away. Never wait for the user during it. Answer workers' supervisor questions yourself from the brief and the code; when a product decision is truly needed, take the conservative option and record it for the final report.",
       "When a team_run finishes, call team_integrate with the runDir of every passed lane right away, then write the final report. If it returned state needs-input, answer the planner's questions from the brief where you can (otherwise take the conservative option and say so) and run again with tasks.",
     ],
@@ -561,6 +668,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
       playbook: Type.Optional(Type.String({ description: "Name of a matching playbook (lessons from earlier projects of this kind); its steps, tips, pitfalls and never-list travel with the goal" })),
       repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session was started in another folder" })),
+      digests: Type.Optional(Type.Array(Type.String(), { description: "Topics of reader digests (digest tool) to hand to the planner and workers, so they skip reading the same material again" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = repoFor(ctx.cwd, params.repo);
@@ -589,7 +697,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         } else if (pre.kind === "command") {
           const prog = pre.program;
           // Quote the name: it came out of the gate with its quotes removed, so `a;b` must not become two commands.
-          const r = await runShell(`'${prog.replace(/'/g, `'\\''`)}' --version`, root, 20);
+          const r = await runShell(`'${prog.replace(/'/g, `'\\''`)}' --version`, root, 20, undefined, gateEnv(root));
           if (r.missingShell) throw new Error("No bash found to run the gate. On Windows install Git for Windows (pi's bash tool needs it too).");
           if (!r.timedOut && looksUnrunnable(r.code, r.output))
             throw new Error(`The gate \`${gate}\` cannot run here: \`${prog} --version\` said:\n${r.output.trim().slice(0, 500)}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
@@ -606,13 +714,19 @@ export default function piTeamKit(pi: ExtensionAPI) {
         .filter(Boolean)
         .join("\n");
       // A playbook is short by construction, so it can travel with the goal to planner, workers and verifier.
-      const fullGoal = pb ? `${briefText}\n${playbookBrief(readFileSync(join(pb.dir, "SKILL.md"), "utf8"), pb.name).block}` : briefText;
+      const digestBlock = digestsFor(root, params.digests ?? []);
+      const fullGoal = [briefText, pb ? playbookBrief(readFileSync(join(pb.dir, "SKILL.md"), "utf8"), pb.name).block : "", digestBlock].filter(Boolean).join("\n");
+      const models = roleModels(t.models, effectiveThinking(), ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+      const modelText = (["planner", "worker", "verifier"] as const).map((r) => `${r} ${models[r] ?? `default (${AGENT_THINKING[r]})`}`).join(", ");
       if (t.confirm && ctx.hasUI) {
         const summary = [
+          `Repository: ${root}`,
           briefText,
           ...(pb ? [`Playbook: ${pb.name} (${pb.uses} earlier use(s))`] : []),
+          ...(params.digests?.length ? [`Reader digests: ${params.digests.join(", ")}`] : []),
           "",
-          `Gate: ${gate || "(none: verifier only)"}`,
+          `Gate: ${gate || "(none: verifier only)"}${gate && t.laneTests ? " (each lane runs only its own test files; the full gate runs after integration)" : ""}`,
+          `Models: ${modelText}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
           `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min (${t.childTimeoutMin} min per worker run). It runs unattended after you confirm.`,
         ].join("\n");
@@ -629,8 +743,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
         verifierAgent: t.verifierAgent,
         plannerAgent: t.plannerAgent,
         maxTasks: t.maxTasks,
-        models: roleModels(t.models, t.thinking, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+        models,
         childTimeoutMs: t.childTimeoutMin * 60_000,
+        laneTests: t.laneTests,
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),
@@ -717,7 +832,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const gate = integrationGate({ skip: params.skipGate, explicit: params.gate, runGate: openRun?.gate, configured: state.config.team.gate, detected: envFor(root)?.testCommand });
       let gatePassed = true;
       if (gate) {
-        const r = await runShell(gate, root, state.config.team.gateTimeoutSec, signal);
+        const r = await runShell(gate, root, state.config.team.gateTimeoutSec, signal, gateEnv(root));
         gatePassed = r.code === 0;
         const tail = clip(r.output.trim().split("\n").slice(-30).join("\n"), 4000);
         const why = r.missingShell ? "no bash found (on Windows install Git for Windows)" : `exit ${r.code ?? "?"}${r.timedOut ? ", timed out" : ""}`;
@@ -776,7 +891,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
           lines.push(`Playbook "${used.name}" was used. End your report with at most 3 one-line changes to it from this run (a new pitfall or tip, an item that held again, an item that was wrong). Apply them with the playbook tool only after the user agrees.`);
         }
       }
-      lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
+      lines.push(
+        "Changes are uncommitted: review with `git diff` (new files show as untracked), then commit. Do not edit these files yourself now: the verifier checked exactly this; put anything that looks wrong in your report, or start another team run.",
+      );
       saveLead(root, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
       return text(lines.join("\n"));
     },
@@ -1080,6 +1197,58 @@ export default function piTeamKit(pi: ExtensionAPI) {
     },
   });
 
+  // ---------- reader: the team-reader agent's digests, cached (lib/digest.ts) ----------
+  // Off by default: the lead uses the reader only when the user asks. Digests live under <agentDir>/ptk/digests,
+  // never in the project, and stay valid while the files they name are unchanged.
+
+  const digestDir = () => join(globalDataDir(), "digests");
+  const digestsFor = (root: string, topics: string[]): string => {
+    if (!topics.length) return "";
+    const found = topics.map((t) => {
+      const d = findDigest(digestDir(), t, root);
+      if (!d) throw new Error(`No reader digest "${t}" for ${root}. Saved for this project: ${listDigests(digestDir(), root).map((m) => m.topic).join(", ") || "none"}.`);
+      return d;
+    });
+    return digestBlock(found);
+  };
+
+  pi.registerTool({
+    name: "digest",
+    label: "Reader digest",
+    description:
+      "Cache of what the team-reader agent extracted from documents or a codebase. find: the saved digest for a topic, and whether its sources changed since. save: keep the reader's output (it ends with a ## Sources list). list: digests saved for this project. The reader is off by default: use it only when the user asks for it.",
+    promptSnippet: "Reuse what the team-reader agent extracted instead of reading the same material again",
+    promptGuidelines: [
+      "The team-reader agent is off by default. Use it only when the user asks for the reader (\"阅读 agent\", \"have the reader look at X\"): call digest find first; when there is none or its sources changed, run subagent with agent team-reader in the foreground (async false) with the topic and where to look, then digest save its output. Give the user the facts and resources it found.",
+      "Asked about a topic the reader already covered (\"what are the test conventions?\", \"have the reader look at it again\"), call digest find and answer from it. Run the reader again only when its sources changed or the user asks for a fresh read in so many words.",
+      "When a team run should build on what the reader found, pass the topics as digests to team_run, so the planner and workers do not read the same material again.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["find", "save", "list"] as const),
+      topic: Type.Optional(Type.String({ description: "What was read, in a few words, e.g. \"login test cases\" or \"test framework conventions\"" })),
+      text: Type.Optional(Type.String({ description: "save: the reader's digest, as it returned it" })),
+      repo: Type.Optional(Type.String({ description: "The project's folder, when this session was started elsewhere" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const asked = params.repo?.trim() ? resolve(ctx.cwd, params.repo.trim().replace(/^~(?=$|[\\/])/, homedir())) : undefined;
+      const root = asked ? (findRepoRoot(asked) ?? asked) : (workRepo(ctx.cwd) ?? ctx.cwd);
+      if (params.action === "list") {
+        const all = listDigests(digestDir(), root);
+        return text(all.length ? all.map((m) => `- "${m.topic}" (${m.created.slice(0, 10)}, ${m.sources.length} source file(s))`).join("\n") : `No reader digests for ${root} yet.`);
+      }
+      const topic = params.topic?.trim();
+      if (!topic) throw new Error("topic is required: what was read, in a few words");
+      if (params.action === "save") {
+        const meta = saveDigest(digestDir(), topic, root, params.text ?? "");
+        return text(`Saved reader digest "${meta.topic}" for ${root} (${meta.sources.length} source file(s)). It stays valid while those files are unchanged; pass the topic as digests to team_run to hand it to the team.`);
+      }
+      const d = findDigest(digestDir(), topic, root);
+      if (!d) return text(`No digest for "${topic}" in ${root}. Run subagent with agent team-reader (async false) on it, then digest save.`);
+      if (d.changed.length) return text(`Saved digest for "${topic}" from ${d.meta.created.slice(0, 10)} is out of date: changed since: ${d.changed.slice(0, 10).join(", ")}. Run the reader again on these, then digest save.\n\n${d.text}`);
+      return text(`Saved digest for "${topic}" (${d.meta.created.slice(0, 10)}; its ${d.meta.sources.length} source file(s) are unchanged):\n\n${d.text}`);
+    },
+  });
+
   // ---------- friction: where the tooling itself cost time, for improving pi-team-kit ----------
   // The report reads pi's session files (lib/feedback.ts); the only thing written is an optional note entry.
 
@@ -1102,7 +1271,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
 
   const frictionReport = (cwd: string, days: number, all: boolean) => {
     const files = sessionFiles(join(agentDir(), "sessions"), days);
-    const { signals, sessions } = frictionFromFiles(files, all ? undefined : basename(findRepoRoot(cwd) ?? cwd), readRunValue);
+    const { signals, sessions } = frictionFromFiles(files, all ? undefined : basename(findRepoRoot(cwd) ?? cwd), readRunValue, runPhases);
     return formatFriction(signals, { days, sessions });
   };
 

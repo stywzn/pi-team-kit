@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.0] - 2026-11-18
+
+Faster team runs, from measurements on real runs (the friction report now shows where the time goes).
+
+- Worker worktrees are ready before the first turn: the project's virtualenv is activated for the worker and its gate (not copied), small local files git ignores (`.env`) are copied, ignored folders (`node_modules`) are symlinked except on Windows. Only paths git ignores in the worktree are placed, so nothing reaches the patch (a `node_modules/` pattern does not cover a link, so no link is made then). `team.linkIntoWorktrees`, `[]` to turn off. The gate the lead runs (preflight, integration) uses the same virtualenv. Done in the worker's own session start: pi-subagents' setup hook cannot start a script on Windows.
+- Each lane's gate runs only the test files the lane owns, for pytest, unittest, jest, vitest and playwright test; the full gate still runs once on the combined code. Compound commands, globs, npm scripts and `unittest discover` stay as written. `team.laneTests`.
+- Workers get the verifier's checklist in their brief, so the first round can already pass.
+- Thinking defaults: planner and verifier `max`, workers `high`. For one session, say it in the conversation (the lead calls `team_thinking`) or `/team-thinking worker=medium`; `team.thinking` in ptk.json for a default. The confirm dialog shows the repository and each role's model.
+- Reader, off unless asked: the `team-reader` agent reads documents or a codebase and returns a short digest with sources; the `digest` tool keeps it and reuses it while those files are unchanged; `team_run` takes `digests` so the planner and workers do not read the same material again.
+- `/feedback` and `ptk feedback` show time by role across team runs (planner, worker, verifier, rework).
+- The lead is told to pass `tasks` itself for small, clear goals (skips the planner run) and to find a project named by a keyword and say which folder it picked.
+- After `team_integrate` the lead leaves the integrated files alone and reports what looks wrong: seen in a real run, a lead stripped lines the verifier had required, after verification, so the user would have reviewed unverified code.
+- The lead is told to leave `gate` out unless the detected one is wrong: seen in a real run, a lead wrote a compound gate to work around a missing virtualenv, which the worktree preparation now handles, and which ran the whole suite in every lane.
+- Reader digests ignore `.git`, virtualenv and cache files as sources (they change on every commit and made digests look stale).
+- Not done: integrating lanes as they finish. Each partial integration runs the full gate again, so the run would not finish sooner.
+
 ## [0.6.3] - 2026-11-18
 
 - Thinking level per role: `team.thinking` (`planner`, `worker`, `verifier`), carried as a `:level` suffix on the role's model (or the lead's model when the role has none). The agents' own defaults are now `max` for the planner and the verifier (splitting and checking decide the run) and `medium` for workers (they follow a detailed brief), so a fast model can do every role and only the two judgment roles think hard.

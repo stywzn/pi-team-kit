@@ -42,7 +42,7 @@ key="--$(printf '%s' "$DIR" | sed 's#^/##; s#/#-#g')--"
 SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions/$key"
 STARTED="$(mktemp)"   # only session files newer than this belong to this run
 
-GOAL='Fix the two TODOs in calc.py (division by zero raises ValueError("division by zero"); main() prints usage to stderr and returns 2 on a wrong argument count) with tests in test_calc.py, and add stats.py with mean(xs) and median(xs) (ValueError on an empty list) plus test_stats.py. Done when python3 -m unittest -q passes. Out of scope: any other file. Everything is decided: do not ask me anything, go straight to team_run.'
+GOAL='Fix the two TODOs in calc.py (division by zero raises ValueError("division by zero"); main() prints usage to stderr and returns 2 on a wrong argument count) with tests in test_calc.py, and add stats.py with mean(xs) and median(xs) (ValueError on an empty list) plus test_stats.py. Done when python3 -m unittest -q passes. Out of scope: any other file. Do not pass tasks: let the team-planner split the work. Everything is decided: do not ask me anything, go straight to team_run.'
 
 say "starting pi in tmux ($SESSION) in $DIR"
 tmux new-session -d -s "$SESSION" -x 200 -y 50 -c "$DIR" "pi -a"

@@ -31,6 +31,8 @@ export interface TeamPlan {
   models?: { planner?: string; worker?: string; verifier?: string };
   /** Deadline for each planner, worker and verifier run; pi-subagents' own default is 30 minutes. */
   childTimeoutMs?: number;
+  /** Each lane's gate runs only the test files the lane owns (see narrowGate in the script). */
+  laneTests?: boolean;
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -108,9 +110,12 @@ const PLAN_SCHEMA = ${JSON.stringify(PLAN_SCHEMA)};
 const GATE = PLAN.gate ? { command: PLAN.gate, timeoutMs: PLAN.gateTimeoutSec * 1000 } : undefined;
 // Resumed children reject the gate shorthand but accept the explicit form, so rework is held to the same check.
 // pi-subagents stages the first round's changes when it captures the patch; preserveStagedIndex lets rework continue on top.
-const RESUME_ACCEPTANCE = GATE
-  ? { level: "verified", preserveStagedIndex: true, verify: [{ id: "gate", command: GATE.command, timeoutMs: GATE.timeoutMs }] }
-  : { level: "checked", preserveStagedIndex: true };
+function resumeAcceptance(lane) {
+  var g = laneGate(lane);
+  return g
+    ? { level: "verified", preserveStagedIndex: true, verify: [{ id: "gate", command: g.command, timeoutMs: g.timeoutMs }] }
+    : { level: "checked", preserveStagedIndex: true };
+}
 const VERDICT_SCHEMA = ${JSON.stringify(VERDICT_SCHEMA)};
 ${WORKFLOW_BODY}`;
 }
@@ -172,6 +177,26 @@ function settle(key, promise) {
   });
 }
 
+// Each lane checks only the test files it owns when the gate is a test runner that takes file arguments
+// (pytest, unittest, jest, vitest, playwright test). The full gate still runs once on the combined code.
+// Compound commands, globs, npm scripts and unittest discover are left as written.
+function narrowGate(gate, files) {
+  if (!PLAN.laneTests || /[;&|<>\`$\n]/.test(gate) || /\bdiscover\b/.test(gate)) return gate;
+  var runner = /(^|\s)(pytest|py\.test)(\s|$)|-m\s+(pytest|unittest)(\s|$)|(^|\s)(npx\s+)?(jest|vitest|playwright\s+test)(\s|$)/;
+  if (!runner.test(gate)) return gate;
+  var tests = (files || []).filter(function (f) {
+    return !/[*?[{]/.test(f) && /(^|\/)(test_[^\/]*\.py|[^\/]*_test\.py|[^\/]*\.(test|spec)\.[cm]?[jt]sx?)$/.test(f);
+  });
+  if (!tests.length) return gate;
+  return gate + " " + tests.map(function (f) { return /^[\w@%+=:,.\/-]+$/.test(f) ? f : "'" + f.split("'").join("'\\''") + "'"; }).join(" ");
+}
+function laneGate(lane) {
+  return GATE ? { command: narrowGate(GATE.command, lane.files), timeoutMs: GATE.timeoutMs } : undefined;
+}
+function gateText(lane) { var g = laneGate(lane); return g ? JSON.stringify(g.command) : ""; }
+// What the verifier checks, given to the worker up front so the first round can already pass.
+var CHECKLIST = "it does what the tasks ask; no obvious bug or missing edge case; tests changed when behaviour changed; " +
+  "no file changed outside the owned list";
 function withModel(item, role) { var m = PLAN.models && PLAN.models[role]; if (m) item.model = m; return bounded(item); }
 // Each child gets the configured deadline (pi-subagents would stop it after 30 minutes otherwise).
 function bounded(item) { if (PLAN.childTimeoutMs) item.timeoutMs = PLAN.childTimeoutMs; return item; }
@@ -224,7 +249,8 @@ function workTask(lane) {
     "Rules: other workers are editing other files in parallel. If you must touch a file you do not own, or the brief is ambiguous, " +
     "call contact_supervisor with reason need_decision and wait for the answer. Do not commit, push, or switch branches. " +
     "Keep the change minimal and match the existing style." +
-    (PLAN.gate ? " The command " + JSON.stringify(PLAN.gate) + " must pass in your worktree; run it before you finish." : "") +
+    (GATE ? " The command " + gateText(lane) + " must pass in your worktree; run it before you finish." : "") +
+    " Before you report, check your change the way the verifier will: " + CHECKLIST + "." +
     "\nFinish with: changed files, commands you ran and their results, open risks.";
 }
 
@@ -237,8 +263,7 @@ function verifyTask(lane, writer, round) {
       "The patch file in handoff.json shows round 1 only.\n";
   return "Verify one lane of a team run (round " + round + "). Overall goal: " + PLAN.goal + "\n\n" +
     "The lane's tasks:\n" + taskList(lane) + "\n\nFiles the lane owns:\n" + owned(lane) + "\n\n" + where +
-    "Check: it does what the tasks ask; no obvious bug or missing edge case; tests changed when behaviour changed; " +
-    "no file changed outside the owned list.\n" +
+    "Check: " + CHECKLIST + ".\n" +
     "Verdict: pass = correct and in scope. rework = list each concrete fix. blocked = only when the task itself is wrong or needs a human decision.\n\n" +
     "Writer's report:\n" + clip(writer.output, 3000);
 }
@@ -246,11 +271,11 @@ function verifyTask(lane, writer, round) {
 function fixTask(lane, review, round) {
   var items = (review.findings || []).map(function (f, i) { return (i + 1) + ". " + (f.file ? f.file + ": " : "") + f.issue + (f.fix ? " -> " + f.fix : ""); }).join("\n");
   return "Round " + round + " review asked for changes. Fix exactly these, stay inside your files" +
-    (PLAN.gate ? ", re-run " + JSON.stringify(PLAN.gate) : "") + ", then report again:\n" + (items || clip(review.summary, 2000));
+    (GATE ? ", re-run " + gateText(lane) : "") + ", then report again:\n" + (items || clip(review.summary, 2000));
 }
 
 function gateFixTask(lane, writer) {
-  return "Your run did not pass its checks" + (PLAN.gate ? " (gate " + JSON.stringify(PLAN.gate) + ")" : "") +
+  return "Your run did not pass its checks" + (GATE ? " (gate " + gateText(lane) + ")" : "") +
     ". Details:\n" + clip(writer.error || writer.output, 3000) + "\nFix the cause, stay inside your files, run the check again, then report.";
 }
 
@@ -276,8 +301,8 @@ function noteRound(lane, entry) {
   lane.history = (lane.history || []).concat([entry]).slice(-6);
 }
 
-function resumeItem(writer, label, task) {
-  return bounded({ resume: writer.runId, label: label, task: task, acceptance: RESUME_ACCEPTANCE });
+function resumeItem(lane, writer, label, task) {
+  return bounded({ resume: writer.runId, label: label, task: task, acceptance: resumeAcceptance(lane) });
 }
 
 function afterWrite(lane, writer, round) {
@@ -285,7 +310,7 @@ function afterWrite(lane, writer, round) {
   noteRound(lane, { round: round, gate: clip(writer.error || writer.output, 300) });
   if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, null, round, "failed");
   var key = lane.key + "-gatefix-" + round;
-  return settle(key, runs.run(key, resumeItem(writer, "Fix checks: " + lane.key, gateFixTask(lane, writer))))
+  return settle(key, runs.run(key, resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer))))
     .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
 }
 
@@ -301,14 +326,15 @@ function review(lane, writer, round) {
       noteRound(lane, { round: round, findings: (out.findings || []).slice(0, 5).map(function (f) { return { file: f.file, issue: clip(f.issue, 200), fix: clip(f.fix, 200) }; }) });
       if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, out, round, "needs-human");
       var fixKey = lane.key + "-fix-" + round;
-      return settle(fixKey, runs.run(fixKey, resumeItem(writer, "Rework " + lane.key + " #" + round, fixTask(lane, out, round))))
+      return settle(fixKey, runs.run(fixKey, resumeItem(lane, writer, "Rework " + lane.key + " #" + round, fixTask(lane, out, round))))
         .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
     });
 }
 
 function startLane(lane) {
   var item = withModel({ agent: PLAN.workerAgent, label: "Implement " + lane.key, task: workTask(lane), worktree: true }, "worker");
-  if (GATE) item.gate = GATE;
+  var gate = laneGate(lane);
+  if (gate) item.gate = gate;
   var key = lane.key + "-work";
   return settle(key, runs.run(key, item)).then(function (w) {
     lane.origin = runDir(w);

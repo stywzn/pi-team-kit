@@ -239,3 +239,26 @@ test("models per role: a thinking level rides on the role's model, or on the lea
   assert.deepEqual(roleModels({}, { planner: "max" }), {}, "no model known at all: left to the agent");
   assert.throws(() => roleModels({}, { worker: "huge" }, flash), /team\.thinking\.worker "huge": use one of off, minimal, low, medium, high, xhigh, max/);
 });
+
+test("each lane runs only its own test files; the brief carries the verifier's checklist", async () => {
+  const lanes = planLanes([task("login", ["tests/test_login.py", "pages/login_page.py"]), task("cart", ["tests/my cart_test.py"]), task("util", ["utils/*.py"])]);
+  let reviews = 0;
+  const run = (gate: string, laneTests = true) =>
+    simulate({ lanes, gate, laneTests }, (key) =>
+      key.includes("verify") ? { structuredOutput: key.startsWith("login") && ++reviews === 1 ? { verdict: "rework", summary: "x", findings: [{ issue: "y" }] } : { verdict: "pass", summary: "ok", findings: [] } } : {},
+    );
+  const { calls } = await run("python3 -m pytest -q");
+  const gateOf = (key: string) => calls.find((c) => c.key === key)?.item.gate?.command;
+  assert.equal(gateOf("login-work"), "python3 -m pytest -q tests/test_login.py");
+  assert.equal(gateOf("cart-work"), "python3 -m pytest -q 'tests/my cart_test.py'", "paths with spaces are quoted");
+  assert.equal(gateOf("util-work"), "python3 -m pytest -q", "globs: the full gate");
+  const fix = calls.find((c) => c.key === "login-fix-1")!;
+  assert.equal(fix.item.acceptance?.verify?.[0].command, "python3 -m pytest -q tests/test_login.py", "rework rounds keep the lane's gate");
+  assert.match(fix.item.task, /re-run "python3 -m pytest -q tests\/test_login\.py"/);
+  const work = calls.find((c) => c.key === "login-work")!;
+  assert.match(work.item.task, /check your change the way the verifier will: it does what the tasks ask; .*no file changed outside the owned list\./);
+  for (const gate of ["npm test", "pytest -q && ruff check .", "python3 -m unittest discover -s tests", "make test"])
+    assert.equal((await run(gate)).calls.find((c) => c.key === "login-work")?.item.gate?.command, gate, `left as written: ${gate}`);
+  assert.equal((await run("python -m unittest -q")).calls.find((c) => c.key === "login-work")?.item.gate?.command, "python -m unittest -q tests/test_login.py");
+  assert.equal((await run("python3 -m pytest -q", false)).calls.find((c) => c.key === "login-work")?.item.gate?.command, "python3 -m pytest -q", "laneTests off");
+});

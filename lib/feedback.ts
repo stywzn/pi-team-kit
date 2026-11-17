@@ -3,7 +3,7 @@
 // existed. The output is a short ranked list a person can hand to another agent to research fixes.
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { patternsOverlap } from "./team.ts";
 import { redact } from "./playbook.ts";
 
@@ -34,6 +34,8 @@ export interface Signal {
   minutes: number;
   /** For runs: lanes and tasks. */
   lanes?: number;
+  /** For runs: minutes spent per role (planner, worker, verifier, rework), from the run's child records. */
+  phases?: Record<string, number>;
   tasks?: number;
 }
 
@@ -73,7 +75,7 @@ function sharedFiles(lane: Lane, plan: RunValue["plan"]): string[] {
 }
 
 /** Signals from one session file. `readRunValue` returns a finished team run's value from its receipt directory. */
-export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unknown = () => undefined): Signal[] {
+export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unknown = () => undefined, readPhases: (dir: string) => Record<string, number> | undefined = () => undefined): Signal[] {
   const out: Signal[] = [];
   let project = "unknown";
   const calls = new Map<string, { name: string; args: Record<string, unknown> }>();
@@ -108,7 +110,8 @@ export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unk
       }
       const minutes = Number.isNaN(runStart) ? 0 : Math.max(0, (t - runStart) / 60_000);
       const lanes = value?.lanes ?? [];
-      add("run", t, "team run", 0, { lanes: lanes.length, tasks: value?.plan?.tasks?.length ?? lanes.reduce((n, l) => n + (l.tasks?.length ?? 1), 0) });
+      const phases = readPhases(receipt[1].trim());
+      add("run", t, "team run", 0, { lanes: lanes.length, tasks: value?.plan?.tasks?.length ?? lanes.reduce((n, l) => n + (l.tasks?.length ?? 1), 0), ...(phases ? { phases } : {}) });
       const maxRounds = Math.max(1, ...lanes.map((l) => l.rounds || 1));
       for (const lane of lanes) {
         if (lane.rounds > 1) {
@@ -158,7 +161,12 @@ export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unk
 }
 
 /** Read session files and collect their signals; `project` keeps only sessions started in that folder name. */
-export function frictionFromFiles(files: string[], project?: string, readRun: (dir: string) => unknown = () => undefined): { signals: Signal[]; sessions: number } {
+export function frictionFromFiles(
+  files: string[],
+  project?: string,
+  readRun: (dir: string) => unknown = () => undefined,
+  readPhases: (dir: string) => Record<string, number> | undefined = () => undefined,
+): { signals: Signal[]; sessions: number } {
   const signals: Signal[] = [];
   let sessions = 0;
   for (const f of files) {
@@ -176,7 +184,7 @@ export function frictionFromFiles(files: string[], project?: string, readRun: (d
     }
     if (project && basename(cwd.replace(/[\\/]+$/, "")) !== project) continue;
     sessions++;
-    signals.push(...sessionSignals(text, readRun));
+    signals.push(...sessionSignals(text, readRun, readPhases));
   }
   return { signals, sessions };
 }
@@ -247,6 +255,18 @@ export function formatFriction(signals: Signal[], opts: { days: number; sessions
       ".",
     "",
   ];
+  const phase: Record<string, number> = {};
+  for (const r of runs) for (const [k, v] of Object.entries(r.phases ?? {})) phase[k] = (phase[k] ?? 0) + v;
+  const total = Object.values(phase).reduce((a, b) => a + b, 0);
+  if (total > 0)
+    lines.splice(
+      1,
+      0,
+      `Time by role in team runs: ${Object.entries(phase)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k} ${v < 10 ? v.toFixed(1) : Math.round(v)} min (${Math.round((100 * v) / total)}%)`)
+        .join(", ")}.`,
+    );
   const items = frictionItems(signals).slice(0, opts.limit ?? 8);
   if (!items.length) lines.push("Nothing found: no rework, timeouts, refusals, tool errors or interruptions in this period.");
   items.forEach((it, i) => {
@@ -258,4 +278,39 @@ export function formatFriction(signals: Signal[], opts: { days: number; sessions
   if (notes.length) lines.push("", "Noted by leads:", ...notes.map((n) => `- ${n}`));
   lines.push("", "Minutes are estimates (rework and serialization share a run's time). To improve the tool, hand this to an agent: \"For the top items, find the cause in pi-team-kit and propose the smallest fix for each.\"");
   return lines.join("\n");
+}
+
+/**
+ * Minutes per role in one finished team run: each child's start and end from its own status.json, named by the
+ * workflow key (plan, <lane>-work, <lane>-verify-N, <lane>-fix-N / -gatefix-N). Undefined when the records are gone.
+ */
+export function runPhases(runDir: string): Record<string, number> | undefined {
+  let lines: string[];
+  try {
+    lines = readFileSync(join(runDir, "workflow-children.jsonl"), "utf8").split("\n");
+  } catch {
+    return undefined;
+  }
+  const out: Record<string, number> = {};
+  for (const line of lines) {
+    let e: { type?: string; key?: string; result?: { runId?: string; asyncDir?: string } };
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type !== "settle" || !e.key || !e.result?.runId) continue;
+    const dir = e.result.asyncDir || join(dirname(runDir), e.result.runId);
+    try {
+      const st = JSON.parse(readFileSync(join(dir, "status.json"), "utf8")) as { startedAt?: string | number; endedAt?: string | number };
+      const a = typeof st.startedAt === "number" ? st.startedAt : Date.parse(String(st.startedAt));
+      const b = typeof st.endedAt === "number" ? st.endedAt : Date.parse(String(st.endedAt));
+      if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) continue;
+      const role = e.key === "plan" ? "planner" : /-verify-\d+$/.test(e.key) ? "verifier" : /-(fix|gatefix)-\d+$/.test(e.key) ? "rework" : "worker";
+      out[role] = (out[role] ?? 0) + (b - a) / 60_000;
+    } catch {
+      /* child record gone */
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
