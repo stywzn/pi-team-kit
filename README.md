@@ -4,6 +4,8 @@
 
 *A pi package: lead + up to 4 parallel workers + verifier + automatic rework, a command guard that stops hangs, environment facts detected by code, plain-language output, and a reusable toolbox.*
 
+**形式**：一个标准的 pi 包（pi package）。一个 git 仓库里同时装着扩展代码、子 agent 角色、skill、`/team` 命令、工具箱脚本和 `ptk` 命令行，`pi install` 一条命令装好，`pi update` 更新，`pi remove` 卸载。不依赖任何终端、WSL 或个人配置，团队里谁装都是同一套；需要更正式的分发时，可以原样发布到 npm（`keywords` 里已经带了 `pi-package`，会出现在 [pi.dev 包列表](https://pi.dev/packages)）。
+
 ## 解决什么问题
 
 | 问题 | pi-team-kit 的做法 |
@@ -15,8 +17,12 @@
 | 踩过的坑下次还踩，查到的资源下次还要查 | `remember` 工具把事实和坑存成 JSON：事实可带一条检查命令，检查失败就标为"可能过期"；坑带正则，下次匹配到的命令会被提醒或直接拦下 |
 | 每次新对话都重写 md 转 pdf 之类的脚本 | 工具箱自带 `md2pdf`、`shot`（截图）、`bg`（后台进程）；新写的好用脚本用 `toolbox add` 存起来，以后所有会话直接用 |
 | 输出一堆黑话看不懂 | 讲人话规则：先说结论，不用没解释的缩写，英文更地道的术语（flaky test、fixture、mock）保留英文；代码会检查回复里没解释的缩写，下一轮提醒模型 |
-| 多个 pi 会话分不清谁在干嘛 | 终端标题显示会话名和状态（● 在跑 / ✓ 刚跑完），跑完响铃；配合 [way-pi-kit](https://github.com/stywzn/way-pi-kit) 的 tmux 配置，窗口名自动跟随、响铃时高亮 |
-| 同样的错误反复出现 | `/team-retro`：把这次会话里浪费时间的地方变成检查、保存的坑或事实，而不是写进文档 |
+| 没问清楚就开工，做完才发现方向不对 | 主会话开工前先写清简报（目标、完成标准、不做什么、替你做的假设），不清楚的最多问 3 个问题；`team_run` 会弹确认框，你点"是"才开跑 |
+| 想交代完就走，回来看结果（像 CI/CD） | 确认之后全程无人看守：worker 的问题主会话自己答，小决定取保守方案并记下来；跑完自动合并、跑测试、写 CI 风格的报告，再弹桌面通知 |
+| 换一个主会话接着干 | 每次团队运行的简报、进度、结果都记在状态文件里（不在仓库里，不弄脏工作区）。新会话打开时会提示，输入 `/continue` 接手：先核对现状、等你确认，再动手。会话太长时 `/handoff <下一步>` 生成交接简报并开新会话 |
+| 上下文越用越长，又慢又贵还变笨 | 按角色设上下文预算：主会话 160k、规划员 80k、worker 120k、审查员 60k（大窗口模型也按这个算）。主会话在空闲时压缩，压缩两次后建议 `/handoff`；规划员、worker、审查员每个任务都是新会话，`ptk caps` 还能按角色给模型设窗口上限 |
+| 多个 pi 会话分不清谁在干嘛 | 终端标题显示「会话名 · 目录」（第一句话自动当会话名），运行中前面带 ●；跑完超过 30 秒弹桌面通知（WSL/Windows、macOS、Linux 都支持，tmux 里也能弹） |
+| 同样的错误反复出现 | `retro` skill（`/skill:retro`）：把这次会话里浪费时间的地方变成检查、保存的坑或事实，而不是写进文档 |
 | `grep -r`、`find` 慢 | 引导到 pi 内置的 `grep`/`find` 工具（底层是 ripgrep/fd）或 `rg`/`fd`，没装就用 pi 自带的那份 |
 
 ## 安装
@@ -51,7 +57,12 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
 /team 修掉 calc.py 的两个 TODO 并补测试，同时新增 stats.py（mean/median）和测试
 ```
 
-主会话只负责说清目标和完成标准，然后调 `team_run`；规划员读代码拆任务，worker 并行干活，跑完自动唤醒主会话，主会话调 `team_integrate` 把各路改动合进工作区，在合并后的代码上再跑一遍测试，最后用大白话汇报。进度在 pi-subagents 的 FleetView 里看。
+两个阶段：
+
+1. **和你一起**：主会话读必要的代码，写出简报（目标、完成标准、不做什么、假设），有不清楚的就问你；确认框里点"是"。
+2. **无人看守**：规划员拆任务，worker 并行干活，审查员把关、不过关就返工；跑完自动唤醒主会话，合并各路改动，在合并后的代码上再跑一遍测试，写一份 CI 风格的报告，弹桌面通知。你回来看报告就行。
+
+进度在 pi-subagents 的 FleetView 里看。第二天换个会话接着干：`/continue`。
 
 真实运行记录：[examples/demo-run.md](examples/demo-run.md)（两路并行，81 秒完成）。端到端测试 `test/e2e/rework.sh` 用一个"第一轮必打回"的审查员夹具，验证规划 → 并行 → 打回 → 返工 → 合并整条链路（实测 2 分钟左右）。
 
@@ -77,7 +88,7 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
 
 没有单独的"监控会话"：完成通知、卡住提醒、进度展示都由 pi-subagents 的运行时用代码完成，不花模型的 token，也不会跑偏。也没有让人去和子会话对话：信息向下靠 brief 和自动注入的环境信息，向上靠结构化结果（改了哪些文件、跑了哪些检查、审查结论）。
 
-思路上参考了 Lauren Tan（poteto）的 pstack：验收要有运行时证据（这里是宿主机执行的测试命令），把反复纠正的错误变成检查（`/team-retro`），按任务类型选作业手册（规划员的 bug fix / feature / refactor / 测试 / 性能 五种写法），不同模型互相审查，每次改动后重新检查（每轮返工都换一个全新的审查员）。
+思路上参考了 Lauren Tan（poteto）的 pstack：验收要有运行时证据（这里是宿主机执行的测试命令），把反复纠正的错误变成检查（`retro` skill），按任务类型选作业手册（规划员的 bug fix / feature / refactor / 测试 / 性能 五种写法），不同模型互相审查，每次改动后重新检查（每轮返工都换一个全新的审查员）。
 
 ## 配置
 
@@ -96,6 +107,10 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
 ```
 
 项目里 `remember` 存下的事实在 `.pi/ptk/facts.json`，提交进仓库，团队成员就共享同一份环境知识。
+
+想让子 agent 的上下文也严格按预算走：配好 `team.models` 之后运行 `ptk caps` 看建议，`ptk caps --apply` 写进 `~/.pi/agent/models.json`（会先备份）。pi 会在两轮之间按这个窗口自动压缩，不会打断正在跑的任务。
+
+和 [way-pi-kit](https://github.com/stywzn/way-pi-kit) 的关系：way-pi-kit 是作者个人的终端环境（WSL + tmux + WezTerm），它可以安装本包；本包不依赖它，也不包含任何个人配置。
 
 ## 设计原则
 

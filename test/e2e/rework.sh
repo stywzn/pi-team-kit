@@ -30,7 +30,8 @@ fi
 mkdir -p "$DIR/.pi/agents"
 cp "$KIT"/examples/demo-repo/* "$DIR/"
 cp "$HERE/strict-verifier.md" "$DIR/.pi/agents/team-verifier.md"
-printf '{ "team": { "models": { "worker": "%s" } } }\n' "${PTK_E2E_WORKER_MODEL:-}" > "$DIR/.pi/ptk.json"
+# confirm=false: nobody is at the keyboard to answer the brief dialog in this test
+printf '{ "team": { "confirm": false, "models": { "worker": "%s" } } }\n' "${PTK_E2E_WORKER_MODEL:-}" > "$DIR/.pi/ptk.json"
 printf '__pycache__/\n.pi/subagents/\n' > "$DIR/.gitignore"
 touch "$DIR/.ptk-e2e"
 git -C "$DIR" init -q -b main
@@ -41,7 +42,7 @@ key="--$(printf '%s' "$DIR" | sed 's#^/##; s#/#-#g')--"
 SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions/$key"
 STARTED="$(mktemp)"   # only session files newer than this belong to this run
 
-GOAL='Fix the two TODOs in calc.py (division by zero raises ValueError("division by zero"); main() prints usage to stderr and returns 2 on a wrong argument count) with tests in test_calc.py, and add stats.py with mean(xs) and median(xs) (ValueError on an empty list) plus test_stats.py. Do not ask me anything; go straight to team_run.'
+GOAL='Fix the two TODOs in calc.py (division by zero raises ValueError("division by zero"); main() prints usage to stderr and returns 2 on a wrong argument count) with tests in test_calc.py, and add stats.py with mean(xs) and median(xs) (ValueError on an empty list) plus test_stats.py. Done when python3 -m unittest -q passes. Out of scope: any other file. Everything is decided: do not ask me anything, go straight to team_run.'
 
 say "starting pi in tmux ($SESSION) in $DIR"
 tmux new-session -d -s "$SESSION" -x 200 -y 50 -c "$DIR" "pi -a"
@@ -114,6 +115,15 @@ wt = subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True
 check(len(wt) == 1, f"no worker worktrees left ({len(wt) - 1} extra)")
 t = subprocess.run(["python3", "-m", "unittest", "-q"], cwd=repo, capture_output=True, text=True)
 check(t.returncode == 0, "combined tests pass: " + (t.stderr.strip().splitlines() or ["?"])[-1])
+import hashlib, os
+agent = os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent")
+name = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(repo))[:40]
+lead = f"{agent}/ptk/leads/{name}-{hashlib.sha256(repo.encode()).hexdigest()[:10]}.json"
+try:
+    st = json.load(open(lead))
+    check(st["brief"]["doneWhen"] and st["runs"][-1]["status"] == "integrated", f"takeover record written for /continue (last run {st['runs'][-1]['status']})")
+except Exception as err:
+    check(False, f"takeover record written for /continue ({err})")
 sys.exit(0 if ok else 1)
 PY
 status=$?

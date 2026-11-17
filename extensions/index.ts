@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, convertToLlm, isToolCallEventType, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
@@ -22,8 +22,35 @@ import { classifyCommand, inspectBash, looksLikeTimeout, NON_INTERACTIVE_ENV, re
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, patchesFromHandoff, planLanes, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
+import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
+import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+const HANDOFF_PROMPT = `You write the opening brief for a fresh coding session that continues work from an earlier conversation.
+Include: the goal for the new session; decisions already made and why; constraints; files involved (paths); what was verified and what was not; open questions.
+Leave out anything already written down (specs, commits, diffs): point to it by path instead. Do not state as fact anything the conversation did not verify.
+Output only the brief, as a message the user can send. Plain words, short.`;
+
+type HandoffEntry = { type: string; id?: string; message?: unknown; summary?: string; tokensBefore?: number; timestamp?: string; firstKeptEntryId?: string };
+
+/** The current branch as messages, starting from the latest compaction summary if there is one. */
+function handoffMessages(branch: HandoffEntry[]): unknown[] {
+  const toMessage = (e: HandoffEntry) =>
+    e.type === "message"
+      ? e.message
+      : e.type === "compaction"
+        ? { role: "compactionSummary", summary: e.summary, tokensBefore: e.tokensBefore, timestamp: new Date(e.timestamp ?? Date.now()).getTime() }
+        : undefined;
+  let last = -1;
+  for (let i = branch.length - 1; i >= 0; i--) if (branch[i].type === "compaction") {
+    last = i;
+    break;
+  }
+  if (last < 0) return branch.map(toMessage).filter(Boolean);
+  const kept = branch.findIndex((e) => e.id === branch[last].firstKeptEntryId);
+  return [branch[last], ...(kept >= 0 ? branch.slice(kept, last) : []), ...branch.slice(last + 1)].map(toMessage).filter(Boolean);
+}
 
 interface State {
   cwd: string;
@@ -169,6 +196,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     if (event.messageType === "user") state.lastUserText = event.prompt ?? "";
+    role = detectRole(process.env, event.systemPrompt ?? "");
     const c = state.config;
     const sections: Record<string, string> = {};
     const env = [state.envText];
@@ -187,6 +215,12 @@ export default function piTeamKit(pi: ExtensionAPI) {
       sections["toolbox"] =
         "Ready-made helpers, run with the toolbox tool. Check here before writing a one-off script; save new reusable helpers with toolbox action add.\n" +
         formatToolList(state.tools);
+    if (role === "lead")
+      sections["working-agreement"] =
+        "Clarify first, then run unattended. Before work that changes files, restate the task in one line with how you will know it is done. " +
+        "If the goal, the done-criteria or the scope is unclear, ask at most 3 short questions and wait; do not start on guesses. " +
+        "Once the user has confirmed, work to the end without asking again: the user may be away. Take the conservative option on minor decisions and list them in your final report. " +
+        "Stop and ask only before something destructive or irreversible (deleting data, force-pushing, touching production, spending money).";
     if (c.plainTalk.enabled) {
       const reminder = state.lastUnexplained.length
         ? `\nYour previous reply used ${state.lastUnexplained.join(", ")} without explaining it. Explain terms like that in plain words this time.`
@@ -384,6 +418,20 @@ export default function piTeamKit(pi: ExtensionAPI) {
     files: Type.Array(Type.String(), { description: "Paths or globs this task owns (relative to repo root). Tasks sharing a path run in one lane." }),
   });
 
+  const leadFile = (cwd: string) => {
+    const root = findRepoRoot(cwd);
+    return root ? { root, file: leadStatePath(globalDataDir(), root) } : undefined;
+  };
+  const saveLead = (cwd: string, patch: Parameters<typeof updateLeadState>[2], session?: string) => {
+    const lf = leadFile(cwd);
+    if (!lf) return;
+    try {
+      writeLeadState(lf.file, updateLeadState(readLeadState(lf.file), lf.root, { ...patch, ...(session ? { session } : {}) }));
+    } catch {
+      /* state is a convenience; never fail the tool because of it */
+    }
+  };
+
   pi.registerTool({
     name: "team_run",
     label: "Team run",
@@ -391,12 +439,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
       "Start a team run: each lane gets a worker in its own git worktree, the gate command must pass, a fresh read-only verifier checks the patch, and failed checks go back to the same worker (bounded rounds). Tasks that share files are merged into one lane so lanes never conflict. Runs in the background; you are notified when it finishes, then call team_integrate.",
     promptSnippet: "Run a goal with a planner, parallel workers, a verifier and automatic rework",
     promptGuidelines: [
-      "Use team_run for work that splits into parallel parts. Pass only `goal` to let the team-planner split it (keeps your context small), or pass `tasks` with disjoint file ownership when you already know the split. Ask the user first only if the goal itself is unclear.",
-      "While a team_run is running, answer workers' supervisor questions yourself from the goal and the code; escalate to the user only product or scope decisions. Do not ask the user to talk to workers.",
-      "When a team_run finishes, call team_integrate with the runDir of every passed lane, then report results in plain words. If it returned state needs-input, answer the planner's questions (ask the user only if you cannot) and run again with tasks.",
+      "Before team_run, settle the brief with the user: goal, doneWhen (the checks that prove it), outOfScope and your assumptions. Ask about anything unclear and wait; team_run shows the brief to the user for confirmation.",
+      "Once a team run is confirmed it runs unattended: the user may be away. Never wait for the user during it. Answer workers' supervisor questions yourself from the brief and the code; when a product decision is truly needed, take the conservative option and record it for the final report.",
+      "When a team_run finishes, call team_integrate with the runDir of every passed lane right away, then write the final report. If it returned state needs-input, answer the planner's questions from the brief where you can (otherwise take the conservative option and say so) and run again with tasks.",
     ],
     parameters: Type.Object({
-      goal: Type.String({ description: "The overall goal in one or two sentences, including how to tell it is done" }),
+      goal: Type.String({ description: "The overall goal in one or two sentences" }),
+      doneWhen: Type.String({ description: "How to tell it is done: the tests or checks that must pass, the behaviour to observe" }),
+      outOfScope: Type.Optional(Type.String({ description: "What must not be changed or done" })),
+      assumptions: Type.Optional(Type.Array(Type.String(), { description: "Defaults you chose where the user did not decide" })),
       tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12, description: "Omit to let the team-planner agent split the goal inside the run" })),
       gate: Type.Optional(Type.String({ description: "Command that must pass in every worktree; default: configured or detected test command" })),
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
@@ -411,8 +462,29 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[]) : [];
       const lanes = planLanes(tasks);
       const gate = (params.gate ?? t.gate ?? "").trim() || state.env?.testCommand || "";
-      const plan = {
+      const brief = {
         goal: params.goal.trim(),
+        doneWhen: params.doneWhen.trim(),
+        ...(params.outOfScope?.trim() ? { outOfScope: params.outOfScope.trim() } : {}),
+        ...(params.assumptions?.length ? { assumptions: params.assumptions.map((a) => a.trim()).filter(Boolean) } : {}),
+      };
+      // The goal text travels to planner, workers and verifier, so the done-criteria and limits travel with it.
+      const fullGoal = [brief.goal, `Done when: ${brief.doneWhen}`, brief.outOfScope ? `Out of scope: ${brief.outOfScope}` : "", brief.assumptions?.length ? `Assumptions: ${brief.assumptions.join("; ")}` : ""]
+        .filter(Boolean)
+        .join("\n");
+      if (t.confirm && ctx.hasUI) {
+        const summary = [
+          fullGoal,
+          "",
+          `Gate: ${gate || "(none: verifier only)"}`,
+          lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
+          `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min. It runs unattended after you confirm.`,
+        ].join("\n");
+        const ok = await ctx.ui.confirm("Start this team run?", summary);
+        if (!ok) throw new Error("The user did not confirm the brief. Ask what to change, update the brief, then call team_run again.");
+      }
+      const plan = {
+        goal: fullGoal,
         lanes,
         gate,
         gateTimeoutSec: t.gateTimeoutSec,
@@ -429,6 +501,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         globalConcurrencyLimit: t.maxParallel,
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
+      saveLead(ctx.cwd, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data) } }, ctx.sessionManager.getSessionFile());
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
       const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
       return {
@@ -492,6 +565,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
           if (r.code !== 0) r = await pi.exec("git", ["apply", "--3way", "--whitespace=nowarn", p.path], { cwd: root, timeout: 60_000, signal });
           if (r.code !== 0) {
             lines.push(`FAILED ${p.path}\n${r.stderr.trim()}`);
+            saveLead(ctx.cwd, { finishRun: { status: "integration-failed", result: lines.join("\n").slice(0, 1500) } });
             return text(`${lines.join("\n")}\n\nStopped. Earlier patches stay applied. Resolve the conflict or send the lane back to a worker.`);
           }
           lines.push(`applied ${p.branch ?? p.path}${p.diffStat ? `: ${p.diffStat.split("\n").pop()?.trim()}` : ""}`);
@@ -530,32 +604,170 @@ export default function piTeamKit(pi: ExtensionAPI) {
         if (removed) lines.push(`removed ${removed} worker worktree(s) and their branches`);
       } else if (!gatePassed) lines.push("Worker worktrees kept so the lanes can be reworked.");
       lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
+      saveLead(ctx.cwd, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
       return text(lines.join("\n"));
     },
   });
 
-  // ---------- terminal title and bell (tmux shows them per window) ----------
+  // ---------- terminal: title with session name and directory, notification when a long run ends ----------
 
   let runStarted = 0;
-  const baseTitle = () => {
-    const name = pi.getSessionName();
-    const dir = basename(state.cwd);
-    return name ? `π ${name} · ${dir}` : `π ${dir}`;
+  const setTitle = (ctx: ExtensionContext, working: boolean) => {
+    if (state.config.terminal.title && ctx.hasUI) ctx.ui.setTitle(terminalTitle(pi.getSessionName(), basename(state.cwd), working));
   };
+
+  pi.on("session_start", async (_event, ctx) => setTitle(ctx, false));
+
+  pi.on("input", async (event, ctx) => {
+    if (!state.config.terminal.autoName || event.source !== "interactive" || pi.getSessionName()) return;
+    const name = sessionNameFrom(event.text);
+    if (name) {
+      pi.setSessionName(name);
+      setTitle(ctx, false);
+    }
+  });
 
   pi.on("agent_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
     runStarted = Date.now();
-    if (state.config.terminal.title) ctx.ui.setTitle(`● ${baseTitle()}`);
+    setTitle(ctx, true);
   });
 
   pi.on("agent_settled", async (event, ctx) => {
     if (!ctx.hasUI || !runStarted) return;
-    const c = state.config.terminal;
-    const long = c.bellAfterSec > 0 && (Date.now() - runStarted) / 1000 >= c.bellAfterSec && !event.aborted;
+    const secs = (Date.now() - runStarted) / 1000;
     runStarted = 0;
-    if (c.title) ctx.ui.setTitle(`${long ? "✓ " : ""}${baseTitle()}`);
-    if (long) process.stdout.write("\x07"); // tmux marks the window; terminals flash or notify
+    setTitle(ctx, false);
+    const after = state.config.terminal.notifyAfterSec;
+    if (after <= 0 || secs < after || event.aborted) return;
+    const where = pi.getSessionName() ? `${pi.getSessionName()} · ${basename(state.cwd)}` : basename(state.cwd);
+    const n = buildNotification(`pi · ${where}`, `Done after ${Math.round(secs)}s, waiting for you`, process.platform, process.env, Boolean(state.probe && which(state.probe, "notify-send")));
+    if (n.kind === "osc") process.stdout.write(n.sequence);
+    else pi.exec(n.command, n.args, { timeout: 15_000 }).catch(() => undefined);
+  });
+
+  // ---------- context budget per kind of session ----------
+
+  let role: SessionRole = "lead";
+  let compacting = false;
+  let compactions = 0;
+  const COMPACT_FOCUS: Record<SessionRole, string> = {
+    lead: "Keep the user's goals, decisions and constraints, every team run result (lanes, states, runDirs, findings), open questions and what is left. Drop tool output that was already acted on.",
+    planner: "Keep the goal, the code locations found and the task split so far. Drop file contents already summarised.",
+    worker: "Keep the brief, the owned files, what was changed so far, failing checks with their causes and any reviewer findings. Drop file contents already edited and old command output.",
+    verifier: "Keep the brief, the patch under review and the findings so far.",
+    child: "Keep the task, the findings so far and what is left.",
+  };
+
+  let cooldown = 0; // runs to skip after a compaction: what is kept verbatim can sit near the budget
+  pi.on("session_compact", async () => {
+    compacting = false;
+    compactions++;
+    cooldown = 2;
+  });
+  pi.on("session_compact_failed", async () => {
+    compacting = false;
+  });
+
+  // Only ever compact an idle session. Tested: ctx.compact() during a run aborts that run.
+  // Subagents (planner/worker/verifier) are not compacted here: they start fresh per task, and `ptk caps`
+  // gives their models a smaller context window so pi's own between-turn compaction keeps them in budget.
+  function checkContext(ctx: ExtensionContext) {
+    const c = state.config.context;
+    if (!c.enabled || compacting || role !== "lead" || !ctx.isIdle()) return;
+    if (cooldown > 0) {
+      cooldown--;
+      return;
+    }
+    const usage = ctx.getContextUsage();
+    if (!usage?.tokens) return;
+    const limit = compactThreshold(role, c, usage.contextWindow);
+    if (usage.tokens < limit) return;
+    compacting = true;
+    ctx.compact({
+      customInstructions: COMPACT_FOCUS[role],
+      onComplete: () => {
+        if (!ctx.hasUI) return;
+        ctx.ui.notify(`Context passed ${Math.round(limit / 1000)}k tokens (${role} budget) and was compacted.`, "info");
+        if (role === "lead" && compactions >= c.handoffAfterCompactions)
+          ctx.ui.notify(`Compacted ${compactions} times; summaries of summaries lose detail. For the next step, /handoff <what comes next> starts a fresh session with a focused brief.`, "warning");
+      },
+      onError: () => {
+        compacting = false;
+      },
+    });
+  }
+
+  pi.on("agent_settled", async (event, ctx) => {
+    if (!event.aborted) checkContext(ctx);
+  });
+
+  // /handoff: the "start fresh" path. Adapted from pi's examples/extensions/handoff.ts (MIT).
+  pi.registerCommand("handoff", {
+    description: "Start a fresh session with a focused brief generated from this one: /handoff <what the new session should do>",
+    handler: async (args, ctx) => {
+      if (ctx.mode !== "tui") return ctx.ui.notify("/handoff needs the interactive terminal", "error");
+      if (!ctx.model) return ctx.ui.notify("No model selected", "error");
+      const goal = args.trim();
+      if (!goal) return ctx.ui.notify("Usage: /handoff <what the new session should do>", "error");
+      const messages = handoffMessages(ctx.sessionManager.getBranch() as HandoffEntry[]);
+      if (messages.length === 0) return ctx.ui.notify("Nothing to hand off yet", "error");
+      const conversation = serializeConversation(convertToLlm(messages as never));
+      const parentSession = ctx.sessionManager.getSessionFile();
+      const draft = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+        const loader = new BorderedLoader(tui, theme, "Writing the handoff brief...");
+        loader.onAbort = () => done(null);
+        ctx.modelRegistry
+          .complete(
+            ctx.model!,
+            {
+              systemPrompt: HANDOFF_PROMPT,
+              messages: [{ role: "user", content: [{ type: "text", text: `## Conversation\n\n${conversation}\n\n## Goal for the new session\n\n${goal}` }], timestamp: Date.now() }],
+            },
+            { signal: loader.signal, cacheRetention: "none", sessionId: randomUUID() },
+          )
+          .then((r) => done(r.stopReason === "aborted" ? null : r.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n")))
+          .catch(() => done(null));
+        return loader;
+      });
+      if (!draft) return ctx.ui.notify("Handoff cancelled", "info");
+      const edited = await ctx.ui.editor("Edit the handoff brief, then submit it in the new session", draft);
+      if (edited === undefined) return ctx.ui.notify("Handoff cancelled", "info");
+      saveLead(ctx.cwd, { handoff: edited }, parentSession);
+      await ctx.newSession({
+        parentSession,
+        withSession: async (next) => {
+          next.ui.setEditorText(edited);
+          next.ui.notify("Fresh session ready: review the brief and press Enter.", "info");
+        },
+      });
+    },
+  });
+
+  // ---------- inheritance: a new lead session takes over with /continue ----------
+
+  pi.registerCommand("continue", {
+    description: "Take over the task an earlier lead session left in this repository (brief, team runs, handoff notes)",
+    handler: async (_args, ctx) => {
+      const lf = leadFile(ctx.cwd);
+      const s = lf && readLeadState(lf.file);
+      if (!s) return ctx.ui.notify("No earlier lead session recorded for this repository.", "info");
+      const message = continuationMessage(s);
+      if (ctx.mode === "tui") {
+        ctx.ui.setEditorText(message);
+        ctx.ui.notify("Takeover message is in the editor: review it and press Enter.", "info");
+      } else pi.sendUserMessage(message);
+    },
+  });
+
+  pi.on("session_start", async (event, ctx) => {
+    if (!ctx.hasUI || (event.reason !== "startup" && event.reason !== "new")) return;
+    const lf = leadFile(ctx.cwd);
+    const s = lf && readLeadState(lf.file);
+    if (!s || Date.now() - new Date(s.updatedAt).getTime() > 7 * 86_400_000) return;
+    if (s.session && s.session === ctx.sessionManager.getSessionFile()) return;
+    const open = s.runs.some((r) => r.status === "running");
+    ctx.ui.notify(`An earlier lead session left work here (${ageText(s.updatedAt)}${open ? ", a team run may still be running" : ""}): ${s.brief?.goal ?? "see /continue"}. Type /continue to take it over.`, "info");
   });
 
   // ---------- /ptk ----------

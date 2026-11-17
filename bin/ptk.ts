@@ -3,17 +3,19 @@
 //   ptk doctor [--strict]       check pi, pi-subagents, conflicts, rg/fd, browser, config
 //   ptk env                     print what the agent is told about this machine and repo
 //   ptk tools | ptk run <name> [args...]
+//   ptk caps [--apply]          per-role context windows through pi's model overrides
 //   ptk demo [dir]              create a throwaway repo to try /team on
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
 
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentDir, findRepoRoot, globalDataDir, loadConfig, projectDataDir } from "../lib/config.ts";
 import { detectEnv, formatEnv, realProbe, which } from "../lib/env.ts";
 import { buildTeamScript, planLanes, validateTasks, type TeamTask } from "../lib/team.ts";
 import { discoverTools, formatToolList, toolArgv } from "../lib/toolbox.ts";
+import { modelCaps } from "../lib/session.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cwd = process.cwd();
@@ -89,6 +91,39 @@ switch (cmd) {
     const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
     process.exit(r.status ?? 1);
   }
+  case "caps": {
+    // Per-role context caps through pi's own model overrides: pi then compacts subagents between turns at their budget.
+    const { config } = loadConfig(cwd);
+    const settingsPath = join(agentDir(), "settings.json");
+    const settings = existsSync(settingsPath) ? (JSON.parse(readFileSync(settingsPath, "utf8")) as { defaultProvider?: string; defaultModel?: string }) : {};
+    const lead = settings.defaultProvider && settings.defaultModel ? `${settings.defaultProvider}/${settings.defaultModel}` : "";
+    const m = config.team.models;
+    const roles = { lead, planner: m.planner || lead, worker: m.worker || lead, verifier: m.verifier || lead };
+    const caps = modelCaps(roles, config.context);
+    if (Object.keys(caps).length === 0) {
+      console.error("No models known: set team.models in ptk.json or defaultProvider/defaultModel in pi settings.");
+      process.exit(2);
+    }
+    console.log("Roles:", Object.entries(roles).map(([r, s]) => `${r}=${s || "?"}`).join(", "));
+    console.log("Context window per model (role budget + 16k compaction reserve):");
+    for (const [p, ids] of Object.entries(caps)) for (const [id, v] of Object.entries(ids)) console.log(`  ${p}/${id}: ${v.contextWindow}`);
+    if (!rest.includes("--apply")) {
+      console.log("\nNothing changed. Run `ptk caps --apply` to merge this into ~/.pi/agent/models.json (a backup is kept).");
+      break;
+    }
+    const modelsPath = join(agentDir(), "models.json");
+    const current = existsSync(modelsPath) ? JSON.parse(readFileSync(modelsPath, "utf8")) : {};
+    if (existsSync(modelsPath)) copyFileSync(modelsPath, `${modelsPath}.bak-${Date.now()}`);
+    current.providers ??= {};
+    for (const [p, ids] of Object.entries(caps)) {
+      current.providers[p] ??= {};
+      current.providers[p].modelOverrides ??= {};
+      for (const [id, v] of Object.entries(ids)) current.providers[p].modelOverrides[id] = { ...current.providers[p].modelOverrides[id], ...v };
+    }
+    writeFileSync(modelsPath, JSON.stringify(current, null, 2) + "\n");
+    console.log(`\nWrote ${modelsPath}. Restart pi (or /reload) to apply.`);
+    break;
+  }
   case "demo": {
     // A throwaway git repo to try /team on, without touching real work.
     const target = resolve(rest[0] ?? join(process.env.HOME ?? process.env.USERPROFILE ?? ".", "code", "ptk-demo"));
@@ -121,6 +156,6 @@ switch (cmd) {
     break;
   }
   default:
-    console.log("usage: ptk doctor [--strict] | env | tools | run <name> [args...] | demo [dir] | plan <tasks.json> [--script]");
+    console.log("usage: ptk doctor [--strict] | env | tools | run <name> [args...] | caps [--apply] | demo [dir] | plan <tasks.json> [--script]");
     process.exit(cmd ? 2 : 0);
 }

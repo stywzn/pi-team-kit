@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0] - 2026-11-17
+
+- Clarify first, then unattended: `team_run` takes `doneWhen`, `outOfScope` and `assumptions`, and in the terminal shows the brief in a confirmation dialog before starting. After that the lead never waits for the user, takes conservative defaults on minor decisions, integrates and writes a CI-style report. The done-criteria travel to planner, workers and verifier.
+- Inheritance: a per-repository record of the brief, each team run and handoff notes (kept under the pi agent directory, not in the repo). New sessions are told about it; `/continue` hands the task to the new lead, which checks the current state before doing anything. `/handoff <next step>` writes a focused brief and opens a fresh session.
+- Context budget per kind of session (lead 160k, planner 80k, worker 120k, verifier 60k, at most half the model window). The lead compacts only when idle (compacting during a run aborts it, tested), with a cooldown, and is pointed to `/handoff` after two compactions. `ptk caps [--apply]` sets per-role context windows through pi's model overrides.
+- Terminal title "π <session name> · <directory>", sessions auto-named from their first prompt, and a desktop notification (Windows/WSL, macOS, Linux, OSC 777 through tmux) instead of a bell when a long run finishes.
+- The retrospective is now the `retro` skill (`/skill:retro`).
+
 ## [0.2.0] - 2026-11-17
 
 - Planner: `team_run` with only a `goal` lets the new `team-planner` agent read the code and split the work (file ownership, contract-first interfaces, a playbook per task type). The main session's context stays small; questions that block planning come back as `needs-input`.

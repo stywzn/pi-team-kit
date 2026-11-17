@@ -48,12 +48,35 @@ export interface PtkConfig {
     runTimeoutSec: number;
   };
   terminal: {
-    /** Show working/done in the terminal title, so tmux window names reflect each pi session. */
+    /** Terminal title "π <session name> · <directory>", with ● while working (tmux can use it as the window name). */
     title: boolean;
-    /** Ring the bell when a run that took at least this many seconds finishes (tmux flags the window). 0 = off. */
-    bellAfterSec: number;
+    /** Name an unnamed session after its first prompt, so titles and /resume show what it is about. */
+    autoName: boolean;
+    /** Desktop notification when a run that took at least this many seconds finishes. 0 = off. */
+    notifyAfterSec: number;
+  };
+  /**
+   * Context budget per kind of session, in tokens. A session compacts once it passes its budget
+   * (or maxWindowFraction of the model's window, whichever is smaller): long contexts are slower,
+   * cost more per call and lose accuracy, long before the model's hard limit.
+   * Policy: planner, worker and verifier start fresh for every task (new session, never carried over);
+   * the lead compacts, and after handoffAfterCompactions compactions it is told to /handoff to a new session.
+   */
+  context: {
+    enabled: boolean;
+    lead: number;
+    planner: number;
+    worker: number;
+    verifier: number;
+    /** Other subagents (scout, reviewer, oracle...). */
+    child: number;
+    maxWindowFraction: number;
+    handoffAfterCompactions: number;
   };
   team: {
+    /** Ask the user to confirm the brief (goal, done-when, out of scope, assumptions) before a team run starts.
+     *  Only in the interactive terminal; print/RPC/CI runs have no one to ask. After the confirmation the run goes unattended. */
+    confirm: boolean;
     /** Workers running at the same time. */
     maxParallel: number;
     /** Verifier rounds per lane before a human has to decide. */
@@ -88,8 +111,19 @@ export const DEFAULTS: PtkConfig = {
   facts: { enabled: true, checkTimeoutMs: 1500, maxFacts: 40 },
   plainTalk: { enabled: true, acronymCheck: true, allow: [] },
   toolbox: { enabled: true, runTimeoutSec: 300 },
-  terminal: { title: true, bellAfterSec: 20 },
+  terminal: { title: true, autoName: true, notifyAfterSec: 30 },
+  context: {
+    enabled: true,
+    lead: 160_000,
+    planner: 80_000,
+    worker: 120_000,
+    verifier: 60_000,
+    child: 100_000,
+    maxWindowFraction: 0.5,
+    handoffAfterCompactions: 2,
+  },
   team: {
+    confirm: true,
     maxParallel: 4,
     maxRounds: 3,
     gate: "",
@@ -186,6 +220,12 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   g.maxTimeoutSec = clamp(g.maxTimeoutSec, g.defaultTimeoutSec, 86_400);
   g.testTimeoutSec = clamp(g.testTimeoutSec, 5, g.maxTimeoutSec);
   g.buildTimeoutSec = clamp(g.buildTimeoutSec, 5, g.maxTimeoutSec);
+  const cx = config.context;
+  // pi keeps the most recent 20k tokens verbatim when it compacts, so smaller budgets have nothing to compact.
+  for (const k of ["lead", "planner", "worker", "verifier", "child"] as const) cx[k] = clamp(Math.round(cx[k]), 30_000, 2_000_000);
+  cx.maxWindowFraction = clamp(cx.maxWindowFraction, 0.1, 0.95);
+  cx.handoffAfterCompactions = clamp(Math.round(cx.handoffAfterCompactions), 1, 20);
+  config.terminal.notifyAfterSec = clamp(config.terminal.notifyAfterSec, 0, 86_400);
   config.team.maxParallel = clamp(Math.round(config.team.maxParallel), 1, 8);
   config.team.maxRounds = clamp(Math.round(config.team.maxRounds), 1, 10);
   return { config, files, warnings };
