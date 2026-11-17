@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.4] - 2026-11-17
+
+- `bg` on Windows: logs stayed empty, so `bg logs`, `--wait-for <log regex>` and the "last log lines" of a process that died at start all showed nothing. The cause is a detached `cmd.exe`: it drops output redirected to a file (redirecting inside cmd, as first suggested, loses it too). `bg` now starts a small detached node supervisor (`toolbox/bg/win-supervisor.mjs`) that owns the log and runs the command; `bg stop` ends it with its whole process tree. Linux/macOS are unchanged. CI now waits on a log line and checks the logs and the early-exit reason on every platform.
+- Toolbox helpers declared with `python3` run with the Python that works here (`python`, `py -3`, `python3`), like the gate.
+- `ptk plan --script` prints the same plan `team_run` would build (configured `maxTasks`, models, planner, detected gate) and validates tasks against `team.maxTasks`.
+
 ## [0.3.3] - 2026-11-17
 
 Fixes from a second round of testing on Windows, plus an independent review of the fixes.

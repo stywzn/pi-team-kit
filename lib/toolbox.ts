@@ -47,9 +47,19 @@ export function discoverTools(layers: { dir: string; layer: ToolEntry["layer"] }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** argv to execute a tool: manifest `run` (relative paths made absolute) followed by user args. */
-export function toolArgv(tool: ToolEntry, args: string[]): string[] {
-  const [program, ...lead] = tool.run;
+/**
+ * argv to execute a tool: manifest `run` (relative paths made absolute) followed by user args.
+ * `python` is the command that really starts Python here ("python", "py -3", "python3", from env detection);
+ * manifests say python3, which does not exist or is only a Store alias on many Windows machines.
+ */
+export function toolArgv(tool: ToolEntry, args: string[], python?: string): string[] {
+  let [program, ...lead] = tool.run;
+  // Only `python3` (what `toolbox add` writes); a manifest that says `python` explicitly is left alone.
+  if (python && program === "python3") {
+    const [exe, ...pre] = python.split(" ");
+    program = exe;
+    lead = [...pre, ...lead];
+  }
   const abs = (p: string) => (!isAbsolute(p) && /[\\/]|\.(m?js|ts|py|sh)$/.test(p) ? join(tool.dir, p) : p);
   const exe = program === "node" ? process.execPath : abs(program);
   return [exe, ...lead.map(abs), ...args];

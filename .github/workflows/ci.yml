@@ -28,11 +28,16 @@ jobs:
           printf '# hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n' > "$T/t.md"
           node bin/ptk.ts run md2pdf "$T/t.md" "$T/t.html" --html-only
           grep -q '<table>' "$T/t.html"
-          printf 'require("http").createServer((q, s) => s.end("ok")).listen(18799)\n' > "$T/server.js"
-          node bin/ptk.ts run bg start srv --cwd "$T" --wait-for :18799 --timeout 30 -- node server.js
+          printf 'console.log("listening 18799"); require("http").createServer((q, s) => s.end("ok")).listen(18799)\n' > "$T/server.cjs"
+          # wait on a LOG line, not just the port: on Windows the log once stayed empty (0.3.3 and earlier)
+          node bin/ptk.ts run bg start srv --cwd "$T" --wait-for "listening" --timeout 30 -- node server.cjs
+          node bin/ptk.ts run bg logs srv | grep -q "listening 18799"
           node bin/ptk.ts run bg list
           node bin/ptk.ts run bg stop srv
-          node bin/ptk.ts run bg start bad --timeout 5 --wait-for ready -- node -e "process.exit(3)" && exit 1 || echo "bg reported the early exit"
+          printf 'console.error("boom: missing config"); process.exit(3)\n' > "$T/bad.cjs"
+          out=$(node bin/ptk.ts run bg start bad --cwd "$T" --timeout 10 --wait-for ready -- node bad.cjs 2>&1) && exit 1 || true
+          echo "$out" | grep -q "boom: missing config"
+          echo "bg reported the early exit with its reason"
       - name: demo repo
         run: |
           git config --global user.name ci && git config --global user.email ci@localhost

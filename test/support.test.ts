@@ -62,6 +62,15 @@ test("toolbox: layers override by name, add copies a script with a manifest", ()
   assert.equal(argv[1], join(root, "global", "md2pdf", "run.mjs"));
   assert.equal(argv[2], "in.md");
 
+  // D2: .py helpers run with the Python that really works here, not a hard-coded python3.
+  const py = { ...tools[0], run: ["python3", "tool.py"] };
+  assert.deepEqual(toolArgv(py, ["x"], "python").slice(0, 1), ["python"]);
+  assert.deepEqual(toolArgv(py, ["x"], "py -3").slice(0, 2), ["py", "-3"]);
+  assert.equal(toolArgv(py, ["x"], "py -3")[2], join(py.dir, "tool.py"));
+  assert.equal(toolArgv(py, ["x"])[0], "python3", "no detection: manifest as written");
+  assert.equal(toolArgv(tools[0], [], "py -3")[0], process.execPath, "node helpers untouched");
+  assert.equal(toolArgv({ ...py, run: ["python", "tool.py"] }, [], "python3")[0], "python", "an explicit `python` in a manifest is kept");
+
   writeFileSync(join(root, "csv2md.py"), "print('hi')\n");
   const saved = addTool(join(root, "global"), { name: "csv2md", description: "CSV to Markdown table", usage: "csv2md <file>", source: "csv2md.py" }, root);
   assert.deepEqual(saved.run, ["python3", "csv2md.py"]);

@@ -102,7 +102,7 @@ switch (cmd) {
       console.error(`no tool "${name ?? ""}". Try: ptk tools`);
       process.exit(2);
     }
-    const argv = toolArgv(tool, args);
+    const argv = toolArgv(tool, args, detectEnv(probe()).python);
     const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
     process.exit(r.status ?? 1);
   }
@@ -186,11 +186,26 @@ switch (cmd) {
       process.exit(2);
     }
     const input = JSON.parse(readFileSync(file, "utf8")) as { goal?: string; tasks: TeamTask[]; gate?: string };
-    const lanes = planLanes(validateTasks(input.tasks));
+    const lanes = planLanes(validateTasks(input.tasks, loadConfig(cwd).config.team.maxTasks));
     for (const l of lanes) console.log(`${l.key}: ${l.tasks.map((t) => t.key).join(" + ")}  [${l.files.join(", ")}]`);
     if (rest.includes("--script")) {
+      // Same plan fields team_run builds, so the printed script matches what would really run.
       const t = loadConfig(cwd).config.team;
-      console.log(buildTeamScript({ goal: input.goal ?? "", lanes, gate: input.gate ?? t.gate, gateTimeoutSec: t.gateTimeoutSec, maxRounds: t.maxRounds, workerAgent: t.workerAgent, verifierAgent: t.verifierAgent }));
+      const gate = (input.gate ?? t.gate).trim() || detectEnv(probe()).testCommand || "";
+      console.log(
+        buildTeamScript({
+          goal: input.goal ?? "",
+          lanes,
+          gate,
+          gateTimeoutSec: t.gateTimeoutSec,
+          maxRounds: t.maxRounds,
+          workerAgent: t.workerAgent,
+          verifierAgent: t.verifierAgent,
+          plannerAgent: t.plannerAgent,
+          maxTasks: t.maxTasks,
+          models: t.models,
+        }),
+      );
     }
     break;
   }

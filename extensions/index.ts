@@ -405,7 +405,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
       if (!tool) throw new Error(`no toolbox helper named "${params.name ?? ""}". Available: ${state.tools.map((t) => t.name).join(", ")}`);
       if (params.action === "show") return text(`${tool.name} (${tool.layer}, ${tool.dir})\n${tool.description}\nUsage: ${tool.usage}`);
-      const argv = toolArgv(tool, params.args ?? []);
+      const argv = toolArgv(tool, params.args ?? [], state.env?.python);
       const timeoutSec = Math.min(params.timeoutSec ?? state.config.toolbox.runTimeoutSec, state.config.guard.maxTimeoutSec);
       const r = await pi.exec(argv[0], argv.slice(1), { cwd: ctx.cwd, timeout: timeoutSec * 1000, signal });
       const out = clip(`${r.stdout ?? ""}${r.stderr ? `\n${r.stderr}` : ""}`.trim(), 20_000);

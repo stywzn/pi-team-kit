@@ -8,6 +8,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const STATE = path.join(os.tmpdir(), `ptk-bg-${typeof process.getuid === "function" ? process.getuid() : os.userInfo().username}`);
 mkdirSync(STATE, { recursive: true });
@@ -161,14 +162,19 @@ if (action === "status") {
     console.error(`--cwd does not exist: ${cwd}`);
     process.exit(2);
   }
-  // One argument = a shell command line (pipes, &&, env vars allowed). Several = an exact argv, no shell.
+  // One argument = a shell command line (pipes, &&, env vars allowed). Several = an exact argv, no shell,
+  // except on Windows: there both forms go through cmd.exe, because npm, npx, pnpm... are .cmd shims that
+  // only start through it (as before 0.3.4). Quote arguments that contain cmd syntax (& | % ^) yourself.
   const quote = (a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `"${a.replace(/"/g, '\\"')}"`);
   const cmd = command.length === 1 ? command[0] : command.map(quote).join(" ");
   const fd = openSync(logFile(name), "w");
   const stdio = ["ignore", fd, fd];
+  // Windows: a detached cmd.exe drops output redirected to the log (0 bytes, tested), so a small detached
+  // node supervisor owns the log and runs the command; see win-supervisor.mjs. The pid recorded is the
+  // supervisor's; bg stop kills it with its whole tree.
   const child =
     process.platform === "win32"
-      ? spawn(cmd, { cwd, shell: true, detached: true, windowsHide: true, stdio })
+      ? spawn(process.execPath, [fileURLToPath(new URL("./win-supervisor.mjs", import.meta.url)), cmd], { cwd, detached: true, windowsHide: true, stdio })
       : command.length === 1
         ? spawn("sh", ["-c", cmd], { cwd, detached: true, stdio })
         : spawn(command[0], command.slice(1), { cwd, detached: true, stdio });
