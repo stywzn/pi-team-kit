@@ -105,6 +105,12 @@ cd ~/code/ptk-demo && pi
 
 写短是硬规则：描述 200 字符内；每节最多 5～8 条，每条一行（160 字符内），全文 60 行内。写满了只能替换或删掉旧的；删掉的进 `references/retired.md`，证据在 `references/sources.md`，可复用的文件在 `templates/`。
 
+### 工具本身哪里慢（问题清单）
+
+跑过几次任务后，`/feedback`（默认看当前项目最近 30 天，`/feedback 7 all` 看所有项目最近 7 天）或 shell 里 `ptk feedback --repo <项目名>`。它读 pi 已有的会话记录，按耗时列出问题，比如"返工 9 次，≈38 分钟，原因：waitForTimeout ×6"、"共享 fixtures/auth.ts，把任务挤成了一路"，每条附一句可以试的方向。报告也存到 `~/.pi/agent/ptk/feedback.md`，可以直接丢给别的 agent："针对前几条，找出 pi-team-kit 里的原因，给每条提最小的改法"。
+
+分钟数是估算（返工和"没能并行"按运行时长分摊）；审查员的打回原因从 0.5.0 起才有记录。
+
 团队共享：建一个 playbook 仓库，大家 clone 下来，在 `~/.pi/agent/ptk.json` 里加 `"playbooks": { "dirs": ["~/code/team-playbooks"] }`；改动走 PR，CI 里跑 `ptk playbooks check .` 检查长度。`ptk playbooks` 列出现有的和使用次数。
 
 ## 8. 多个 pi 会话怎么分

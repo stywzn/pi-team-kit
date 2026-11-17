@@ -9,6 +9,7 @@
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
 //   ptk leads [n]               lead sessions running on this machine, their status and the last n messages
 //   ptk playbooks [check [dir]] list playbooks; check = enforce the length limits (for a team playbook repo's CI)
+//   ptk feedback [days] [--repo name]  where the tooling cost time (from pi's session files), to hand to an agent
 
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,6 +17,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { formatBoard, formatLog, readCards, readLog } from "../lib/board.ts";
 import { checkPlaybook, listPlaybooks } from "../lib/playbook.ts";
+import { formatFriction, frictionFromFiles, sessionFiles } from "../lib/feedback.ts";
+import { readRunValue } from "../lib/harvest.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir } from "../lib/config.ts";
 import { factFilePath, mergeFactFiles, readFactFile, writeFactFile } from "../lib/facts.ts";
@@ -235,7 +238,15 @@ switch (cmd) {
     if (!all.length) console.log(`no playbooks in ${dirs.join(", ")}`);
     process.exit(bad ? 1 : 0);
   }
+  case "feedback": {
+    const days = Math.max(1, Math.min(365, Number(rest.find((a) => /^\d+$/.test(a)) ?? 30)));
+    const r = rest.indexOf("--repo");
+    const repo = r >= 0 ? rest[r + 1] : undefined;
+    const { signals, sessions } = frictionFromFiles(sessionFiles(join(agentDir(), "sessions"), days), repo, readRunValue);
+    console.log(formatFriction(signals, { days, sessions }));
+    break;
+  }
   default:
-    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n] | playbooks [check [dir]]");
+    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n] | playbooks [check [dir]] | feedback [days] [--repo name]");
     process.exit(cmd ? 2 : 0);
 }

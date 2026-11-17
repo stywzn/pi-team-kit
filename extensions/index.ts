@@ -18,6 +18,7 @@ import { Type } from "typebox";
 
 import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions, sessionEvidence } from "../lib/harvest.ts";
+import { formatFriction, frictionFromFiles, sessionFiles } from "../lib/feedback.ts";
 import {
   appendRetired,
   applyChanges,
@@ -28,6 +29,7 @@ import {
   listPlaybooks,
   playbookBrief,
   readMeta,
+  redact,
   renderPlaybook,
   validPlaybookName,
   writeMeta,
@@ -1048,6 +1050,49 @@ export default function piTeamKit(pi: ExtensionAPI) {
       meta.log.push(...r.log);
       writeMeta(pb.dir, meta);
       return text(`Updated ${pb.name}: ${r.log.map((l) => `${l.op} ${l.id}`).join(", ")}. Now ${r.text.split("\n").filter((l) => l.trim()).length} lines.`);
+    },
+  });
+
+  // ---------- friction: where the tooling itself cost time, for improving pi-team-kit ----------
+  // The report reads pi's session files (lib/feedback.ts); the only thing written is an optional note entry.
+
+  if (!process.env.PI_SUBAGENT_CHILD)
+    pi.registerTool({
+      name: "friction",
+      label: "Friction",
+      description:
+        "Note one line when the tooling itself cost time or got in the way: a team run, the planner's split, the guard, a ptk tool, pi or the model. Not for bugs in the project. Kept in this session for the /feedback report the user uses to improve the tools.",
+      promptSnippet: "Note where the tooling (not the project) cost time",
+      parameters: Type.Object({ text: Type.String({ description: "What happened and what it cost, one line" }) }),
+      async execute(_id, params) {
+        const t = params.text.replace(/\s+/g, " ").trim();
+        if (!t) throw new Error("text is empty");
+        if (t.length > 200) throw new Error("one line, under 200 characters");
+        pi.appendEntry("ptk-friction", { text: redact(t) });
+        return text("Noted for /feedback.");
+      },
+    });
+
+  const frictionReport = (cwd: string, days: number, all: boolean) => {
+    const files = sessionFiles(join(agentDir(), "sessions"), days);
+    const { signals, sessions } = frictionFromFiles(files, all ? undefined : basename(findRepoRoot(cwd) ?? cwd), readRunValue);
+    return formatFriction(signals, { days, sessions });
+  };
+
+  pi.registerCommand("feedback", {
+    description: "Where the tooling cost time in this project (rework, serialized lanes, timeouts, refusals, tool errors...): /feedback [days] [all]",
+    handler: async (args, ctx) => {
+      const words = args.trim().split(/\s+/).filter(Boolean);
+      const days = Math.max(1, Math.min(365, Number(words.find((w) => /^\d+$/.test(w)) ?? 30)));
+      const report = frictionReport(ctx.cwd, days, words.includes("all"));
+      const file = join(globalDataDir(), "feedback.md");
+      try {
+        mkdirSync(globalDataDir(), { recursive: true });
+        writeFileSync(file, `${report}\n`);
+      } catch {
+        /* the report is shown anyway */
+      }
+      ctx.ui.notify(`${report}\n\nSaved to ${file}`, "info");
     },
   });
 

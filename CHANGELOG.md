@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0] - 2026-11-18
+
+- Friction report: where the tooling itself cost time, to improve pi-team-kit from real use (`lib/feedback.ts`, `/feedback`, `ptk feedback [days] [--repo name]`).
+  - Read from pi's own session files, nothing extra is recorded, so it also covers work done before this version.
+  - Ranked by estimated time lost: rework rounds and their reasons, tasks squeezed into one lane by shared files, lanes that failed, patches that did not apply, lanes that passed alone but failed together, timeouts, commands the guard refused, failed tool calls, runs stopped by hand, a person stepping in during an unattended run, model errors, compactions. Each item has one line on what to try.
+  - `friction` tool: a lead notes in one line where the tooling got in the way; `/team` asks for it before the final report. Notes appear in the report.
+  - `/feedback` also saves the report to `~/.pi/agent/ptk/feedback.md` to hand to another agent.
+- `test/e2e/feedback.sh`: a real lead's note shows up, `/feedback` runs inside pi, and the report on real team runs names the verifier's rework reason.
+
 ## [0.5.0] - 2026-11-18
 
 - Playbooks: what one project taught about a kind of task, reused by the next one (`lib/playbook.ts`, `lib/harvest.ts`, the `playbook` tool, `/harvest`, `ptk playbooks`).
