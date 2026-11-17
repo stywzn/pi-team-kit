@@ -14,7 +14,8 @@ const git = (cwd: string, ...args: string[]) => {
 };
 
 test("a pi-subagents worktree gets the virtualenv activated, ignored files copied, never anything git would commit", () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "ptk-wt-")));
+  // realpath.native expands Windows 8.3 names (RUNNER~1) the way git records paths
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "ptk-wt-")));
   const main = join(root, "hostapp-test");
   mkdirSync(join(main, ".venv", "bin"), { recursive: true });
   writeFileSync(join(main, ".venv", "pyvenv.cfg"), "home = /usr/bin\n");
@@ -32,7 +33,7 @@ test("a pi-subagents worktree gets the virtualenv activated, ignored files copie
   const wt = join(root, "pi-worktree-login-0");
   git(main, "worktree", "add", "-q", "-b", "pi-subagents/login", wt);
 
-  assert.equal(mainCheckout(wt), main);
+  assert.equal(realpathSync.native(mainCheckout(wt) ?? ""), main);
   assert.equal(isWorkerWorktree(wt), true);
   assert.equal(isWorkerWorktree(main), false, "the main checkout is no worker worktree");
   const ignored = (rel: string) => spawnSync("git", ["-C", wt, "check-ignore", "-q", "--", rel]).status === 0;
