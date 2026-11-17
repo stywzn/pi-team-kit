@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.2] - 2026-11-17
+
+Fixes from running on a company Windows machine.
+
+- Python: the detected test command uses a Python that actually runs here (`python`, `py -3` or `python3`; Windows Store aliases skipped) instead of a hard-coded `python3`; no gate is guessed when there is no Python. The `py` launcher is understood by the guard (`py -m http.server` blocked, `py -m pytest` gets the test timeout).
+- `team_run` checks that the gate's program can start (`<program> --version`) before any worker runs, so a broken gate fails in seconds instead of after a full round.
+- Gate and fact checks run through pi's own bash (Git Bash on Windows) instead of `sh` on PATH; fact checks now run on Windows too, and `/ptk` says whether they ran.
+- Facts the agent saves for a project go to `.git/ptk/` (never in `git status`, so they cannot block a team run); `ptk facts share` merges them into the committed `.pi/ptk/facts.json`. Project toolbox helpers saved by the agent go to `.git/ptk/toolbox`.
+- `ptk doctor`: finds `pi.cmd` on Windows, finds the browser on Windows (file URL import), and flags package paths with backslashes (local-path installs on Windows, which hide this package's agents from pi-subagents); `--fix` rewrites them. `/ptk` shows the same warning.
+- `team.maxTasks` (default 8) applies everywhere; more tasks is an error and a planner over the limit hands its plan back instead of being cut silently.
+- md2pdf/shot no longer fail with EBUSY when Windows still holds the browser's temp files; `ls -R` gets a hint instead of being blocked.
+
 ## [0.3.1] - 2026-11-17
 
 - Windows/WSL desktop notifications: the script is passed with `-EncodedCommand`, so Chinese and other non-ASCII text survives the WSL to Windows code page boundary, and the toast template is filled without the "collection was modified" error that kept it from showing.

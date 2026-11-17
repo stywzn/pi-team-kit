@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -93,7 +93,9 @@ test("recursive grep / simple find suggest rg and fd", () => {
   assert.ok(blocked("grep -R --include=*.ts foo src"));
   assert.ok(blocked("find . -name '*.md'"));
   assert.ok(blocked("find src -type f -iname '*.py' -not -path '*/node_modules/*'"));
-  assert.ok(blocked("ls -R src"));
+  assert.ok(!blocked("ls -R src"), "ls -R only gets a hint, it is not worth a blocked call");
+  const lsr = inspectBash("ls -R src", base);
+  assert.match(lsr.kind === "allow" ? lsr.notes.join(" ") : "", /fd \./);
   assert.ok(!blocked("grep foo file.txt"));
   assert.ok(!blocked("git diff | grep -n foo"));
   assert.ok(!blocked("find . -mtime -1 -name '*.log'"), "complex find stays allowed");
@@ -166,6 +168,17 @@ test("wrapping in bash -c / sh -c / eval does not hide a command", () => {
   assert.ok(blocked(`bash -c "grep -rn TODO ."`));
   assert.ok(!blocked(`bash -c "npm run dev" &`), "backgrounded wrapper is fine");
   assert.ok(!blocked(`bash -c "npm test"`));
+});
+
+test("the Windows py launcher is understood like python", () => {
+  assert.ok(blocked("py -m http.server 8000"));
+  assert.ok(blocked("py -3.12 -m http.server"));
+  assert.ok(blocked("py"), "bare py opens a REPL");
+  assert.ok(!blocked("py -3 script.py"));
+  assert.equal(classifyCommand("py -m pytest -q"), "test");
+  assert.equal(classifyCommand("py -3 -m unittest -q"), "test");
+  assert.deepEqual(stripPyVersion(["-3.12-64", "-m", "x"]), ["-m", "x"]);
+  assert.deepEqual(stripPyVersion(["-V:3.12", "a.py"]), ["a.py"]);
 });
 
 test("commands are classified so tests and builds get longer default timeouts", () => {

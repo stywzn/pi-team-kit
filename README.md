@@ -49,6 +49,11 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
 
 > 如果装过 pi 官方的 subagent 示例扩展（`~/.pi/agent/extensions/subagent/index.ts`），它也注册了 `subagent` 工具，会和 pi-subagents 冲突，先移走。`ptk doctor` 会检查这一项；用 [way-pi-kit](https://github.com/stywzn/way-pi-kit) 安装会自动处理。
 
+**Windows（不用 WSL）注意**：
+- 需要 Git for Windows：pi 的 bash 工具、门禁命令和事实检查都用它带的 bash。
+- Python 会自动挑一个真能运行的：`python`、`py -3` 或 `python3`，会跳过微软商店那个只会提示 "Python was not found" 的空壳。
+- 如果是从本地路径安装的（`pi install C:\...`），先运行一次 `ptk doctor --fix`。pi 会把路径存成反斜杠，pi-subagents 就找不到本包的规划员、worker、审查员。
+
 **10 分钟教程：[docs/TUTORIAL.md](docs/TUTORIAL.md)**（角色怎么配合、怎么写目标、怎么防冲突和死锁、DeepSeek + GLM 怎么搭）。
 
 ## 用法
@@ -106,7 +111,7 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
 }
 ```
 
-项目里 `remember` 存下的事实在 `.pi/ptk/facts.json`，提交进仓库，团队成员就共享同一份环境知识。
+agent 用 `remember` 存下的项目事实放在 `.git/ptk/facts.json`：在 git 目录里，`git status` 看不到，不会弄脏工作区挡住团队运行，也不会被误提交。想和团队共享时，运行 `ptk facts share`，把它们合并进 `.pi/ptk/facts.json` 再提交；团队文件只在 pi 信任该项目后才加载。
 
 想让子 agent 的上下文也严格按预算走：配好 `team.models` 之后运行 `ptk caps` 看建议，`ptk caps --apply` 写进 `~/.pi/agent/models.json`（会先备份）。pi 会在两轮之间按这个窗口自动压缩，不会打断正在跑的任务。
 

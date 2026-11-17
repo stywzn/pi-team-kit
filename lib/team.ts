@@ -196,7 +196,7 @@ function lanesFor(tasks) {
 }
 function cleanTasks(raw) {
   var seen = {};
-  return (raw || []).slice(0, PLAN.maxTasks).map(function (t, i) {
+  return (raw || []).map(function (t, i) {
     var key = String(t.key || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "task-" + (i + 1);
     while (seen[key]) key = key + "-" + (i + 1);
     seen[key] = true;
@@ -312,6 +312,10 @@ if (!lanes.length) {
   var tasks = cleanTasks(out.tasks);
   if (!tasks.length) {
     return { goal: PLAN.goal, state: "needs-input", questions: out.questions || [], notes: out.notes || p.error || "planner returned no tasks", lanes: [] };
+  }
+  if (tasks.length > PLAN.maxTasks) {
+    // Never cut silently: hand the plan back so the lead can merge tasks or split the goal into two runs.
+    return { goal: PLAN.goal, state: "needs-input", questions: ["The planner proposed " + tasks.length + " tasks; the limit is " + PLAN.maxTasks + ". Merge small tasks, or split the goal into two runs, then call team_run with tasks."], notes: out.notes || "", plan: { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }) }, lanes: [] };
   }
   lanes = lanesFor(tasks);
   planned = { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }), questions: out.questions || [], notes: out.notes || "" };

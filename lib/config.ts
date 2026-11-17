@@ -2,7 +2,7 @@
 //   built-in defaults  <  <agentDir>/ptk.json  <  <repo>/.pi/ptk.json
 // The defaults below are the documentation: each key says what it does.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -79,6 +79,8 @@ export interface PtkConfig {
     confirm: boolean;
     /** Workers running at the same time. */
     maxParallel: number;
+    /** Most tasks one run takes, from the lead or the planner. More is an error, never a silent cut. */
+    maxTasks: number;
     /** Verifier rounds per lane before a human has to decide. */
     maxRounds: number;
     /** Shell command that must pass in every worker's worktree. Auto-detected when empty. */
@@ -125,6 +127,7 @@ export const DEFAULTS: PtkConfig = {
   team: {
     confirm: true,
     maxParallel: 4,
+    maxTasks: 8,
     maxRounds: 3,
     gate: "",
     gateTimeoutSec: 900,
@@ -153,9 +156,33 @@ export function findRepoRoot(start: string): string | undefined {
   }
 }
 
-/** Project data lives next to pi's own project config: `<repo>/.pi/ptk/`. */
+/** Shared project data, committed with the repo: `<repo>/.pi/ptk/`. Only humans write here (e.g. `ptk facts share`). */
 export function projectDataDir(cwd: string): string {
   return join(findRepoRoot(cwd) ?? resolve(cwd), ".pi", "ptk");
+}
+
+/** The repository's git directory (the main one, also from inside a linked worktree). */
+export function gitCommonDir(repoRoot: string): string {
+  const dotGit = join(repoRoot, ".git");
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!pointer) return dotGit;
+    const gitDir = resolve(repoRoot, pointer);
+    const common = existsSync(join(gitDir, "commondir")) ? readFileSync(join(gitDir, "commondir"), "utf8").trim() : "";
+    return common ? resolve(gitDir, common) : gitDir;
+  } catch {
+    return dotGit;
+  }
+}
+
+/**
+ * Data the agent writes for one repo on this machine: `<git dir>/ptk/`. Inside .git it never shows up in
+ * `git status`, so it cannot block a team run (workers need a clean tree) and is never committed by accident.
+ */
+export function localProjectDataDir(cwd: string): string | undefined {
+  const root = findRepoRoot(cwd);
+  return root ? join(gitCommonDir(root), "ptk") : undefined;
 }
 
 export function globalDataDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -227,8 +254,20 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   cx.handoffAfterCompactions = clamp(Math.round(cx.handoffAfterCompactions), 1, 20);
   config.terminal.notifyAfterSec = clamp(config.terminal.notifyAfterSec, 0, 86_400);
   config.team.maxParallel = clamp(Math.round(config.team.maxParallel), 1, 8);
+  config.team.maxTasks = clamp(Math.round(config.team.maxTasks), 1, 12);
   config.team.maxRounds = clamp(Math.round(config.team.maxRounds), 1, 10);
   return { config, files, warnings };
+}
+
+/** Package sources in pi's settings.json that contain backslashes (Windows local-path installs). pi-subagents
+ *  then cannot resolve the package's agents, so team-planner/worker/verifier silently do not exist. */
+export function backslashSources(settingsText: string): string[] {
+  try {
+    const s = JSON.parse(settingsText) as { packages?: (string | { source?: string })[] };
+    return (s.packages ?? []).map((p) => (typeof p === "string" ? p : (p.source ?? ""))).filter((src) => src.includes("\\"));
+  } catch {
+    return [];
+  }
 }
 
 export function clamp(value: number, min: number, max: number): number {

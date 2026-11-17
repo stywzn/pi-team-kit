@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DEFAULTS, mergeKnown } from "../lib/config.ts";
-import { detectEnv, formatEnv, type Probe } from "../lib/env.ts";
+import { detectEnv, formatEnv, pythonCommand, type Probe } from "../lib/env.ts";
 import { applyRemember, emptyFactFile, readFactFile, writeFactFile } from "../lib/facts.ts";
 import { unexplainedAcronyms } from "../lib/plain.ts";
 import { addTool, discoverTools, toolArgv } from "../lib/toolbox.ts";
@@ -112,6 +112,39 @@ test("environment: detected from the machine and repo, Windows PATH ignored insi
   assert.match(text, /on feature\/x, origin ssh:\/\/github\.com\/me\/app\.git/);
   assert.doesNotMatch(text, /token123/, "credentials in remote URLs are stripped");
   assert.match(text, /Not installed: fd/);
+});
+
+function winProbe(bins: string[], files: Record<string, string> = {}): Probe {
+  return {
+    platform: "win32",
+    release: "",
+    arch: "x64",
+    env: { PATH: "C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Python312;C:\\Windows\\py" },
+    cwd: "C:\\repo",
+    repoRoot: "C:\\repo",
+    home: "C:\\Users\\u",
+    nodeVersion: "v22.23.2",
+    extraBin: [],
+    exists: (p) => bins.includes(p) || p in files,
+    read: (p) => files[p],
+    list: (p) => (p === "C:\\repo" ? Object.keys(files).filter((f) => f.startsWith("C:\\repo\\")).map((f) => f.slice(8)) : []),
+  };
+}
+
+test("python: the command that really runs is used for tests; Windows Store aliases are skipped", () => {
+  const storeOnly = ["C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe", "C:\\Users\\u\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"];
+  assert.equal(pythonCommand(winProbe(storeOnly)), undefined, "Store aliases only print 'Python was not found'");
+  assert.equal(pythonCommand(winProbe([...storeOnly, "C:\\Python312\\python.exe"])), "python");
+  assert.equal(pythonCommand(winProbe([...storeOnly, "C:\\Windows\\py\\py.exe"])), "py -3");
+  const repo = winProbe(["C:\\Python312\\python.exe"], { "C:\\repo\\test_calc.py": "", "C:\\repo\\calc.py": "" });
+  assert.equal(detectEnv(repo).testCommand, "python -m unittest -q");
+  assert.match(formatEnv(detectEnv(repo)), /python \(run as `python`\)/);
+  const none = detectEnv(winProbe(storeOnly, { "C:\\repo\\test_calc.py": "" }));
+  assert.equal(none.testCommand, undefined, "no guessed gate that cannot run");
+  assert.ok(none.project.some((l) => /no working Python/.test(l)));
+  const linux = fakeProbe({ "/repo/test_x.py": "", "/repo/pyproject.toml": "[tool.pytest.ini_options]\n", "/repo/uv.lock": "" }, ["/usr/bin/python3"]);
+  assert.equal(pythonCommand(linux), "python3");
+  assert.equal(detectEnv(linux).testCommand, "uv run python -m pytest -q", "inside uv the environment's python is used");
 });
 
 test("config: known keys merge, wrong types and unknown keys are reported", () => {

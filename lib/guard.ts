@@ -46,6 +46,9 @@ export function longRunnerReason(seg: Segment): string | undefined {
   const sub = rest.find((a) => !a.startsWith("-"));
   const has = (...flags: string[]) => rest.some((a) => flags.includes(a) || flags.some((f) => a.startsWith(f + "=")));
 
+  // The Windows `py` launcher: `py -3.12 -m http.server` is `python -m http.server`.
+  if (prog === "py") return longRunnerReason({ ...seg, argv: ["python", ...stripPyVersion(rest)] });
+
   const devScripts = new Set(["dev", "start", "serve", "watch", "preview", "develop"]);
   if (["npm", "pnpm", "yarn", "bun"].includes(prog)) {
     const script = sub === "run" || sub === "run-script" ? rest[rest.indexOf(sub) + 1] : sub;
@@ -125,6 +128,13 @@ export function longRunnerReason(seg: Segment): string | undefined {
   return undefined;
 }
 
+/** Drop the `py` launcher's version selectors (`-3`, `-3.12`, `-3.12-64`, `-V:3.12`). */
+export function stripPyVersion(args: string[]): string[] {
+  let i = 0;
+  while (i < args.length && /^-(\d+(\.\d+)?(-(32|64))?|V:\S+)$/.test(args[i])) i++;
+  return args.slice(i);
+}
+
 /** A faster equivalent for slow recursive searches, or undefined. */
 export function fastSearchHint(seg: Segment, opts: Pick<GuardOptions, "hasRg" | "hasFd" | "builtinSearch">): string | undefined {
   const argv = effectiveCommand(seg.argv).argv;
@@ -188,6 +198,10 @@ export function classifyCommand(command: string): CommandClass {
     if (["npx", "bunx", "pnpx"].includes(prog) || ((prog === "uv" || prog === "poetry" || prog === "pdm" || prog === "pipenv") && argv[1] === "run")) {
       argv = argv.slice(prog === "npx" || prog === "bunx" || prog === "pnpx" ? 1 : 2).filter((a) => a !== "-y" && a !== "--yes");
       prog = argv.length ? baseName(argv[0]) : "";
+    }
+    if (prog === "py") {
+      argv = ["python", ...stripPyVersion(argv.slice(1))];
+      prog = "python";
     }
     if (/^python(\d(\.\d+)?)?$/.test(prog) && argv[1] === "-m") {
       argv = argv.slice(2);
@@ -259,7 +273,9 @@ export function inspectBash(command: string, opts: GuardOptions): GuardDecision 
     for (const seg of segments) {
       const hint = fastSearchHint(seg, opts);
       if (!hint) continue;
-      if (opts.preferFastSearch === "block") return { kind: "block", reason: hint };
+      // `ls -R` on a small tree is harmless; only nudge. Recursive grep/find are the real time sinks.
+      const soft = hint.startsWith("`ls -R`");
+      if (opts.preferFastSearch === "block" && !soft) return { kind: "block", reason: hint };
       notes.push(hint);
       break;
     }
@@ -281,7 +297,23 @@ export function unsafeRegex(source: string): boolean {
   return /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]/.test(source) || source.length > 300;
 }
 
-/** Prefix test commands with CI=1 unless the command or environment already sets CI. */
+/** The program a gate command starts, skipping `VAR=x` and wrappers: `CI=1 python -m pytest` -> `python`. */
+export function gateProgram(gate: string): string | undefined {
+  const first = splitSegments(gate).find((s) => !/^cd\s/.test(s.text));
+  return first ? effectiveCommand(first.argv).argv[0] : undefined;
+}
+
+/** Output of `<program> --version` that means the program cannot run here at all (not that tests failed). */
+export function looksUnrunnable(code: number | null, output: string): boolean {
+  return (
+    code === 127 ||
+    code === 9009 ||
+    /command not found|is not recognized as an internal or external command|Python was not found|No such file or directory|cannot execute/i.test(output)
+  );
+}
+
+/** Prefix test commands with CI=1 unless the command or environment already sets CI.
+ *  Bash syntax on purpose: the guard only rewrites pi's `bash` tool, which runs bash everywhere (Git Bash on Windows). */
 export function withCi(command: string, env: NodeJS.ProcessEnv): string {
   if (env.CI !== undefined || /(^|[\s;&|(])(export\s+)?CI=/.test(command)) return command;
   return `export CI=1\n${command}`;

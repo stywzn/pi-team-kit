@@ -11,14 +11,14 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader, convertToLlm, isToolCallEventType, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, convertToLlm, createLocalBashOperations, isToolCallEventType, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-import { agentDir, findRepoRoot, globalDataDir, loadConfig, projectDataDir, type PtkConfig } from "../lib/config.ts";
+import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { classifyCommand, inspectBash, looksLikeTimeout, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
+import { classifyCommand, gateProgram, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, patchesFromHandoff, planLanes, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
@@ -122,8 +122,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
   }
 
   function loadFacts() {
-    const project = state.repo && state.trusted;
-    const layers: [Scope, string][] = [["global", globalDataDir()], ...(project ? [["project", projectDataDir(state.cwd)] as [Scope, string]] : [])];
+    // team facts come from the repo (only once pi trusts it); project facts live in .git/ptk on this machine.
+    const local = localProjectDataDir(state.cwd);
+    const layers: [Scope, string][] = [
+      ["global", globalDataDir()],
+      ...(state.repo && state.trusted ? [["team", projectDataDir(state.cwd)] as [Scope, string]] : []),
+      ...(local ? [["project", local] as [Scope, string]] : []),
+    ];
     state.facts = [];
     state.pitfalls = [];
     for (const [scope, dir] of layers) {
@@ -133,21 +138,40 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Run a shell command the way pi's own bash tool does (Git Bash on Windows, bash elsewhere),
+   * instead of assuming `sh` is on PATH. `missingShell` means no bash could be started at all.
+   */
+  async function runShell(command: string, cwd: string, timeoutSec: number, signal?: AbortSignal) {
+    let out = "";
+    const append = (d: Buffer) => {
+      if (out.length < 400_000) out += d.toString();
+    };
+    try {
+      const ops = createLocalBashOperations();
+      const r = await ops.exec(command, cwd, { onData: append, timeout: timeoutSec, signal, env: process.env });
+      return { code: r.exitCode, output: out, timedOut: false, missingShell: false };
+    } catch (error) {
+      const msg = String((error as Error)?.message ?? error);
+      return { code: null, output: `${out}\n${msg}`.trim(), timedOut: looksLikeTimeout(msg), missingShell: /ENOENT|spawn|not found/i.test(msg) && !out };
+    }
+  }
+
+  let factChecks = "not run yet";
   async function checkFacts() {
-    if (process.platform === "win32") return;
-    const timeout = state.config.facts.checkTimeoutMs;
+    const timeoutSec = state.config.facts.checkTimeoutMs / 1000;
+    const withChecks = state.facts.filter((f) => f.check);
+    if (!withChecks.length) return void (factChecks = "no facts with checks");
+    let noShell = false;
     await Promise.all(
-      state.facts
-        .filter((f) => f.check)
-        .map(async (f) => {
-          try {
-            const r = await pi.exec("sh", ["-c", f.check as string], { cwd: state.repo ?? state.cwd, timeout });
-            f.stale = r.code !== 0 || r.killed === true;
-          } catch {
-            f.stale = true;
-          }
-        }),
+      withChecks.map(async (f) => {
+        const r = await runShell(f.check as string, state.repo ?? state.cwd, timeoutSec);
+        if (r.missingShell) noShell = true;
+        f.stale = r.code !== 0;
+      }),
     );
+    factChecks = noShell ? "not run: no bash found (on Windows install Git for Windows)" : `${withChecks.length} checked`;
+    if (noShell) for (const f of withChecks) f.stale = false; // unknown, not stale
   }
 
   function loadTools() {
@@ -155,6 +179,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       { dir: join(PACKAGE_ROOT, "toolbox"), layer: "bundled" },
       { dir: join(globalDataDir(), "toolbox"), layer: "global" },
       ...(state.repo && state.trusted ? [{ dir: join(projectDataDir(state.cwd), "toolbox"), layer: "project" as const }] : []),
+      ...(localProjectDataDir(state.cwd) ? [{ dir: join(localProjectDataDir(state.cwd) as string, "toolbox"), layer: "project" as const }] : []),
     ]);
   }
 
@@ -316,12 +341,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
       match: Type.Optional(Type.String({ description: "pitfall only: regex tested against bash commands" })),
       when: Type.Optional(Type.String({ description: "pitfall only: regex the working directory must match" })),
       action: Type.Optional(StringEnum(["warn", "block"] as const)),
-      scope: Type.Optional(StringEnum(["project", "global"] as const, { description: "project = this repo (commit .pi/ptk/facts.json to share); global = every repo" })),
+      scope: Type.Optional(StringEnum(["project", "global"] as const, { description: "project = this repo on this machine (kept in .git/ptk, never dirties the working tree); global = every repo" })),
     }),
     async execute(_id, params) {
       const scope: Scope = params.scope ?? (state.repo ? "project" : "global");
-      if (scope === "project" && !state.repo) throw new Error("not inside a git repo; use scope global");
-      const file = factFilePath(scope === "project" ? projectDataDir(state.cwd) : globalDataDir());
+      const local = localProjectDataDir(state.cwd);
+      if (scope === "project" && !local) throw new Error("not inside a git repo; use scope global");
+      const file = factFilePath(scope === "project" ? (local as string) : globalDataDir());
       // Parallel tool calls must not interleave read-modify-write on the same file.
       const run = factWrites.then(() => {
         const { file: next, result } = applyRemember(readFactFile(file), params as RememberInput, state.config.facts.maxFacts);
@@ -331,7 +357,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       });
       factWrites = run.catch(() => undefined);
       const result = await run;
-      const note = scope === "project" && !state.trusted ? " This project is not trusted in pi yet, so project facts load only after you trust it." : "";
+      const note = scope === "project" ? " To share it with the team: `ptk facts share`, then commit .pi/ptk/facts.json." : "";
       return text(`${result} Stored in ${file}.${note}`);
     },
   });
@@ -365,8 +391,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (params.action === "add") {
         if (!params.name || !params.source || !params.description) throw new Error("add needs name, source and description");
         const scope = params.scope ?? "global";
-        if (scope === "project" && !state.repo) throw new Error("not inside a git repo; use scope global");
-        const root = join(scope === "project" ? projectDataDir(ctx.cwd) : globalDataDir(), "toolbox");
+        const local = localProjectDataDir(ctx.cwd);
+        if (scope === "project" && !local) throw new Error("not inside a git repo; use scope global");
+        // Project helpers go to .git/ptk/toolbox so saving one never dirties the working tree.
+        const root = join(scope === "project" ? (local as string) : globalDataDir(), "toolbox");
         const saved = addTool(root, { name: params.name, description: params.description, usage: params.usage ?? params.name, source: params.source }, ctx.cwd);
         loadTools();
         return text(`Saved "${saved.name}" to ${saved.dir}. Run it with toolbox action run.`);
@@ -448,7 +476,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       doneWhen: Type.String({ description: "How to tell it is done: the tests or checks that must pass, the behaviour to observe" }),
       outOfScope: Type.Optional(Type.String({ description: "What must not be changed or done" })),
       assumptions: Type.Optional(Type.Array(Type.String(), { description: "Defaults you chose where the user did not decide" })),
-      tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12, description: "Omit to let the team-planner agent split the goal inside the run" })),
+      tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12, description: "Omit to let the team-planner agent split the goal inside the run. At most team.maxTasks (default 8)." })),
       gate: Type.Optional(Type.String({ description: "Command that must pass in every worktree; default: configured or detected test command" })),
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
     }),
@@ -456,12 +484,26 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const root = findRepoRoot(ctx.cwd);
       if (!root) throw new Error("team_run needs a git repository (workers use git worktrees).");
       const dirty = await dirtyFiles(root);
-      if (dirty.length) throw new Error(`Commit or stash these first; workers branch from a clean HEAD:\n${dirty.slice(0, 20).join("\n")}`);
+      if (dirty.length) {
+        const shared = dirty.some((f) => f.startsWith(".pi/ptk")) ? "\n.pi/ptk holds team-shared facts/tools: commit it (or move it away) first." : "";
+        throw new Error(`Commit or stash these first; workers branch from a clean HEAD:\n${dirty.slice(0, 20).join("\n")}${shared}`);
+      }
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
-      const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[]) : [];
+      const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
       const lanes = planLanes(tasks);
       const gate = (params.gate ?? t.gate ?? "").trim() || state.env?.testCommand || "";
+      // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
+      // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
+      if (gate) {
+        const prog = gateProgram(gate);
+        if (prog) {
+          const r = await runShell(`${prog} --version`, root, 20);
+          if (r.missingShell) throw new Error("No bash found to run the gate. On Windows install Git for Windows (pi's bash tool needs it too).");
+          if (!r.timedOut && looksUnrunnable(r.code, r.output))
+            throw new Error(`The gate \`${gate}\` cannot run here: \`${prog} --version\` said:\n${r.output.trim().slice(0, 500)}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
+        }
+      }
       const brief = {
         goal: params.goal.trim(),
         doneWhen: params.doneWhen.trim(),
@@ -492,7 +534,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         workerAgent: t.workerAgent,
         verifierAgent: t.verifierAgent,
         plannerAgent: t.plannerAgent,
-        maxTasks: 8,
+        maxTasks: t.maxTasks,
         models: t.models,
       };
       const data = await rpc("spawn", {
@@ -574,10 +616,11 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const gate = params.skipGate ? "" : (params.gate ?? state.config.team.gate ?? "").trim() || state.env?.testCommand || "";
       let gatePassed = true;
       if (gate) {
-        const r = await pi.exec("sh", ["-c", gate], { cwd: root, timeout: state.config.team.gateTimeoutSec * 1000, signal });
+        const r = await runShell(gate, root, state.config.team.gateTimeoutSec, signal);
         gatePassed = r.code === 0;
-        const tail = clip(`${r.stdout}\n${r.stderr}`.trim().split("\n").slice(-30).join("\n"), 4000);
-        lines.push(`gate \`${gate}\`: ${gatePassed ? "PASSED" : `FAILED (exit ${r.code}${r.killed ? ", timed out" : ""})`}\n${tail}`);
+        const tail = clip(r.output.trim().split("\n").slice(-30).join("\n"), 4000);
+        const why = r.missingShell ? "no bash found (on Windows install Git for Windows)" : `exit ${r.code ?? "?"}${r.timedOut ? ", timed out" : ""}`;
+        lines.push(`gate \`${gate}\`: ${gatePassed ? "PASSED" : `FAILED (${why})`}\n${tail}`);
       }
       if (gatePassed && params.keepWorktrees !== true) {
         // Patches are in the checkout now; the workers' retained worktrees and branches are just clutter.
@@ -791,7 +834,12 @@ export default function piTeamKit(pi: ExtensionAPI) {
         `guard: ${g.enabled ? `on, timeout ${g.defaultTimeoutSec}s / tests ${g.testTimeoutSec}s / builds ${g.buildTimeoutSec}s (max ${g.maxTimeoutSec}s), search=${g.preferFastSearch}` : "off"}`,
         `pi-subagents: ${subagents}; team gate: ${state.config.team.gate || state.env?.testCommand || "(none)"}; models: ${Object.entries(state.config.team.models).map(([r, m]) => `${r}=${m || "default"}`).join(", ")}`,
         `toolbox: ${state.tools.map((t) => `${t.name}[${t.layer}]`).join(", ") || "empty"}`,
-        `facts: ${state.facts.length} (${state.facts.filter((f) => f.stale).length} stale), pitfalls: ${state.pitfalls.length}`,
+        `facts: ${state.facts.length} (${state.facts.filter((f) => f.stale).length} stale; checks ${factChecks}), pitfalls: ${state.pitfalls.length}`,
+        ...(() => {
+          const settingsFile = join(agentDir(), "settings.json");
+          const bad = existsSync(settingsFile) ? backslashSources(readFileSync(settingsFile, "utf8")) : [];
+          return bad.length ? [`WARNING package path with backslashes (${bad.join(", ")}): pi-subagents cannot load this package's agents. Run: node <pi-team-kit>/bin/ptk.ts doctor --fix`] : [];
+        })(),
         "",
         state.envText,
       ].join("\n");

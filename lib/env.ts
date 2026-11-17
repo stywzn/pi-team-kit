@@ -50,7 +50,7 @@ function safe<T>(fn: () => T): T | undefined {
 }
 
 /** Locate an executable on PATH (plus extra dirs) without spawning anything. */
-export function which(probe: Probe, name: string): string | undefined {
+export function which(probe: Probe, name: string, accept: (path: string) => boolean = () => true): string | undefined {
   join = probe.platform === "win32" ? win32.join : posix.join;
   const dirs = [...(probe.env.PATH ?? "").split(probe.platform === "win32" ? ";" : ":"), ...probe.extraBin].filter(Boolean);
   const exts = probe.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
@@ -59,7 +59,7 @@ export function which(probe: Probe, name: string): string | undefined {
     if (probe.platform === "linux" && dir.startsWith("/mnt/") && !name.endsWith(".exe")) continue;
     for (const ext of exts) {
       const full = join(dir, name + ext);
-      if (probe.exists(full)) return full;
+      if (probe.exists(full) && accept(full)) return full;
     }
   }
   return undefined;
@@ -74,12 +74,26 @@ export interface EnvFacts {
   repo?: { root: string; branch?: string; remote?: string };
   project: string[];
   testCommand?: string;
+  /** The command that starts Python here: "python3", "python" or "py -3". Undefined when there is none. */
+  python?: string;
 }
 
 const TOOLS = [
-  "git", "rg", "fd", "fdfind", "jq", "node", "npm", "pnpm", "yarn", "bun", "deno", "python3", "uv", "pip3", "poetry",
+  "git", "rg", "fd", "fdfind", "jq", "node", "npm", "pnpm", "yarn", "bun", "deno", "uv", "pip3", "poetry",
   "go", "cargo", "java", "docker", "make", "gh", "tmux", "pandoc", "apt-get", "brew", "winget",
 ];
+
+/**
+ * How to start Python on this machine. Windows: prefer `python`, then the `py` launcher, then `python3`;
+ * skip the Microsoft Store aliases in ...\WindowsApps\, which only print "Python was not found".
+ * Elsewhere: `python3`, then `python`.
+ */
+export function pythonCommand(probe: Probe): string | undefined {
+  const order = probe.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python"];
+  const real = (p: string) => !(probe.platform === "win32" && /[\\/]WindowsApps[\\/]/i.test(p));
+  for (const name of order) if (which(probe, name, real)) return name === "py" ? "py -3" : name;
+  return undefined;
+}
 
 export function detectEnv(probe: Probe): EnvFacts {
   join = probe.platform === "win32" ? win32.join : posix.join;
@@ -100,7 +114,8 @@ export function detectEnv(probe: Probe): EnvFacts {
     else if (["rg", "fd", "jq", "git"].includes(t)) missing.push(t);
   }
   if (!tools.fd && tools.fdfind) missing.splice(missing.indexOf("fd"), 1);
-  return { os: `${os} ${probe.arch}`, wsl, tools, missing, network: network(probe), repo: repoInfo(probe), ...project(probe) };
+  const python = pythonCommand(probe);
+  return { os: `${os} ${probe.arch}`, wsl, tools, missing, network: network(probe), repo: repoInfo(probe), python, ...project(probe, python) };
 }
 
 function distro(probe: Probe): string | undefined {
@@ -146,7 +161,7 @@ function repoInfo(probe: Probe): EnvFacts["repo"] {
   return { root: probe.repoRoot, branch, remote };
 }
 
-function project(probe: Probe): { project: string[]; testCommand?: string } {
+function project(probe: Probe, python: string | undefined): { project: string[]; testCommand?: string } {
   const root = probe.repoRoot ?? probe.cwd;
   const has = (f: string) => probe.exists(join(root, f));
   const lines: string[] = [];
@@ -165,10 +180,12 @@ function project(probe: Probe): { project: string[]; testCommand?: string } {
     const tool = has("uv.lock") ? "uv" : has("poetry.lock") ? "poetry" : has("Pipfile") ? "pipenv" : "pip";
     lines.push(`Python project (${tool})${has(".venv") ? ", virtualenv at .venv" : ""}`);
     const py = probe.read(join(root, "pyproject.toml")) ?? "";
-    const runner = tool === "uv" ? "uv run " : tool === "poetry" ? "poetry run " : "";
-    if (!testCommand && (/pytest/.test(py) || has("pytest.ini") || has("conftest.py"))) testCommand = `${runner}python -m pytest -q`;
+    // Inside uv/poetry the environment's own `python` is right; otherwise use whatever starts Python here.
+    const interpreter = tool === "uv" ? "uv run python" : tool === "poetry" ? "poetry run python" : python;
+    if (!testCommand && interpreter && (/pytest/.test(py) || has("pytest.ini") || has("conftest.py"))) testCommand = `${interpreter} -m pytest -q`;
   }
-  if (!testCommand && probe.list(root).some((f) => /^test_.*\.py$/.test(f))) testCommand = "python3 -m unittest -q";
+  if (!testCommand && python && probe.list(root).some((f) => /^test_.*\.py$/.test(f))) testCommand = `${python} -m unittest -q`;
+  if (!python && (has("pyproject.toml") || probe.list(root).some((f) => f.endsWith(".py")))) lines.push("Python files present but no working Python found on PATH");
   if (has("go.mod")) {
     lines.push("Go module");
     testCommand ??= "go test ./...";
@@ -190,7 +207,11 @@ function project(probe: Probe): { project: string[]; testCommand?: string } {
 
 export function formatEnv(facts: EnvFacts): string {
   const t = facts.tools;
-  const runtimes = ["node", "python3", "go", "cargo", "java", "deno", "bun"].filter((k) => t[k]);
+  const runtimes = [
+    ...(t.node ? ["node"] : []),
+    ...(facts.python ? [`python (run as \`${facts.python}\`)`] : []),
+    ...["go", "cargo", "java", "deno", "bun"].filter((k) => t[k]),
+  ];
   const pms = ["npm", "pnpm", "yarn", "uv", "pip3", "poetry", "apt-get", "brew", "winget"].filter((k) => t[k]);
   const extras = ["git", "gh", "jq", "docker", "make", "tmux", "pandoc"].filter((k) => t[k]);
   const search = [t.rg ? "rg" : "", t.fd ? "fd" : t.fdfind ? "fdfind (Debian name for fd)" : ""].filter(Boolean);

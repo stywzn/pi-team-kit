@@ -21,7 +21,9 @@ export interface FactFile {
   pitfalls: Pitfall[];
 }
 
-export type Scope = "project" | "global";
+/** global = every repo on this machine; project = this repo on this machine (in .git/ptk, written by the agent);
+ *  team = this repo for everyone (.pi/ptk/facts.json, committed by a human via `ptk facts share`). */
+export type Scope = "project" | "global" | "team";
 
 export function factFilePath(dataDir: string): string {
   return join(dataDir, "facts.json");
@@ -124,6 +126,23 @@ export function applyRemember(file: FactFile, input: RememberInput, maxItems: nu
 export interface CheckedFact extends Fact {
   scope: Scope;
   stale: boolean;
+}
+
+/** Merge facts and pitfalls from `from` into `into` by id (`from` wins). Used to share local facts with the team. */
+export function mergeFactFiles(into: FactFile, from: FactFile): { file: FactFile; added: number; updated: number } {
+  const facts = new Map(into.facts.map((f) => [f.id, f]));
+  const pitfalls = new Map(into.pitfalls.map((p) => [p.id, p]));
+  let added = 0;
+  let updated = 0;
+  for (const f of from.facts) {
+    facts.has(f.id) ? updated++ : added++;
+    facts.set(f.id, f);
+  }
+  for (const p of from.pitfalls) {
+    pitfalls.has(p.id) ? updated++ : added++;
+    pitfalls.set(p.id, p);
+  }
+  return { file: { version: 1, facts: [...facts.values()], pitfalls: [...pitfalls.values()] }, added, updated };
 }
 
 export function formatFacts(facts: CheckedFact[], pitfalls: (Pitfall & { scope: Scope })[]): string {

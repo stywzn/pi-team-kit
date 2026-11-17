@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // ptk: the same logic the extension uses, for humans and CI.
-//   ptk doctor [--strict]       check pi, pi-subagents, conflicts, rg/fd, browser, config
+//   ptk doctor [--strict] [--fix]   check pi, pi-subagents, conflicts, rg/fd, browser, config (--fix: package paths)
+//   ptk facts [share]           facts saved on this machine; share = copy them into .pi/ptk/facts.json to commit
 //   ptk env                     print what the agent is told about this machine and repo
 //   ptk tools | ptk run <name> [args...]
 //   ptk caps [--apply]          per-role context windows through pi's model overrides
@@ -10,8 +11,9 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { agentDir, findRepoRoot, globalDataDir, loadConfig, projectDataDir } from "../lib/config.ts";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir } from "../lib/config.ts";
+import { factFilePath, mergeFactFiles, readFactFile, writeFactFile } from "../lib/facts.ts";
 import { detectEnv, formatEnv, realProbe, which } from "../lib/env.ts";
 import { buildTeamScript, planLanes, validateTasks, type TeamTask } from "../lib/team.ts";
 import { discoverTools, formatToolList, toolArgv } from "../lib/toolbox.ts";
@@ -34,7 +36,7 @@ function probe() {
   return realProbe(cwd, findRepoRoot(cwd), [join(agentDir(), "bin"), join(globalDataDir(), "bin")]);
 }
 
-function doctor(strict: boolean): number {
+function doctor(strict: boolean, fix: boolean): number {
   let bad = 0;
   const line = (ok: boolean | "warn", label: string, detail = "") => {
     if (ok === false) bad++;
@@ -43,10 +45,21 @@ function doctor(strict: boolean): number {
   const major = Number(process.versions.node.split(".")[0]);
   const minor = Number(process.versions.node.split(".")[1]);
   line(major > 22 || (major === 22 && minor >= 19), "Node.js >= 22.19", process.version);
-  const pi = spawnSync("pi", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  // On Windows `pi` is pi.cmd, which only runs through a shell.
+  const pi = spawnSync("pi", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" });
   line(pi.status === 0, "pi installed", pi.status === 0 ? pi.stdout.trim() : "npm i -g @earendil-works/pi-coding-agent");
   const settingsFile = join(agentDir(), "settings.json");
-  const settings = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : "";
+  let settings = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : "";
+  const slashed = backslashSources(settings);
+  if (slashed.length && fix) {
+    copyFileSync(settingsFile, `${settingsFile}.bak-${Date.now()}`);
+    const s = JSON.parse(settings) as { packages: (string | { source?: string })[] };
+    s.packages = s.packages.map((p) => (typeof p === "string" ? p.replace(/\\/g, "/") : { ...p, source: p.source?.replace(/\\/g, "/") }));
+    settings = JSON.stringify(s, null, 2) + "\n";
+    writeFileSync(settingsFile, settings);
+    line(true, "package paths use forward slashes", `fixed ${slashed.length} path(s) in ${settingsFile}; restart pi`);
+  } else
+    line(!slashed.length, "package paths use forward slashes", slashed.length ? `${slashed.join(", ")}: pi-subagents cannot load this package's agents. Run: ptk doctor --fix` : "");
   const subagentsDir = join(agentDir(), "npm", "node_modules", "pi-subagents");
   line(/pi-subagents/.test(settings) || existsSync(subagentsDir), "pi-subagents installed", "pi install npm:pi-subagents");
   line(/pi-team-kit/.test(settings), "pi-team-kit registered in pi", "pi install git:github.com/stywzn/pi-team-kit");
@@ -60,7 +73,9 @@ function doctor(strict: boolean): number {
   const ensure = `pi downloads it on first use; to install now: bash ${join(ROOT, "skills", "fast-search", "scripts", "ensure-rg-fd.sh")}`;
   line(which(p, "rg") ? true : "warn", "ripgrep (rg)", which(p, "rg") ?? ensure);
   line(which(p, "fd") || which(p, "fdfind") ? true : "warn", "fd", which(p, "fd") ?? which(p, "fdfind") ?? ensure);
-  const browser = spawnSync(process.execPath, ["-e", `import(${JSON.stringify(join(ROOT, "toolbox", "_lib", "browser.mjs"))}).then(m=>{const b=m.findBrowser();console.log(b?b.path:"")})`], { encoding: "utf8" });
+  // ESM import() needs a file:// URL; a bare C:\ path fails on Windows.
+  const browserUrl = pathToFileURL(join(ROOT, "toolbox", "_lib", "browser.mjs")).href;
+  const browser = spawnSync(process.execPath, ["-e", `import(${JSON.stringify(browserUrl)}).then(m=>{const b=m.findBrowser();console.log(b?b.path:"")})`], { encoding: "utf8" });
   const b = browser.stdout.trim();
   line(b ? true : "warn", "browser for md2pdf/shot", b || "none found (only needed for md2pdf/shot)");
   line(existsSync(join(ROOT, "node_modules", "marked")) ? true : "warn", "md2pdf dependency (marked)", "run npm install in the package directory");
@@ -72,7 +87,7 @@ function doctor(strict: boolean): number {
 
 switch (cmd) {
   case "doctor":
-    process.exit(doctor(rest.includes("--strict")));
+    process.exit(doctor(rest.includes("--strict"), rest.includes("--fix")));
   case "env": {
     console.log(formatEnv(detectEnv(probe())));
     break;
@@ -90,6 +105,30 @@ switch (cmd) {
     const argv = toolArgv(tool, args);
     const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
     process.exit(r.status ?? 1);
+  }
+  case "facts": {
+    // Facts the agent saved live in .git/ptk (never dirty the tree). `share` copies them into .pi/ptk/facts.json to commit.
+    const local = localProjectDataDir(cwd);
+    if (!local) {
+      console.error("not inside a git repository");
+      process.exit(2);
+    }
+    const localFile = factFilePath(local);
+    const sharedFile = factFilePath(projectDataDir(cwd));
+    const mine = readFactFile(localFile);
+    if (rest[0] === "share") {
+      const { file, added, updated } = mergeFactFiles(readFactFile(sharedFile), mine);
+      writeFactFile(sharedFile, file);
+      console.log(`${sharedFile}: ${added} added, ${updated} updated. Review and commit it to share with the team.`);
+      break;
+    }
+    const shared = readFactFile(sharedFile);
+    console.log(`This machine (${localFile}): ${mine.facts.length} facts, ${mine.pitfalls.length} pitfalls`);
+    console.log(`Team (${sharedFile}): ${shared.facts.length} facts, ${shared.pitfalls.length} pitfalls`);
+    for (const f of mine.facts) console.log(`  [project/${f.id}] ${f.text}`);
+    for (const p of mine.pitfalls) console.log(`  [project/${p.id}] pitfall /${p.match}/: ${p.message}`);
+    console.log("\n`ptk facts share` copies this machine's facts into the team file.");
+    break;
   }
   case "caps": {
     // Per-role context caps through pi's own model overrides: pi then compacts subagents between turns at their budget.
@@ -156,6 +195,6 @@ switch (cmd) {
     break;
   }
   default:
-    console.log("usage: ptk doctor [--strict] | env | tools | run <name> [args...] | caps [--apply] | demo [dir] | plan <tasks.json> [--script]");
+    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script]");
     process.exit(cmd ? 2 : 0);
 }

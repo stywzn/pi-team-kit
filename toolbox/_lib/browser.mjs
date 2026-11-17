@@ -112,6 +112,12 @@ export function render(browser, html, kind, outPath, opts = {}) {
     }
     copyFileSync(result, outPath);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    // On Windows the browser can still hold its profile files for a moment (EBUSY). The output is already
+    // copied; a leftover temp dir is not worth failing the command over.
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    } catch {
+      /* the OS temp cleaner will get it */
+    }
   }
 }
