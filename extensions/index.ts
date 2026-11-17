@@ -64,7 +64,7 @@ import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } fro
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -511,6 +511,25 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const root = findRepoRoot(cwd);
     return root ? { root, file: leadStatePath(globalDataDir(), root) } : undefined;
   };
+
+  // pi is often started in the home folder and pointed at a project: the repo a run works in comes from the
+  // `repo` parameter, the session folder, or the previous run in this session.
+  let lastTeamRepo: string | undefined;
+  const workRepo = (cwd: string) => findRepoRoot(cwd) ?? lastTeamRepo;
+  const repoFor = (cwd: string, repo?: string) => resolveTeamRepo(cwd, repo, lastTeamRepo, findRepoRoot, homedir(), resolve);
+  const envCache = new Map<string, EnvFacts>();
+  /** Environment facts of the run's repo (for the detected test command), not of the session folder. */
+  const envFor = (root: string): EnvFacts | undefined => {
+    if (root === state.repo) return state.env;
+    if (!envCache.has(root)) {
+      try {
+        envCache.set(root, detectEnv({ ...realProbe(root, root, [join(agentDir(), "bin"), join(globalDataDir(), "bin")]), env: process.env }));
+      } catch {
+        return undefined;
+      }
+    }
+    return envCache.get(root);
+  };
   const saveLead = (cwd: string, patch: Parameters<typeof updateLeadState>[2], session?: string) => {
     const lf = leadFile(cwd);
     if (!lf) return;
@@ -541,10 +560,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
       gate: Type.Optional(Type.String({ description: "Command that must pass in every worktree; default: configured or detected test command" })),
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
       playbook: Type.Optional(Type.String({ description: "Name of a matching playbook (lessons from earlier projects of this kind); its steps, tips, pitfalls and never-list travel with the goal" })),
+      repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session was started in another folder" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const root = findRepoRoot(ctx.cwd);
-      if (!root) throw new Error("team_run needs a git repository (workers use git worktrees).");
+      const root = repoFor(ctx.cwd, params.repo);
       const pbName = params.playbook?.trim();
       const pb = pbName ? findPlaybook(playbookDirs(state.config), pbName) : undefined;
       if (pbName && !pb) throw new Error(`No playbook named "${pbName}". Available: ${listPlaybooks(playbookDirs(state.config)).map((p) => p.name).join(", ") || "none"}.`);
@@ -557,7 +576,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
       const lanes = planLanes(tasks);
-      const gate = (params.gate ?? t.gate ?? "").trim() || state.env?.testCommand || "";
+      const gate = (params.gate ?? t.gate ?? "").trim() || envFor(root)?.testCommand || "";
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
       if (gate) {
@@ -618,7 +637,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
         globalConcurrencyLimit: t.maxParallel,
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
-      saveLead(ctx.cwd, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}) } }, ctx.sessionManager.getSessionFile());
+      lastTeamRepo = root;
+      saveLead(root, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}) } }, ctx.sessionManager.getSessionFile());
+      const elsewhere = root !== findRepoRoot(ctx.cwd) ? `Repository: ${root} (this session runs elsewhere; team_integrate uses it too).\n` : "";
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
       const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
@@ -630,6 +651,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
               `Team run started in the background: ${lanes.length ? `${lanes.length} lane(s)` : "the team-planner splits the goal first"}, up to ${t.maxParallel} at once, gate ${gate ? `\`${gate}\`` : "(none: verifier only)"}, max ${plan.maxRounds} round(s)${roles ? `, models ${roles}` : ""}.\n` +
               (laneLines.length ? `${laneLines.join("\n")}\n` : "") +
               (lanes.length && lanes.length < tasks.length ? "Tasks sharing files were merged into one lane.\n" : "") +
+              elsewhere +
               "You will be woken when it finishes. Meanwhile the fleet view shows progress; workers may ask you questions through the supervisor channel.",
           },
         ],
@@ -649,10 +671,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
       gate: Type.Optional(Type.String()),
       skipGate: Type.Optional(Type.Boolean()),
       keepWorktrees: Type.Optional(Type.Boolean({ description: "Keep the workers' worktrees after a passing integration" })),
+      repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session runs in another folder (default: the repo of the last team_run)" })),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const root = findRepoRoot(ctx.cwd);
-      if (!root) throw new Error("not inside a git repository");
+      const root = repoFor(ctx.cwd, params.repo);
       const dirty = await dirtyFiles(root);
       if (dirty.length) throw new Error(`The checkout has uncommitted changes; commit or stash them first so patches apply cleanly:\n${dirty.slice(0, 20).join("\n")}`);
       const lines: string[] = [];
@@ -683,15 +705,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
           if (r.code !== 0) r = await pi.exec("git", ["apply", "--3way", "--whitespace=nowarn", p.path], { cwd: root, timeout: 60_000, signal });
           if (r.code !== 0) {
             lines.push(`FAILED ${p.path}\n${r.stderr.trim()}`);
-            saveLead(ctx.cwd, { finishRun: { status: "integration-failed", result: lines.join("\n").slice(0, 1500) } });
+            saveLead(root, { finishRun: { status: "integration-failed", result: lines.join("\n").slice(0, 1500) } });
             return text(`${lines.join("\n")}\n\nStopped. Earlier patches stay applied. Resolve the conflict or send the lane back to a worker.`);
           }
           lines.push(`applied ${p.branch ?? p.path}${p.diffStat ? `: ${p.diffStat.split("\n").pop()?.trim()}` : ""}`);
         }
       }
-      const lf = leadFile(ctx.cwd);
+      const lf = leadFile(root);
       const openRun = lf ? [...(readLeadState(lf.file)?.runs ?? [])].reverse().find((r) => r.status === "running") : undefined;
-      const gate = integrationGate({ skip: params.skipGate, explicit: params.gate, runGate: openRun?.gate, configured: state.config.team.gate, detected: state.env?.testCommand });
+      const gate = integrationGate({ skip: params.skipGate, explicit: params.gate, runGate: openRun?.gate, configured: state.config.team.gate, detected: envFor(root)?.testCommand });
       let gatePassed = true;
       if (gate) {
         const r = await runShell(gate, root, state.config.team.gateTimeoutSec, signal);
@@ -753,7 +775,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         }
       }
       lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
-      saveLead(ctx.cwd, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
+      saveLead(root, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });
       return text(lines.join("\n"));
     },
   });
@@ -882,7 +904,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (!draft) return ctx.ui.notify("Handoff cancelled", "info");
       const edited = await ctx.ui.editor("Edit the handoff brief, then submit it in the new session", draft);
       if (edited === undefined) return ctx.ui.notify("Handoff cancelled", "info");
-      saveLead(ctx.cwd, { handoff: edited }, parentSession);
+      saveLead(workRepo(ctx.cwd) ?? ctx.cwd, { handoff: edited }, parentSession);
       await ctx.newSession({
         parentSession,
         withSession: async (next) => {
@@ -896,11 +918,14 @@ export default function piTeamKit(pi: ExtensionAPI) {
   // ---------- inheritance: a new lead session takes over with /continue ----------
 
   pi.registerCommand("continue", {
-    description: "Take over the task an earlier lead session left in this repository (brief, team runs, handoff notes)",
-    handler: async (_args, ctx) => {
-      const lf = leadFile(ctx.cwd);
+    description: "Take over the task an earlier lead session left in this repository (brief, team runs, handoff notes): /continue [repo path]",
+    handler: async (args, ctx) => {
+      // From the home folder, name the project: /continue D:\dev\shop-tests
+      const where = args.trim() ? resolve(ctx.cwd, args.trim().replace(/^~(?=$|[\\/])/, homedir())) : (workRepo(ctx.cwd) ?? ctx.cwd);
+      const lf = leadFile(where);
       const s = lf && readLeadState(lf.file);
-      if (!s) return ctx.ui.notify("No earlier lead session recorded for this repository.", "info");
+      if (!s) return ctx.ui.notify(`No earlier lead session recorded for ${lf ? lf.root : `${where} (not a git repository; name the project: /continue <repo path>)`}.`, "info");
+      lastTeamRepo = lf.root;
       const message = continuationMessage(s);
       if (ctx.mode === "tui") {
         ctx.ui.setEditorText(message);
@@ -982,9 +1007,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
             return [];
           }
         });
-        const lf = leadFile(ctx.cwd);
+        const lf = leadFile(workRepo(ctx.cwd) ?? ctx.cwd);
         items.push(...leadEvidence(lf ? readLeadState(lf.file) : undefined));
-        const root = findRepoRoot(ctx.cwd);
+        const root = workRepo(ctx.cwd);
         if (root) {
           const since = `--since=${days}.days`;
           const log = await pi.exec("git", ["log", since, "-n", "30", "--format=%h %s"], { cwd: root, timeout: 15_000 });
@@ -1023,8 +1048,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
         mkdirSync(join(dir, "references"), { recursive: true });
         writeFileSync(join(dir, "SKILL.md"), body);
         writeMeta(dir, { version: 1, created: new Date().toISOString(), uses: [], log: [] });
-        if (lastEvidence) writeFileSync(join(dir, "references", "sources.md"), `# Evidence this playbook was written from\n\nRepo: ${basename(findRepoRoot(ctx.cwd) ?? ctx.cwd)}, ${new Date().toISOString().slice(0, 10)}\n\n${lastEvidence}\n`);
-        const root = findRepoRoot(ctx.cwd);
+        if (lastEvidence) writeFileSync(join(dir, "references", "sources.md"), `# Evidence this playbook was written from\n\nRepo: ${basename(workRepo(ctx.cwd) ?? ctx.cwd)}, ${new Date().toISOString().slice(0, 10)}\n\n${lastEvidence}\n`);
+        const root = workRepo(ctx.cwd);
         const t = root && params.files?.length ? copyTemplates(root, params.files, join(dir, "templates")) : { copied: [], skipped: [] };
         const lines = body.split("\n").filter((l) => l.trim()).length;
         return text(

@@ -11,7 +11,7 @@ Phase 1, with me (do not start work before this is settled):
 3. If anything that changes the result is unclear, ask me at most 3 short questions and wait for the answers. Do not ask about things a sensible default covers; put those under assumptions.
 
 Phase 2, unattended (I may be away; never wait for me from here on):
-4. Call `team_run` with goal, doneWhen, outOfScope, assumptions and `playbook` (the playbook's name, if you read one), and no `tasks`, so the team-planner splits the work. I confirm the brief in the dialog; after that you are on your own.
+4. Call `team_run` with goal, doneWhen, outOfScope, assumptions, `playbook` (the playbook's name, if you read one) and `repo` (the project's folder, if this session was started somewhere else), and no `tasks`, so the team-planner splits the work. I confirm the brief in the dialog; after that you are on your own.
 5. Answer workers' questions yourself from the brief and the code. If a product decision is truly needed, take the conservative option and note it.
 6. When the run finishes, call `team_integrate` with the `runDir` of every passed lane right away. If the planner returned questions, answer them from the brief (or take the conservative option) and run again with `tasks`.
 7. If the tooling itself cost time in this run (the planner's split, the guard, a tool, a rework loop that should not have been needed), note each in one line with `friction` (at most 3). Then finish with a report like a CI summary:

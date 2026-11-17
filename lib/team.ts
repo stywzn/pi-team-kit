@@ -452,3 +452,22 @@ export function patchesFromHandoff(runDir: string, handoffJson: string): PatchRe
       if (c.patch?.path) out.push({ runDir, path: c.patch.path, branch: c.patch.branch, diffStat: c.patch.diffStat, changed: c.patch.changed !== false });
   return out;
 }
+
+/**
+ * The git repository a team run works in. Many people start pi in their home folder and point it at a project,
+ * so the session folder is not always the repo: an explicit `repo` wins, then the session folder's repo, then
+ * the repo the previous run in this session used. `find` is findRepoRoot (injected for tests).
+ */
+export function resolveTeamRepo(cwd: string, repo: string | undefined, previous: string | undefined, find: (p: string) => string | undefined, home: string, resolvePath: (...p: string[]) => string): string {
+  const asked = repo?.trim();
+  if (asked) {
+    const abs = resolvePath(cwd, asked.replace(/^~(?=$|[\/])/, home));
+    const root = find(abs);
+    if (!root) throw new Error(`${abs} is not inside a git repository. Pass the folder of the project's git repository as repo.`);
+    return root;
+  }
+  const root = find(cwd) ?? previous;
+  if (!root)
+    throw new Error(`This session runs in ${cwd}, which is not a git repository, and workers need git worktrees. Call again with repo = the path of the project's git repository (for example the folder you have been working in).`);
+  return root;
+}

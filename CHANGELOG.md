@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1] - 2026-11-18
+
+- Team runs work when pi was started outside the project (the home folder on a company machine): `team_run` and `team_integrate` take `repo`, and `team_integrate` defaults to the repo of the last run. Before, `team_run` refused, and a lead fell back to plain subagents sharing one working tree, without worktrees or lane planning (seen in real use).
+  - The gate is detected from that repo, the takeover record is that repo's, `/continue <repo path>` takes it over from any folder, playbook evidence reads that repo's git.
+  - The project's own `.pi/ptk.json` is not read then (pi trusts folders, and this one was not opened): set the gate in the global config or pass it.
+- `test/e2e/outside.sh`: pi in a folder that is no repository runs /team on a project elsewhere; lanes run in its worktrees, are integrated there, and nothing is written to the session folder.
+
 ## [0.6.0] - 2026-11-18
 
 - Friction report: where the tooling itself cost time, to improve pi-team-kit from real use (`lib/feedback.ts`, `/feedback`, `ptk feedback [days] [--repo name]`).

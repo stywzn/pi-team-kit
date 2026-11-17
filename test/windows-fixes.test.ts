@@ -2,12 +2,27 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { backslashSources, gitCommonDir, localProjectDataDir } from "../lib/config.ts";
+import { backslashSources, findRepoRoot, gitCommonDir, localProjectDataDir } from "../lib/config.ts";
 import { factStatus, mergeFactFiles } from "../lib/facts.ts";
 import { gatePreflight, gateProgram, isPathLike, looksUnrunnable } from "../lib/guard.ts";
-import { buildTeamScript, integrationGate, parseWorktreeList, pathKey, planWorktreeCleanup, validateTasks } from "../lib/team.ts";
+import { buildTeamScript, integrationGate, parseWorktreeList, pathKey, planWorktreeCleanup, resolveTeamRepo, validateTasks } from "../lib/team.ts";
+
+test("team runs work when pi was started outside the repo (home folder, another drive)", () => {
+  const home = mkdtempSync(join(tmpdir(), "ptk-home-"));
+  const repo = join(home, "dev", "hostapp-test");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  mkdirSync(join(repo, "tests"), { recursive: true });
+  const r = (cwd: string, asked?: string, prev?: string) => resolveTeamRepo(cwd, asked, prev, findRepoRoot, home, resolve);
+  assert.equal(r(home, repo), repo, "an explicit absolute path");
+  assert.equal(r(home, join("dev", "hostapp-test", "tests")), repo, "relative to the session folder, any folder inside the repo");
+  assert.equal(r(home, "~/dev/hostapp-test"), repo, "~ is the home folder");
+  assert.equal(r(repo), repo, "started inside the repo: as before");
+  assert.equal(r(home, undefined, repo), repo, "team_integrate after team_run in the same session");
+  assert.throws(() => r(home), /which is not a git repository[\s\S]*repo = the path of the project's git repository/);
+  assert.throws(() => r(home, "dev"), /is not inside a git repository/);
+});
 
 test("A6: agent-written project data lives in the git dir, also from a linked worktree", () => {
   const main = mkdtempSync(join(tmpdir(), "ptk-repo-"));
