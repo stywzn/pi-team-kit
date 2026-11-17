@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.3] - 2026-11-17
+
+Fixes from a second round of testing on Windows, plus an independent review of the fixes.
+
+- Worktree cleanup works on Windows: git prints `C:/...` while pi-subagents records `C:\...`, so nothing ever matched and every worker worktree was left behind. Paths are now compared after normalising separators (and case, for Windows paths only). A worktree is only deleted when git says it is on exactly the `pi-subagents/` branch the handoff recorded for it; detached or reused paths are never deleted on a name match. Whatever is not deleted is listed with the reason instead of being silently skipped.
+- The gate preflight never runs a script (`./run_tests.sh` is only checked for existence) and only judges a gate whose first command is the program: gates with setup steps (`source .venv/bin/activate && ...`, `cd api && ...`, `export ...`), shell expansions (`$PYTHON`, `~`) or a leading redirection are not checked rather than falsely blocked. Exit 0 always counts as runnable.
+- A fact check that times out, is aborted or has no shell is "unknown", not "stale"; the default check timeout is 5 s.
+- `team_integrate` runs the same gate the team run used (recorded when it started) unless told otherwise; before, a custom per-run gate passed in every worker but the combined code was tested with the default one.
+
 ## [0.3.2] - 2026-11-17
 
 Fixes from running on a company Windows machine.

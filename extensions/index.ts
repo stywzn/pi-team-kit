@@ -17,10 +17,10 @@ import { Type } from "typebox";
 
 import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
-import { applyRemember, factFilePath, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { classifyCommand, gateProgram, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
+import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
+import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, patchesFromHandoff, planLanes, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, planLanes, planWorktreeCleanup, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -163,15 +163,19 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const withChecks = state.facts.filter((f) => f.check);
     if (!withChecks.length) return void (factChecks = "no facts with checks");
     let noShell = false;
+    let unknown = 0;
     await Promise.all(
       withChecks.map(async (f) => {
         const r = await runShell(f.check as string, state.repo ?? state.cwd, timeoutSec);
         if (r.missingShell) noShell = true;
-        f.stale = r.code !== 0;
+        const status = factStatus(r);
+        f.stale = status === "stale";
+        if (status === "unknown") unknown++;
       }),
     );
-    factChecks = noShell ? "not run: no bash found (on Windows install Git for Windows)" : `${withChecks.length} checked`;
-    if (noShell) for (const f of withChecks) f.stale = false; // unknown, not stale
+    factChecks = noShell
+      ? "not run: no bash found (on Windows install Git for Windows)"
+      : `${withChecks.length} checked${unknown ? `, ${unknown} timed out (status unknown, not marked stale)` : ""}`;
   }
 
   function loadTools() {
@@ -496,9 +500,16 @@ export default function piTeamKit(pi: ExtensionAPI) {
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
       if (gate) {
-        const prog = gateProgram(gate);
-        if (prog) {
-          const r = await runShell(`${prog} --version`, root, 20);
+        const pre = gatePreflight(gate);
+        if (pre.kind === "file") {
+          // A script would run the whole suite even with --version: only check that it is there.
+          const base = resolve(root, pre.path);
+          const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat", ".sh", ".ps1"] : [""];
+          if (!exts.some((e) => existsSync(base + e))) throw new Error(`The gate \`${gate}\` cannot run here: ${pre.path} does not exist (relative to ${root}).`);
+        } else if (pre.kind === "command") {
+          const prog = pre.program;
+          // Quote the name: it came out of the gate with its quotes removed, so `a;b` must not become two commands.
+          const r = await runShell(`'${prog.replace(/'/g, `'\\''`)}' --version`, root, 20);
           if (r.missingShell) throw new Error("No bash found to run the gate. On Windows install Git for Windows (pi's bash tool needs it too).");
           if (!r.timedOut && looksUnrunnable(r.code, r.output))
             throw new Error(`The gate \`${gate}\` cannot run here: \`${prog} --version\` said:\n${r.output.trim().slice(0, 500)}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
@@ -566,7 +577,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     name: "team_integrate",
     label: "Team integrate",
     description:
-      "Apply the patches of finished team lanes onto the current checkout in order (git apply), then run the gate once on the combined result. Pass the runDir values from the team run result. Stops at the first patch that does not apply and says why.",
+      "Apply the patches of finished team lanes onto the current checkout in order (git apply), then run the gate once on the combined result (by default the same gate the team run used). Pass the runDir values from the team run result. Stops at the first patch that does not apply and says why.",
     promptSnippet: "Merge finished team lanes into the working tree and run the gate on the result",
     parameters: Type.Object({
       runDirs: Type.Array(Type.String(), { minItems: 1 }),
@@ -613,7 +624,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
           lines.push(`applied ${p.branch ?? p.path}${p.diffStat ? `: ${p.diffStat.split("\n").pop()?.trim()}` : ""}`);
         }
       }
-      const gate = params.skipGate ? "" : (params.gate ?? state.config.team.gate ?? "").trim() || state.env?.testCommand || "";
+      const lf = leadFile(ctx.cwd);
+      const openRun = lf ? [...(readLeadState(lf.file)?.runs ?? [])].reverse().find((r) => r.status === "running") : undefined;
+      const gate = integrationGate({ skip: params.skipGate, explicit: params.gate, runGate: openRun?.gate, configured: state.config.team.gate, detected: state.env?.testCommand });
       let gatePassed = true;
       if (gate) {
         const r = await runShell(gate, root, state.config.team.gateTimeoutSec, signal);
@@ -624,27 +637,25 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
       if (gatePassed && params.keepWorktrees !== true) {
         // Patches are in the checkout now; the workers' retained worktrees and branches are just clutter.
-        // Only touch worktrees git itself lists for this repo and that pi-subagents created.
+        // Only touch worktrees git itself lists for this repo and that pi-subagents created (see planWorktreeCleanup).
         const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], { cwd: root, timeout: 30_000 });
-        const known = new Map<string, string | undefined>();
-        let current = "";
-        for (const l of listed.stdout.split("\n")) {
-          if (l.startsWith("worktree ")) known.set((current = l.slice(9).trim()), undefined);
-          else if (l.startsWith("branch refs/heads/") && current) known.set(current, l.slice(18).trim());
-        }
+        const targets = handoffs.flatMap((h) => cleanupTargets(readFileSync(h, "utf8")));
+        const plan = planWorktreeCleanup(targets, parseWorktreeList(listed.stdout), root);
+        const failed = [...plan.skipped];
         let removed = 0;
-        for (const handoff of handoffs)
-          for (const t of cleanupTargets(readFileSync(handoff, "utf8"))) {
-            const branch = known.get(t.path);
-            if (!known.has(t.path) || t.path === root || !/pi-worktree-/.test(t.path)) continue;
-            if (branch && !branch.startsWith("pi-subagents/")) continue;
-            const w = await pi.exec("git", ["worktree", "remove", "--force", t.path], { cwd: root, timeout: 30_000 });
-            if (w.code !== 0) continue;
-            removed++;
-            if (branch) await pi.exec("git", ["branch", "-D", branch], { cwd: root, timeout: 30_000 });
+        for (const wt of plan.remove) {
+          const w = await pi.exec("git", ["worktree", "remove", "--force", wt.path], { cwd: root, timeout: 30_000 });
+          if (w.code !== 0) {
+            failed.push({ path: wt.path, reason: `git worktree remove failed: ${(w.stderr || w.stdout).trim().split("\n")[0]}` });
+            continue;
           }
+          removed++;
+          if (wt.branch) await pi.exec("git", ["branch", "-D", wt.branch], { cwd: root, timeout: 30_000 });
+        }
         await pi.exec("git", ["worktree", "prune"], { cwd: root, timeout: 30_000 });
         if (removed) lines.push(`removed ${removed} worker worktree(s) and their branches`);
+        // Say exactly what was left behind and why, so nobody reports "kept them" for a cleanup that failed.
+        if (failed.length) lines.push(`NOT removed (${failed.length}):\n${failed.map((f) => `- ${f.path}: ${f.reason}`).join("\n")}\nRemove by hand with git worktree remove --force <path> if they are not needed.`);
       } else if (!gatePassed) lines.push("Worker worktrees kept so the lanes can be reworked.");
       lines.push("Changes are uncommitted: review with `git diff` (new files show as untracked), then commit.");
       saveLead(ctx.cwd, { finishRun: { status: gatePassed ? "integrated" : "integration-failed", result: lines.join("\n").slice(0, 1500) } });

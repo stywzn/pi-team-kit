@@ -110,7 +110,8 @@ export const DEFAULTS: PtkConfig = {
     preferFastSearch: "block",
     sudoNonInteractive: true,
   },
-  facts: { enabled: true, checkTimeoutMs: 1500, maxFacts: 40 },
+  // Checks run in the background at session start, so a few seconds cost nothing; too short a limit only produces "unknown".
+  facts: { enabled: true, checkTimeoutMs: 5000, maxFacts: 40 },
   plainTalk: { enabled: true, acronymCheck: true, allow: [] },
   toolbox: { enabled: true, runTimeoutSec: 300 },
   terminal: { title: true, autoName: true, notifyAfterSec: 30 },

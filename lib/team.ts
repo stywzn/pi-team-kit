@@ -350,6 +350,82 @@ export function worktreeFromHandoff(handoffJson: string): { path: string; baseCo
   return undefined;
 }
 
+/**
+ * Comparable form of a filesystem path. `git worktree list` prints C:/a/b on Windows while pi-subagents
+ * records C:\a\b, so raw string comparison never matches there. Windows drive and UNC paths are also
+ * case-insensitive; POSIX paths keep their case.
+ */
+export function pathKey(p: string, windowsHost = process.platform === "win32"): string {
+  // No trim(): spaces are legal in paths, and "x " must never match a reused "x".
+  const raw = p.replace(/\r$/, "");
+  let k = raw.replace(/\\/g, "/").replace(/(?<!^)\/{2,}/g, "/");
+  if (k.length > 1) k = k.replace(/\/+$/, "");
+  // Drive paths are Windows paths wherever they come from. A leading // is a UNC share only on Windows
+  // (or when written with backslashes); on Linux/macOS //tmp/Repo and //tmp/repo are different.
+  const windowsPath = /^[A-Za-z]:\//.test(k) || (k.startsWith("//") && (windowsHost || raw.startsWith("\\\\")));
+  return windowsPath ? k.toLowerCase() : k;
+}
+
+/**
+ * Gate for the combined code after integration: an explicit one, else the gate the team run itself used
+ * (recorded when it started), else the configured or detected one. Without the middle step a custom
+ * per-run gate would pass in every worker and never run on the combined result.
+ */
+export function integrationGate(opts: { skip?: boolean; explicit?: string; runGate?: string; configured?: string; detected?: string }): string {
+  if (opts.skip) return "";
+  for (const g of [opts.explicit, opts.runGate, opts.configured, opts.detected]) if (g?.trim()) return g.trim();
+  return "";
+}
+
+export interface ListedWorktree {
+  path: string;
+  branch?: string;
+}
+
+/** Parse `git worktree list --porcelain` into worktrees keyed by pathKey. */
+export function parseWorktreeList(porcelain: string, windowsHost = process.platform === "win32"): Map<string, ListedWorktree> {
+  const out = new Map<string, ListedWorktree>();
+  let current: ListedWorktree | undefined;
+  for (const raw of porcelain.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("worktree ")) {
+      current = { path: line.slice(9) };
+      out.set(pathKey(current.path, windowsHost), current);
+    } else if (line.startsWith("branch refs/heads/") && current) current.branch = line.slice(18);
+  }
+  return out;
+}
+
+export interface CleanupPlan {
+  remove: ListedWorktree[];
+  skipped: { path: string; reason: string }[];
+}
+
+/**
+ * Which recorded worker worktrees may be deleted. All of these must hold: git lists it for this repo; it is
+ * not the main checkout; its folder is `pi-worktree-*`; and git says it is on exactly the `pi-subagents/`
+ * branch the handoff recorded for it. A detached worktree, or one whose path was later reused for another
+ * branch, is never deleted on a name match. Everything not deleted is reported, not silently ignored.
+ */
+export function planWorktreeCleanup(targets: { path: string; branch?: string }[], listed: Map<string, ListedWorktree>, repoRoot: string, windowsHost = process.platform === "win32"): CleanupPlan {
+  const plan: CleanupPlan = { remove: [], skipped: [] };
+  const seen = new Set<string>();
+  const rootKey = pathKey(repoRoot, windowsHost);
+  for (const t of targets) {
+    const key = pathKey(t.path, windowsHost);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const wt = listed.get(key);
+    if (!wt) plan.skipped.push({ path: t.path, reason: "not registered with git (already removed?)" });
+    else if (key === rootKey) plan.skipped.push({ path: t.path, reason: "is the main checkout" });
+    else if (!/^pi-worktree-/i.test(key.split("/").pop() ?? "")) plan.skipped.push({ path: t.path, reason: "not a pi-subagents worktree" });
+    else if (!t.branch || !t.branch.startsWith("pi-subagents/")) plan.skipped.push({ path: t.path, reason: "no pi-subagents branch recorded for it" });
+    else if (wt.branch !== t.branch) plan.skipped.push({ path: t.path, reason: wt.branch ? `now on branch ${wt.branch}, not the recorded ${t.branch}` : "detached HEAD, not on the recorded branch" });
+    else plan.remove.push(wt);
+  }
+  return plan;
+}
+
 /** Worktrees and branches a handoff kept for possible rework; safe to remove once its patch is integrated. */
 export function cleanupTargets(handoffJson: string): { path: string; branch?: string }[] {
   const data = JSON.parse(handoffJson) as { groups?: { cleanup?: { tasks?: { path?: string; branch?: string; worktreeRemoved?: boolean }[] } }[] };

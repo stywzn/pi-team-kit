@@ -145,6 +145,13 @@ export function mergeFactFiles(into: FactFile, from: FactFile): { file: FactFile
   return { file: { version: 1, facts: [...facts.values()], pitfalls: [...pitfalls.values()] }, added, updated };
 }
 
+/** What a fact's check result says. Only a real non-zero exit marks it stale; a timeout, an abort or a
+ *  missing shell (no exit code at all) tells us nothing about the fact. */
+export function factStatus(r: { code: number | null; timedOut: boolean; missingShell: boolean }): "fresh" | "stale" | "unknown" {
+  if (r.missingShell || r.timedOut || r.code === null) return "unknown";
+  return r.code === 0 ? "fresh" : "stale";
+}
+
 export function formatFacts(facts: CheckedFact[], pitfalls: (Pitfall & { scope: Scope })[]): string {
   const lines: string[] = [];
   for (const f of facts) lines.push(`- [${f.scope}/${f.id}]${f.stale ? " (check failed, may be outdated)" : ""} ${f.text}`);

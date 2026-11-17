@@ -297,14 +297,52 @@ export function unsafeRegex(source: string): boolean {
   return /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]/.test(source) || source.length > 300;
 }
 
-/** The program a gate command starts, skipping `VAR=x` and wrappers: `CI=1 python -m pytest` -> `python`. */
+// Shell builtins and keywords: `source .venv/bin/activate && pytest` starts pytest, not a program called source.
+const SHELL_BUILTINS = new Set(["cd", "pushd", "popd", "source", ".", "export", "set", "unset", "alias", "true", ":", "shopt", "ulimit", "umask", "trap", "if", "then", "for", "while", "do", "{", "("]);
+
+/** The program a gate command starts, skipping `VAR=x`, wrappers and shell builtins: `CI=1 python -m pytest` -> `python`. */
 export function gateProgram(gate: string): string | undefined {
-  const first = splitSegments(gate).find((s) => !/^cd\s/.test(s.text));
-  return first ? effectiveCommand(first.argv).argv[0] : undefined;
+  for (const seg of splitSegments(gate)) {
+    const prog = effectiveCommand(seg.argv).argv[0];
+    if (prog && !SHELL_BUILTINS.has(prog)) return prog;
+  }
+  return undefined;
 }
 
-/** Output of `<program> --version` that means the program cannot run here at all (not that tests failed). */
+/** `./run_tests.sh`, `scripts/test`, `C:\tools\x.exe`: a file, not a command looked up on PATH. */
+export function isPathLike(program: string): boolean {
+  return /[\\/]/.test(program) || program.startsWith(".");
+}
+
+export type GatePreflight =
+  | { kind: "skip"; reason: string }
+  | { kind: "file"; path: string }
+  | { kind: "command"; program: string };
+
+/**
+ * What the gate preflight may safely do. It must never run the suite and never block a valid gate, so it
+ * only judges a gate whose first command is the program itself. Setup steps (`cd`, `source venv`, `export`)
+ * change what the program resolves to, and shell expansions ($VAR, ~, globs) are not expanded here:
+ * both are skipped rather than guessed.
+ */
+export function gatePreflight(gate: string): GatePreflight {
+  const first = splitSegments(gate)[0];
+  const prog = first ? effectiveCommand(first.argv).argv[0] : undefined;
+  if (!prog) return { kind: "skip", reason: "no program found" };
+  if (SHELL_BUILTINS.has(prog) || prog === "cd") return { kind: "skip", reason: "has setup steps before the program" };
+  if (/[$`~*?[\]{}()]/.test(prog)) return { kind: "skip", reason: "uses shell expansion" };
+  // `2>test.log pytest`, `>out npm test`: a leading redirection is not the program.
+  if (/[<>|&;]/.test(prog)) return { kind: "skip", reason: "starts with a redirection" };
+  if (isPathLike(prog)) return { kind: "file", path: prog };
+  return { kind: "command", program: prog };
+}
+
+/**
+ * Output of `<program> --version` that means the program cannot run here at all (not that tests failed).
+ * Exit 0 always means it runs, whatever it printed.
+ */
 export function looksUnrunnable(code: number | null, output: string): boolean {
+  if (code === 0) return false;
   return (
     code === 127 ||
     code === 9009 ||
