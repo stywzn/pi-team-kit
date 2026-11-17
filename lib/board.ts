@@ -26,6 +26,8 @@ export interface ChangedFile {
   /** Relative to the repo root, forward slashes. */
   path: string;
   at: string;
+  /** Key of the file's repository. A lead started in its home folder works in repos other than its session folder. */
+  repo?: string;
 }
 
 export interface LeadCard {
@@ -285,17 +287,18 @@ export function fileKey(rel: string, windowsHost = process.platform === "win32")
 }
 
 /** Add a changed file to a card's list: newest last, no duplicates, capped. */
-export function recordFile(files: ChangedFile[], rel: string, now = Date.now()): ChangedFile[] {
+export function recordFile(files: ChangedFile[], rel: string, now = Date.now(), repo?: string): ChangedFile[] {
   const path = rel.replace(/\\/g, "/").replace(/^\.\//, "");
   const key = fileKey(path);
-  return [...files.filter((f) => fileKey(f.path) !== key), { path, at: new Date(now).toISOString() }].slice(-MAX_FILES);
+  const kept = files.filter((f) => fileKey(f.path) !== key || f.repo !== repo);
+  return [...kept, { path, at: new Date(now).toISOString(), ...(repo ? { repo } : {}) }].slice(-MAX_FILES);
 }
 
-/** Other running leads in the same repo that changed this file within OVERLAP_MS. */
+/** Other running leads that changed this file of this repo within OVERLAP_MS, wherever their sessions started. */
 export function overlaps(cards: LeadCard[], me: string, repo: string | undefined, rel: string, now = Date.now()): LeadCard[] {
   if (!repo) return [];
   const key = fileKey(rel);
-  return cards.filter((c) => c.name !== me && c.repo === repo && c.files.some((f) => fileKey(f.path) === key && now - Date.parse(f.at) <= OVERLAP_MS));
+  return cards.filter((c) => c.name !== me && c.files.some((f) => (f.repo ?? c.repo) === repo && fileKey(f.path) === key && now - Date.parse(f.at) <= OVERLAP_MS));
 }
 
 /** Whether a delivered message should start a turn in an idle session. */

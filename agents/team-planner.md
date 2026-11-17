@@ -2,7 +2,7 @@
 name: team-planner
 description: Splits a goal into conflict-free tasks with file ownership and self-contained briefs for a pi-team-kit team run; read-only
 acceptanceRole: read-only
-thinking: high
+thinking: max
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false

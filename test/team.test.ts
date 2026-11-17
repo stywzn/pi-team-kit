@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
 
 const task = (key: string, files: string[]): TeamTask => ({ key, title: `Task ${key}`, brief: `Do the ${key} change and add a test for it.`, files });
 
@@ -224,4 +224,18 @@ test("every child run gets the configured deadline (pi-subagents would stop it a
   assert.deepEqual(result.lanes[0].history, [{ round: 1, findings: [{ file: "a.py", issue: "off by one", fix: "use <=" }] }]);
   const plain = await simulate({}, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "fine", findings: [] } } : {}));
   assert.equal((plain.calls[0].item as { timeoutMs?: number }).timeoutMs, undefined, "no setting: pi-subagents decides");
+});
+
+test("models per role: a thinking level rides on the role's model, or on the lead's when the role has none", () => {
+  const flash = "deepseek/deepseek-flash";
+  assert.deepEqual(roleModels({ planner: "", worker: "", verifier: "" }, { planner: "", worker: "", verifier: "" }, flash), {}, "nothing set: the agents decide");
+  assert.deepEqual(roleModels({ planner: flash, worker: flash, verifier: flash }, { planner: "max", worker: "", verifier: "max" }, flash), {
+    planner: `${flash}:max`,
+    worker: flash,
+    verifier: `${flash}:max`,
+  });
+  assert.deepEqual(roleModels({}, { verifier: "xhigh" }, flash), { verifier: `${flash}:xhigh` }, "no model of its own: the lead's");
+  assert.deepEqual(roleModels({ planner: `${flash}:low` }, { planner: "max" }), { planner: `${flash}:max` }, "the configured level replaces a suffix");
+  assert.deepEqual(roleModels({}, { planner: "max" }), {}, "no model known at all: left to the agent");
+  assert.throws(() => roleModels({}, { worker: "huge" }, flash), /team\.thinking\.worker "huge": use one of off, minimal, low, medium, high, xhigh, max/);
 });

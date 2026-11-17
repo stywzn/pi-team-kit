@@ -2,7 +2,7 @@
 name: team-verifier
 description: Fresh-context, read-only check of one team lane's patch against its brief; returns pass, rework or blocked
 acceptanceRole: read-only
-thinking: high
+thinking: max
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false

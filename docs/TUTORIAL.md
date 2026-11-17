@@ -58,19 +58,18 @@ cd ~/code/ptk-demo && pi
 
 ## 5. 模型怎么搭（DeepSeek + GLM）
 
-在 `~/.pi/agent/ptk.json` 里按角色指定，名字用 `pi --list-models` 里的：
+在 `~/.pi/agent/ptk.json` 里按角色指定，名字用 `pi --list-models` 里的。推荐全部用快模型，靠思考强度区分：拆任务和审查决定整次运行的质量，思考开到最大；worker 照着详细的任务说明干活，不需要那么强：
 
 ```json
 {
   "team": {
-    "models": {
-      "planner": "deepseek/deepseek-v4-pro",
-      "worker": "deepseek/deepseek-flash",
-      "verifier": "zai-coding-cn/glm-5-3"
-    }
+    "models": { "planner": "deepseek/deepseek-flash", "worker": "deepseek/deepseek-flash", "verifier": "deepseek/deepseek-flash" },
+    "thinking": { "planner": "max", "worker": "medium", "verifier": "max" }
   }
 }
 ```
+
+`thinking` 不写时就是这个默认值（写在三个 agent 自己的定义里）；可选 off、minimal、low、medium、high、xhigh、max，模型不支持的档位 pi 会自动降到它支持的最高档。主会话自己的思考强度用 pi 的 `/thinking` 调，写任务书、拆目标时可以临时调高。
 
 审查员最好和 worker 不是同一家模型：不同模型的盲区不一样，互相检查能发现更多问题。GLM 的 key 用 `/login` 登录，或设环境变量 `ZAI_CODING_CN_API_KEY`（国内 Coding Plan）/ `ZAI_API_KEY`（国际版）。
 

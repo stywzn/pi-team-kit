@@ -23,7 +23,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir } from "../lib/config.ts";
 import { factFilePath, mergeFactFiles, readFactFile, writeFactFile } from "../lib/facts.ts";
 import { detectEnv, formatEnv, realProbe, which } from "../lib/env.ts";
-import { buildTeamScript, planLanes, validateTasks, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, planLanes, roleModels, validateTasks, type TeamTask } from "../lib/team.ts";
 import { discoverTools, formatToolList, toolArgv } from "../lib/toolbox.ts";
 import { modelCaps } from "../lib/session.ts";
 
@@ -211,7 +211,7 @@ switch (cmd) {
           verifierAgent: t.verifierAgent,
           plannerAgent: t.plannerAgent,
           maxTasks: t.maxTasks,
-          models: t.models,
+          models: roleModels(t.models, t.thinking),
           childTimeoutMs: t.childTimeoutMin * 60_000,
         }),
       );

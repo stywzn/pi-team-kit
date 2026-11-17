@@ -64,7 +64,7 @@ import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } fro
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -629,7 +629,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         verifierAgent: t.verifierAgent,
         plannerAgent: t.plannerAgent,
         maxTasks: t.maxTasks,
-        models: t.models,
+        models: roleModels(t.models, t.thinking, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
         childTimeoutMs: t.childTimeoutMin * 60_000,
       };
       const data = await rpc("spawn", {
@@ -643,7 +643,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const elsewhere = root !== findRepoRoot(ctx.cwd) ? `Repository: ${root} (this session runs elsewhere; team_integrate uses it too).\n` : "";
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
-      const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
+      const roles = Object.entries(plan.models ?? {}).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
       return {
         content: [
           {
@@ -752,9 +752,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
         const now = Date.now();
         const cards = liveCards();
         const clash = new Map<string, string[]>();
+        const key = repoKey(root);
         for (const f of changed) {
-          for (const c of overlaps(cards, lb.name, lb.repo, f, now)) clash.set(c.name, [...(clash.get(c.name) ?? []), f]);
-          lb.files = recordFile(lb.files, f, now);
+          for (const c of overlaps(cards, lb.name, key, f, now)) clash.set(c.name, [...(clash.get(c.name) ?? []), f]);
+          lb.files = recordFile(lb.files, f, now, key);
         }
         const goal = lf ? readLeadState(lf.file)?.brief?.goal : undefined;
         setLeadStatus(`integrated${goal ? `: ${goal.slice(0, 140)}` : ` ${params.runDirs.length} lane(s)`}, gate ${gate ? (gatePassed ? "passed" : "FAILED") : "skipped"}, not committed yet`);
@@ -1176,7 +1177,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (!c || c.owner === lb.owner) return true;
     const old = lb.name;
     try {
-      lb.name = claimName(lb.dir, state.config.leads.name || basename(lb.root ?? state.cwd), myCard());
+      lb.name = claimName(lb.dir, state.config.leads.name || (lb.root ? basename(lb.root) : "lead"), myCard());
       lb.lastBeat = Date.now();
     } catch {
       lb.name = "";
@@ -1260,12 +1261,22 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   }
 
-  /** Path of an edit/write target relative to the repo root, or undefined when it is outside the repo. */
-  const repoRelative = (p: unknown): string | undefined => {
-    if (typeof p !== "string" || !lb.root) return undefined;
+  const repoKeys = new Map<string, string>();
+  const repoKey = (root: string) => {
+    if (!repoKeys.has(root)) repoKeys.set(root, pathKey(gitCommonDir(root)));
+    return repoKeys.get(root)!;
+  };
+  /**
+   * An edit/write target as (its repository, its path there). The file's own repository counts, not the
+   * session folder's: a lead started in the home folder works in projects elsewhere.
+   */
+  const fileInRepo = (p: unknown): { rel: string; repo: string } | undefined => {
+    if (typeof p !== "string") return undefined;
     const abs = resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir()));
-    const rel = relative(lb.root, abs);
-    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel.replace(/\\/g, "/") : undefined;
+    const root = findRepoRoot(dirname(abs));
+    if (!root) return undefined;
+    const rel = relative(root, abs);
+    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? { rel: rel.replace(/\\/g, "/"), repo: repoKey(root) } : undefined;
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1282,7 +1293,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     lb.repo = lb.root ? pathKey(gitCommonDir(lb.root)) : undefined;
     if (!lb.name) {
       try {
-        lb.name = claimName(lb.dir, state.config.leads.name || basename(lb.root ?? ctx.cwd), myCard());
+        lb.name = claimName(lb.dir, state.config.leads.name || (lb.root ? basename(lb.root) : "lead"), myCard());
         lb.lastBeat = Date.now();
       } catch {
         return; // read-only home or similar: run without the board
@@ -1327,11 +1338,12 @@ export default function piTeamKit(pi: ExtensionAPI) {
 
   // Changing a file another lead changed in the last 30 minutes: tell them first, then it goes through.
   pi.on("tool_call", async (event) => {
-    if (!lb.name || !lb.repo || (event.toolName !== "edit" && event.toolName !== "write")) return;
-    const rel = repoRelative((event.input as { path?: unknown }).path);
-    if (!rel) return;
+    if (!lb.name || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const target = fileInRepo((event.input as { path?: unknown }).path);
+    if (!target) return;
+    const rel = target.rel;
     const now = Date.now();
-    const others = overlaps(liveCards(), lb.name, lb.repo, rel, now).filter((c) => now - (lb.told.get(c.name) ?? 0) > OVERLAP_MS);
+    const others = overlaps(liveCards(), lb.name, target.repo, rel, now).filter((c) => now - (lb.told.get(c.name) ?? 0) > OVERLAP_MS);
     if (!others.length) return;
     const names = others.map((c) => c.name).join(", ");
     return {
@@ -1342,9 +1354,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event) => {
     if (!lb.name || event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
-    const rel = repoRelative((event.input as { path?: unknown }).path);
-    if (!rel) return;
-    lb.files = recordFile(lb.files, rel);
+    const target = fileInRepo((event.input as { path?: unknown }).path);
+    if (!target) return;
+    lb.files = recordFile(lb.files, target.rel, Date.now(), target.repo);
     beat();
   });
 

@@ -1,4 +1,5 @@
 // Lead board: lead sessions see each other, pass messages, and do not change the same file unannounced.
+// (A test for leads started outside the repo is at the end of this file.)
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
@@ -240,4 +241,16 @@ test("performance: the 2-second inbox poll and the per-turn board read stay chea
   overlaps(cards, "me", undefined, "src/f1.ts", now);
   assert.ok(performance.now() - t0 < 200 * budget, `200 cards read in ${Math.round(performance.now() - t0)}ms`);
   assert.ok(existsSync(join(dir, "lead-0.json")));
+});
+
+test("a lead started in its home folder: files carry their own repo, so conflicts are still caught", () => {
+  const now = T0 + 60_000;
+  const repo = "/d/dev/hostapp-test/.git";
+  const homeLead = card("lead", { repo: undefined, files: recordFile([], "tests/test_login.py", T0, repo) });
+  const repoLead = card("hostapp-test", { repo, files: [{ path: "tests/test_cart.py", at: iso(T0) }] });
+  const cards = [homeLead, repoLead];
+  assert.deepEqual(overlaps(cards, "me", repo, "tests/test_login.py", now).map((c) => c.name), ["lead"], "found by the file's repo");
+  assert.deepEqual(overlaps(cards, "me", repo, "tests/test_cart.py", now).map((c) => c.name), ["hostapp-test"], "older cards without a per-file repo still count");
+  assert.deepEqual(overlaps(cards, "me", "/d/dev/other/.git", "tests/test_login.py", now), [], "the same path in another repo is no conflict");
+  assert.equal(recordFile(recordFile([], "README.md", T0, "/a/.git"), "README.md", T0, "/b/.git").length, 2, "the same path in two repos is two files");
 });

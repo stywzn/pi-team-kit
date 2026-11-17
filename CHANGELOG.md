@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.3] - 2026-11-18
+
+- Thinking level per role: `team.thinking` (`planner`, `worker`, `verifier`), carried as a `:level` suffix on the role's model (or the lead's model when the role has none). The agents' own defaults are now `max` for the planner and the verifier (splitting and checking decide the run) and `medium` for workers (they follow a detailed brief), so a fast model can do every role and only the two judgment roles think hard.
+- Leads started outside a repository (the usual case: pi opened anywhere, "look at project X in folder Y"): the file-conflict check now uses each file's own repository instead of the session folder's, so two leads working on one project from their home folders still see each other's changes. Such a lead is named `lead` on the board instead of after the home folder.
+- A project folder that is not under git yet gets a clear message: ask the user whether to `git init` and commit, since workers need worktrees.
+
 ## [0.6.2] - 2026-11-18
 
 - Each planner, worker and verifier run in a team run gets `team.childTimeoutMin` (default 44 minutes). pi-subagents stops a child after 30 minutes by default, too short for a worker running a slow UI suite. The whole run's default deadline `team.runTimeoutMin` goes from 60 to 120 minutes, so a 44-minute worker still has time for a rework round.

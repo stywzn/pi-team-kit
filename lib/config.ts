@@ -97,6 +97,10 @@ export interface PtkConfig {
     /** Model per role, "provider/model" as in `pi --list-models`; "" = the agent's default (the main session's model).
      *  A verifier from a different model family than the workers catches more of their mistakes. */
     models: { planner: string; worker: string; verifier: string };
+    /** Thinking level per role (off, minimal, low, medium, high, xhigh, max); "" = the agent's own: planner and verifier
+     *  think the hardest (splitting and checking decide the run), workers less (they follow a detailed brief).
+     *  Levels a model does not support are clamped by pi. */
+    thinking: { planner: string; worker: string; verifier: string };
   };
   /** Lead sessions on this machine see each other's status and tell each other what they changed (the leads tool, /leads). */
   leads: {
@@ -158,6 +162,7 @@ export const DEFAULTS: PtkConfig = {
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
     models: { planner: "", worker: "", verifier: "" },
+    thinking: { planner: "", worker: "", verifier: "" },
   },
   leads: { enabled: true, wake: true, name: "" },
   playbooks: { dir: "", dirs: [], confirm: true },

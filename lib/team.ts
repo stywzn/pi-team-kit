@@ -465,13 +465,38 @@ export function patchesFromHandoff(runDir: string, handoffJson: string): PatchRe
 export function resolveTeamRepo(cwd: string, repo: string | undefined, previous: string | undefined, find: (p: string) => string | undefined, home: string, resolvePath: (...p: string[]) => string): string {
   const asked = repo?.trim();
   if (asked) {
-    const abs = resolvePath(cwd, asked.replace(/^~(?=$|[\/])/, home));
+    const abs = resolvePath(cwd, asked.replace(/^~(?=$|[\\/])/, home));
     const root = find(abs);
-    if (!root) throw new Error(`${abs} is not inside a git repository. Pass the folder of the project's git repository as repo.`);
+    if (!root)
+      throw new Error(
+        `${abs} is not inside a git repository, and workers need git worktrees. If the project is not under git yet, ask the user whether to make it one (git init, then commit the current files), then call again.`,
+      );
     return root;
   }
   const root = find(cwd) ?? previous;
   if (!root)
     throw new Error(`This session runs in ${cwd}, which is not a git repository, and workers need git worktrees. Call again with repo = the path of the project's git repository (for example the folder you have been working in).`);
   return root;
+}
+
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type Role = "planner" | "worker" | "verifier";
+
+/**
+ * Model per role as pi-subagents takes it ("provider/id:level"). A thinking level rides on a model name, so a
+ * role without its own model uses the lead's model, which is what that child would run anyway.
+ */
+export function roleModels(models: Partial<Record<Role, string>>, thinking: Partial<Record<Role, string>>, leadModel?: string): Partial<Record<Role, string>> {
+  const out: Partial<Record<Role, string>> = {};
+  for (const role of ["planner", "worker", "verifier"] as const) {
+    let model = (models[role] ?? "").trim();
+    const level = (thinking[role] ?? "").trim();
+    if (level) {
+      if (!(THINKING_LEVELS as readonly string[]).includes(level)) throw new Error(`team.thinking.${role} "${level}": use one of ${THINKING_LEVELS.join(", ")}`);
+      const base = (model || leadModel || "").replace(new RegExp(`:(${THINKING_LEVELS.join("|")})$`), "");
+      if (base) model = `${base}:${level}`;
+    }
+    if (model) out[role] = model;
+  }
+  return out;
 }
