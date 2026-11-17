@@ -1,6 +1,6 @@
 {
   "name": "pi-team-kit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Team workflow (lead + up to 4 workers + verifier + rework), anti-hang command guard, auto-detected environment facts, plain-language output and a reusable toolbox for the pi coding agent.",
   "type": "module",
   "license": "MIT",
@@ -26,6 +26,8 @@
   "files": [
     "agents",
     "bin",
+    "docs",
+    "examples",
     "extensions",
     "lib",
     "prompts",

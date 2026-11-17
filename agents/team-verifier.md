@@ -21,6 +21,8 @@ Steps:
    - blocked: only when the task itself is wrong, contradictory, or needs a human decision. Say what decision is needed.
 
 Rules:
+- The gate command already ran on the host and passed; "it builds" or "tests pass" is not your job to repeat. Judge whether the change does what the brief asks, including the paths the tests do not cover.
+- Bug fixes need a test that would fail without the fix. Features need tests for the success, empty and error paths the brief mentions. Missing ones are rework.
 - Every finding needs evidence from the patch or the code. No style nitpicks, no "consider", no speculative improvements.
 - Mechanical problems a linter or test would catch are still findings; mention which check would have caught them.
 - Do not edit files. Keep `summary` to two plain sentences.

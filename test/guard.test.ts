@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, unsafeRegex, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -150,6 +150,53 @@ test("timeouts: default filled in, ceiling enforced", () => {
   assert.ok(looksLikeTimeout("Error: timeout:180"));
   assert.ok(looksLikeTimeout("Command timed out after 180 seconds"));
   assert.ok(!looksLikeTimeout("all tests passed"));
+});
+
+test("automated-testing hangs are blocked, one-shot test runs are not", () => {
+  for (const cmd of ["npx playwright show-report", "npx playwright test --ui", "npx cypress open", "ng test", "karma start", "ptw", "pytest --looponfail", "npx vitest watch"])
+    assert.ok(blocked(cmd), `expected block: ${cmd}`);
+  for (const cmd of ["npx playwright test tests/login.spec.ts", "npx cypress run --spec a.cy.ts", "ng test --watch=false", "karma start --single-run", "pytest -k login -x", "npx vitest run"])
+    assert.ok(!blocked(cmd), `expected allow: ${cmd}`);
+});
+
+test("wrapping in bash -c / sh -c / eval does not hide a command", () => {
+  assert.ok(blocked(`bash -c "npm run dev"`));
+  assert.ok(blocked(`sh -lc 'cd web && tail -f out.log'`));
+  assert.ok(blocked("eval npm run dev"));
+  assert.ok(blocked(`bash -c "grep -rn TODO ."`));
+  assert.ok(!blocked(`bash -c "npm run dev" &`), "backgrounded wrapper is fine");
+  assert.ok(!blocked(`bash -c "npm test"`));
+});
+
+test("commands are classified so tests and builds get longer default timeouts", () => {
+  const cases: [string, string][] = [
+    ["pytest -x tests/test_login.py", "test"],
+    ["python -m pytest -q", "test"],
+    ["uv run pytest", "test"],
+    ["npx playwright test", "test"],
+    ["npm test", "test"],
+    ["pnpm run test:e2e", "test"],
+    ["go test ./...", "test"],
+    ["./gradlew test", "test"],
+    ["mvn -q verify", "test"],
+    ["cd api && cargo test", "test"],
+    ["make test", "test"],
+    ["npm ci", "build"],
+    ["pip install -r requirements.txt", "build"],
+    ["docker build -t app .", "build"],
+    ["npx playwright install --with-deps", "build"],
+    ["npm run build", "build"],
+    ["git status", "default"],
+    ["rg -n foo", "default"],
+    ["bash -c 'pytest -q'", "test"],
+  ];
+  for (const [cmd, cls] of cases) assert.equal(classifyCommand(cmd), cls, cmd);
+});
+
+test("test commands get CI=1 unless CI is already set", () => {
+  assert.equal(withCi("npm test", {}), "export CI=1\nnpm test");
+  assert.equal(withCi("CI=true npm test", {}), "CI=true npm test");
+  assert.equal(withCi("npm test", { CI: "false" }), "npm test");
 });
 
 test("longRunnerReason explains itself", () => {

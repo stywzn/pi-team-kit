@@ -146,6 +146,49 @@ test("without a gate, rework still opts into the staged first round", async () =
   assert.deepEqual(calls[2].item.acceptance, { level: "checked", preserveStagedIndex: true });
 });
 
+test("planner mode: the planner splits the goal, overlapping tasks share a lane, models go to each role", async () => {
+  const plannerTasks = [
+    { key: "API auth", title: "Auth", brief: "Add token check", files: ["src/api/**"] },
+    { key: "api-tests", title: "Auth tests", brief: "Test it", files: ["src/api/auth.test.ts"] },
+    { key: "docs", title: "Docs", brief: "Document it", files: ["README.md"] },
+    { key: "misc", title: "Unscoped", brief: "No files given", files: [] },
+  ];
+  const { calls, result } = await simulate({ lanes: [], models: { planner: "deepseek/deepseek-v4-pro", worker: "deepseek/deepseek-flash", verifier: "zai/glm-5-3" } }, (key) =>
+    key === "plan"
+      ? { structuredOutput: { tasks: plannerTasks, questions: [], notes: "" } }
+      : key.includes("verify")
+        ? { structuredOutput: { verdict: "pass", summary: "", findings: [] } }
+        : {},
+  );
+  assert.equal(calls[0].key, "plan");
+  assert.equal(calls[0].item.agent, "team-planner");
+  assert.equal((calls[0].item as { model?: string }).model, "deepseek/deepseek-v4-pro");
+  assert.ok(calls[0].item.outputSchema);
+  // A task without files may touch anything, so everything ends up in one safe lane.
+  assert.deepEqual(result.plan.tasks.map((t: { key: string }) => t.key), ["api-auth", "api-tests", "docs", "misc"]);
+  assert.equal(result.lanes.length, 1);
+  const work = calls.find((c) => c.key.endsWith("-work"));
+  assert.equal((work?.item as { model?: string }).model, "deepseek/deepseek-flash");
+  const verify = calls.find((c) => c.key.includes("verify"));
+  assert.equal((verify?.item as { model?: string }).model, "zai/glm-5-3");
+});
+
+test("planner lanes match planLanes() for the same tasks", async () => {
+  const tasks = [task("a", ["src/api/**"]), task("b", ["web/**"]), task("c", ["src/api/x.ts"]), task("d", ["README.md"]), task("e", ["web/app.css", "docs/x.md"])];
+  const expected = planLanes(tasks).map((l) => l.tasks.map((t) => t.key));
+  const { result } = await simulate({ lanes: [] }, (key) =>
+    key === "plan" ? { structuredOutput: { tasks, questions: [], notes: "" } } : key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "", findings: [] } } : {},
+  );
+  assert.deepEqual(result.lanes.map((l: { tasks: string[] }) => l.tasks), expected);
+});
+
+test("planner with only questions returns needs-input instead of guessing", async () => {
+  const { calls, result } = await simulate({ lanes: [] }, () => ({ structuredOutput: { tasks: [], questions: ["Which DB?"], notes: "" } }));
+  assert.equal(calls.length, 1);
+  assert.equal(result.state, "needs-input");
+  assert.deepEqual(result.questions, ["Which DB?"]);
+});
+
 test("a crashed verifier hands the lane to a human", async () => {
   const { result } = await simulate({}, (key) => (key.includes("verify") ? "fail" : {}));
   assert.equal(result.lanes[0].state, "needs-human");

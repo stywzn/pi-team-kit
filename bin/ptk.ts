@@ -3,10 +3,11 @@
 //   ptk doctor [--strict]       check pi, pi-subagents, conflicts, rg/fd, browser, config
 //   ptk env                     print what the agent is told about this machine and repo
 //   ptk tools | ptk run <name> [args...]
+//   ptk demo [dir]              create a throwaway repo to try /team on
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentDir, findRepoRoot, globalDataDir, loadConfig, projectDataDir } from "../lib/config.ts";
@@ -88,6 +89,22 @@ switch (cmd) {
     const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
     process.exit(r.status ?? 1);
   }
+  case "demo": {
+    // A throwaway git repo to try /team on, without touching real work.
+    const target = resolve(rest[0] ?? join(process.env.HOME ?? process.env.USERPROFILE ?? ".", "code", "ptk-demo"));
+    if (existsSync(target)) {
+      console.error(`${target} already exists; pass another directory: ptk demo <dir>`);
+      process.exit(2);
+    }
+    cpSync(join(ROOT, "examples", "demo-repo"), target, { recursive: true });
+    writeFileSync(join(target, ".gitignore"), "__pycache__/\n.pi/subagents/\n");
+    const git = (...a: string[]) => spawnSync("git", ["-C", target, ...a], { stdio: "ignore" }).status;
+    git("init", "-q", "-b", "main");
+    git("add", "-A");
+    if (git("commit", "-q", "-m", "ptk demo") !== 0) git("-c", "user.name=ptk-demo", "-c", "user.email=ptk-demo@localhost", "commit", "-q", "-m", "ptk demo");
+    console.log(`Demo repo ready: ${target}\n\nNext:\n  cd ${target} && pi\n\nThen paste the /team line from README.md, or type your own goal after /team.`);
+    break;
+  }
   case "plan": {
     const file = rest.find((a) => !a.startsWith("--"));
     if (!file) {
@@ -104,6 +121,6 @@ switch (cmd) {
     break;
   }
   default:
-    console.log("usage: ptk doctor [--strict] | env | tools | run <name> [args...] | plan <tasks.json> [--script]");
+    console.log("usage: ptk doctor [--strict] | env | tools | run <name> [args...] | demo [dir] | plan <tasks.json> [--script]");
     process.exit(cmd ? 2 : 0);
 }

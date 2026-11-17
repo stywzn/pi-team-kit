@@ -9,9 +9,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,9 +24,18 @@ jobs:
       - run: npm test
       - name: toolbox smoke test
         run: |
-          printf '# hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n' > /tmp/t.md
-          node bin/ptk.ts run md2pdf /tmp/t.md /tmp/t.html --html-only
-          grep -q '<table>' /tmp/t.html
-          node bin/ptk.ts run bg start srv --wait-for :18799 --timeout 20 -- python3 -m http.server 18799
+          T="${RUNNER_TEMP:-/tmp}"
+          printf '# hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n' > "$T/t.md"
+          node bin/ptk.ts run md2pdf "$T/t.md" "$T/t.html" --html-only
+          grep -q '<table>' "$T/t.html"
+          printf 'require("http").createServer((q, s) => s.end("ok")).listen(18799)\n' > "$T/server.js"
+          node bin/ptk.ts run bg start srv --cwd "$T" --wait-for :18799 --timeout 30 -- node server.js
+          node bin/ptk.ts run bg list
           node bin/ptk.ts run bg stop srv
+          node bin/ptk.ts run bg start bad --timeout 5 --wait-for ready -- node -e "process.exit(3)" && exit 1 || echo "bg reported the early exit"
+      - name: demo repo
+        run: |
+          git config --global user.name ci && git config --global user.email ci@localhost
+          node bin/ptk.ts demo "${RUNNER_TEMP:-/tmp}/ptk-demo"
+          cd "${RUNNER_TEMP:-/tmp}/ptk-demo" && python3 -m unittest -q || python -m unittest -q
       - run: node bin/ptk.ts doctor

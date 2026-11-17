@@ -3,7 +3,10 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { posix, win32 } from "node:path";
+
+// Paths follow the probed platform, not the host, so tests with a fake Linux probe also pass on Windows.
+let join = posix.join;
 
 export interface Probe {
   platform: NodeJS.Platform;
@@ -48,7 +51,8 @@ function safe<T>(fn: () => T): T | undefined {
 
 /** Locate an executable on PATH (plus extra dirs) without spawning anything. */
 export function which(probe: Probe, name: string): string | undefined {
-  const dirs = [...(probe.env.PATH ?? "").split(probe.platform === "win32" ? ";" : delimiter), ...probe.extraBin].filter(Boolean);
+  join = probe.platform === "win32" ? win32.join : posix.join;
+  const dirs = [...(probe.env.PATH ?? "").split(probe.platform === "win32" ? ";" : ":"), ...probe.extraBin].filter(Boolean);
   const exts = probe.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
   for (const dir of dirs) {
     // Windows PATH entries leak into WSL; only use them for names that are Windows-only anyway.
@@ -78,6 +82,7 @@ const TOOLS = [
 ];
 
 export function detectEnv(probe: Probe): EnvFacts {
+  join = probe.platform === "win32" ? win32.join : posix.join;
   const wsl = probe.platform === "linux" && (/microsoft|wsl/i.test(probe.release) || Boolean(probe.env.WSL_DISTRO_NAME));
   const os =
     probe.platform === "linux"

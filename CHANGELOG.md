@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0] - 2026-11-17
+
+- Planner: `team_run` with only a `goal` lets the new `team-planner` agent read the code and split the work (file ownership, contract-first interfaces, a playbook per task type). The main session's context stays small; questions that block planning come back as `needs-input`.
+- Models per role (`team.models.planner/worker/verifier`), e.g. DeepSeek workers and a GLM verifier.
+- Lane results carry the worker's report up to the main session; `team_run` tells the lead to answer worker questions itself and escalate only product or scope decisions.
+- Guard: timeouts by command type (default 180 s, tests 900 s, installs/builds 600 s, ceiling 1800 s); test commands run with `CI=1`; Playwright report servers, `cypress open`, Karma/ng watch, pytest-watch and `vitest watch` are blocked; commands wrapped in `bash -c` / `sh -c` / `eval` are inspected too.
+- Plain talk keeps established English technical terms (flaky test, fixture, mock...) and allows common testing acronyms.
+- Terminal title shows session name and state (● running, ✓ just finished) and rings the bell after long runs, so tmux can name and flag pi windows.
+- `/team-retro` turns wasted time into checks, pitfalls and facts; `ptk demo` creates a practice repo; `docs/TUTORIAL.md`.
+- Tests: security and performance suites, a real-model end-to-end script with a forced rework round (`test/e2e/rework.sh`), CI on Windows too.
+
 ## [0.1.1] - 2026-11-17
 
 - `/team` prompt template: quoted the description so its YAML frontmatter parses without a warning.

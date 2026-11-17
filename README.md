@@ -8,13 +8,15 @@
 
 | 问题 | pi-team-kit 的做法 |
 |---|---|
-| 一个人串行干活慢，多个 agent 一起改又互相覆盖 | `/team <目标>`：主会话拆任务，**按文件归属分组**，共用文件的任务合并到同一个 worker，最多 4 个 worker 并行，每个在独立的 git worktree（仓库的独立副本）里改 |
-| 子任务做完没人检查，或者检查靠自觉 | 每路先跑**测试命令**（由宿主机执行，worker 自己说"测过了"不算），再由**全新上下文的只读审查员**看 patch；不通过就打回同一个 worker 返工，最多 3 轮，之后交给人决定 |
-| 命令干等几十分钟甚至一小时 | pi 的 bash 默认没有超时。本包默认 180 秒、上限 1200 秒；开发服务器、watch、`tail -f`、REPL 这类不会自己结束的命令直接拦下，改用后台工具 `bg`；`sudo` 自动加 `-n`，分页器和密码提示通过环境变量关掉 |
+| 一个人串行干活慢，多个 agent 一起改又互相覆盖 | `/team <目标>`：**规划员**读代码拆任务、给每个任务划定能改的文件，共用文件的任务合并到同一个 worker，最多 4 个 worker 并行，每个在独立的 git worktree（仓库的独立副本）里改。你只和主会话说话，worker 的问题由主会话回答 |
+| 子任务做完没人检查，或者检查靠自觉 | 每路先跑**测试命令**（由宿主机执行，worker 自己说"测过了"不算），再由**全新上下文的只读审查员**检查；不通过就打回同一个 worker 返工，最多 3 轮，之后交给人决定。审查员可以配成另一家模型（如 worker 用 DeepSeek、审查员用 GLM） |
+| 命令干等几十分钟甚至一小时 | pi 的 bash 默认没有超时。本包按命令类型给默认值：普通 180 秒、测试 900 秒、安装构建 600 秒，上限 1800 秒；测试自动带 `CI=1`（不进 watch 模式、Playwright 报告不起服务）；开发服务器、watch、`tail -f`、REPL、`cypress open` 这类不会自己结束的命令直接拦下，改用后台工具 `bg`（包在 `bash -c` 里也拦得住）；`sudo` 自动加 `-n` |
 | AI 每次都重新摸索环境：用什么包管理器、镜像在哪、测试怎么跑 | 每次会话开始用**代码探测**环境（系统、WSL、运行时、镜像、代理、仓库分支、项目脚本、测试命令）注入提示词。探测出来的不会过时 |
 | 踩过的坑下次还踩，查到的资源下次还要查 | `remember` 工具把事实和坑存成 JSON：事实可带一条检查命令，检查失败就标为"可能过期"；坑带正则，下次匹配到的命令会被提醒或直接拦下 |
 | 每次新对话都重写 md 转 pdf 之类的脚本 | 工具箱自带 `md2pdf`、`shot`（截图）、`bg`（后台进程）；新写的好用脚本用 `toolbox add` 存起来，以后所有会话直接用 |
-| 输出一堆黑话看不懂 | 讲人话规则：先说结论，不用没解释的缩写；代码会检查回复里没解释的缩写，下一轮提醒模型 |
+| 输出一堆黑话看不懂 | 讲人话规则：先说结论，不用没解释的缩写，英文更地道的术语（flaky test、fixture、mock）保留英文；代码会检查回复里没解释的缩写，下一轮提醒模型 |
+| 多个 pi 会话分不清谁在干嘛 | 终端标题显示会话名和状态（● 在跑 / ✓ 刚跑完），跑完响铃；配合 [way-pi-kit](https://github.com/stywzn/way-pi-kit) 的 tmux 配置，窗口名自动跟随、响铃时高亮 |
+| 同样的错误反复出现 | `/team-retro`：把这次会话里浪费时间的地方变成检查、保存的坑或事实，而不是写进文档 |
 | `grep -r`、`find` 慢 | 引导到 pi 内置的 `grep`/`find` 工具（底层是 ripgrep/fd）或 `rg`/`fd`，没装就用 pi 自带的那份 |
 
 ## 安装
@@ -29,13 +31,19 @@ pi install npm:pi-subagents
 pi install git:github.com/stywzn/pi-team-kit
 ```
 
-打开 pi，输入 `/ptk` 看状态。全部检查用命令行：
+打开 pi，输入 `/ptk` 看状态。全部检查和练手仓库用命令行：
 
 ```bash
 node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts doctor
 ```
 
-> 如果装过 pi 官方的 subagent 示例扩展（`~/.pi/agent/extensions/subagent/index.ts`），它也注册了 `subagent` 工具，会和 pi-subagents 冲突，先移走。`ptk doctor` 会检查这一项。
+```bash
+node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts demo
+```
+
+> 如果装过 pi 官方的 subagent 示例扩展（`~/.pi/agent/extensions/subagent/index.ts`），它也注册了 `subagent` 工具，会和 pi-subagents 冲突，先移走。`ptk doctor` 会检查这一项；用 [way-pi-kit](https://github.com/stywzn/way-pi-kit) 安装会自动处理。
+
+**10 分钟教程：[docs/TUTORIAL.md](docs/TUTORIAL.md)**（角色怎么配合、怎么写目标、怎么防冲突和死锁、DeepSeek + GLM 怎么搭）。
 
 ## 用法
 
@@ -43,9 +51,9 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts doctor
 /team 修掉 calc.py 的两个 TODO 并补测试，同时新增 stats.py（mean/median）和测试
 ```
 
-主会话会读必要的代码、列出任务表，然后调 `team_run` 在后台开跑；跑完自动唤醒，调 `team_integrate` 把各路 patch 合进工作区，再在合并后的代码上跑一遍测试，最后用大白话汇报。worker 遇到需要决定的事会通过 supervisor 通道问主会话。进度在 pi-subagents 的 FleetView 里看。
+主会话只负责说清目标和完成标准，然后调 `team_run`；规划员读代码拆任务，worker 并行干活，跑完自动唤醒主会话，主会话调 `team_integrate` 把各路改动合进工作区，在合并后的代码上再跑一遍测试，最后用大白话汇报。进度在 pi-subagents 的 FleetView 里看。
 
-上面这条命令的真实运行记录（两路并行，81 秒完成，含时间线和合并结果）：[examples/demo-run.md](examples/demo-run.md)。
+真实运行记录：[examples/demo-run.md](examples/demo-run.md)（两路并行，81 秒完成）。端到端测试 `test/e2e/rework.sh` 用一个"第一轮必打回"的审查员夹具，验证规划 → 并行 → 打回 → 返工 → 合并整条链路（实测 2 分钟左右）。
 
 其他能力不用记命令，直接说就行：
 
@@ -58,14 +66,18 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts doctor
 ## 团队流程
 
 ```text
-主会话 ── 拆任务（每个任务带文件归属）──> team_run
-          │  共用文件的任务合并成一路（lane）
-          ├─ lane A: worker(独立 worktree) → 测试命令 → 审查员 → [返工 → 测试 → 审查]×≤3
-          ├─ lane B: ...                                   最多 4 路同时跑
-          └─ 完成事件唤醒主会话 ──> team_integrate：按顺序 git apply，合并后再跑一遍测试
+你 ──> 主会话 ── 目标 + 完成标准 ──> team_run
+                  ├─ 规划员：读代码，拆任务，给每个任务划定文件，跨任务的接口先写死
+                  │    共用文件的任务合并成一路（lane）
+                  ├─ lane A: worker(独立 worktree) → 测试命令 → 审查员 → [返工 → 测试 → 审查]×≤3
+                  ├─ lane B: ...                                   最多 4 路同时跑
+                  │    worker 有疑问 → 问主会话（不是问你）
+                  └─ 完成事件唤醒主会话 ──> team_integrate：从各 worktree 取改动，按顺序合并，再跑一遍测试
 ```
 
-没有单独的"监控会话"：完成通知、卡住提醒、进度展示都由 pi-subagents 的运行时用代码完成，不花模型的 token，也不会跑偏。
+没有单独的"监控会话"：完成通知、卡住提醒、进度展示都由 pi-subagents 的运行时用代码完成，不花模型的 token，也不会跑偏。也没有让人去和子会话对话：信息向下靠 brief 和自动注入的环境信息，向上靠结构化结果（改了哪些文件、跑了哪些检查、审查结论）。
+
+思路上参考了 Lauren Tan（poteto）的 pstack：验收要有运行时证据（这里是宿主机执行的测试命令），把反复纠正的错误变成检查（`/team-retro`），按任务类型选作业手册（规划员的 bug fix / feature / refactor / 测试 / 性能 五种写法），不同模型互相审查，每次改动后重新检查（每轮返工都换一个全新的审查员）。
 
 ## 配置
 
@@ -73,8 +85,12 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts doctor
 
 ```json
 {
-  "guard": { "defaultTimeoutSec": 300, "preferFastSearch": "warn" },
-  "team": { "gate": "npm run lint && npm test", "maxParallel": 3 },
+  "guard": { "testTimeoutSec": 1200, "preferFastSearch": "warn" },
+  "team": {
+    "gate": "npm run lint && npm test",
+    "maxParallel": 3,
+    "models": { "worker": "deepseek/deepseek-flash", "verifier": "zai-coding-cn/glm-5-3" }
+  },
   "plainTalk": { "allow": ["SKU", "GMV"] }
 }
 ```
@@ -94,7 +110,13 @@ node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts doctor
 npm install && npm test
 ```
 
-测试会用一个假的 pi-subagents 跑生成的团队脚本，覆盖通过、返工、测试失败修复、超过轮数交给人这几种情况，不花模型 token。
+`npm test` 不花模型 token：用一个假的 pi-subagents 跑生成的团队脚本（通过、返工、测试失败修复、超过轮数交给人、规划员模式），加上安全测试（恶意任务文本、路径穿越、未信任项目的配置）和性能测试（防卡死检查每条命令约 9 微秒，环境探测约 15 毫秒）。CI 在 Linux / macOS / Windows × Node 22 / 24 上跑。
+
+真实模型的端到端测试（几分钱，约 2 分钟）：
+
+```bash
+PTK_E2E_WORKER_MODEL=deepseek/deepseek-flash bash test/e2e/rework.sh
+```
 
 ## 许可
 

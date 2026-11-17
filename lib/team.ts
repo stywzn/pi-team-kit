@@ -19,12 +19,16 @@ export interface Lane {
 
 export interface TeamPlan {
   goal: string;
+  /** Empty = let the planner agent split the goal inside the run. */
   lanes: Lane[];
   gate: string;
   gateTimeoutSec: number;
   maxRounds: number;
   workerAgent: string;
   verifierAgent: string;
+  plannerAgent?: string;
+  maxTasks?: number;
+  models?: { planner?: string; worker?: string; verifier?: string };
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -96,7 +100,9 @@ export function planLanes(tasks: TeamTask[]): Lane[] {
 
 /** The pi-subagents workflow script for a plan. Data is embedded as JSON; logic is fixed. */
 export function buildTeamScript(plan: TeamPlan): string {
-  return `const PLAN = ${JSON.stringify(plan)};
+  const full = { plannerAgent: "team-planner", maxTasks: 8, models: {}, ...plan };
+  return `const PLAN = ${JSON.stringify(full)};
+const PLAN_SCHEMA = ${JSON.stringify(PLAN_SCHEMA)};
 const GATE = PLAN.gate ? { command: PLAN.gate, timeoutMs: PLAN.gateTimeoutSec * 1000 } : undefined;
 // Resumed children reject the gate shorthand but accept the explicit form, so rework is held to the same check.
 // pi-subagents stages the first round's changes when it captures the patch; preserveStagedIndex lets rework continue on top.
@@ -106,6 +112,28 @@ const RESUME_ACCEPTANCE = GATE
 const VERDICT_SCHEMA = ${JSON.stringify(VERDICT_SCHEMA)};
 ${WORKFLOW_BODY}`;
 }
+
+export const PLAN_SCHEMA = {
+  type: "object",
+  properties: {
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          key: { type: "string" },
+          title: { type: "string" },
+          brief: { type: "string" },
+          files: { type: "array", items: { type: "string" } },
+        },
+        required: ["key", "title", "brief", "files"],
+      },
+    },
+    questions: { type: "array", items: { type: "string" } },
+    notes: { type: "string" },
+  },
+  required: ["tasks", "questions", "notes"],
+};
 
 export const VERDICT_SCHEMA = {
   type: "object",
@@ -140,6 +168,49 @@ function settle(key, promise) {
       return { ok: false, error: error, runId: (s && s.runId) || null, artifactPaths: dir ? [dir] : [], output: "" };
     }, function () { return { ok: false, error: error, runId: null, artifactPaths: [], output: "" }; });
   });
+}
+
+function withModel(item, role) { var m = PLAN.models && PLAN.models[role]; if (m) item.model = m; return item; }
+
+// Lane planning, same rules as planLanes() in lib/team.ts (tests check they agree).
+function norm(p) { return String(p || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""); }
+function litPrefix(p) { var i = p.search(/[*?[{]/); return i < 0 ? p : p.slice(0, i); }
+function overlap(a, b) {
+  a = norm(a); b = norm(b);
+  var pa = litPrefix(a), pb = litPrefix(b);
+  if (!pa || !pb) return true;
+  if (pa === a && pb === b) return pa === pb || pa.indexOf(pb + "/") === 0 || pb.indexOf(pa + "/") === 0;
+  return pa.indexOf(pb) === 0 || pb.indexOf(pa) === 0;
+}
+function lanesFor(tasks) {
+  var parent = tasks.map(function (_, i) { return i; });
+  function find(i) { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; }
+  for (var i = 0; i < tasks.length; i++) for (var j = i + 1; j < tasks.length; j++)
+    if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); })) parent[find(j)] = find(i);
+  var groups = [], index = {};
+  tasks.forEach(function (t, i) { var r = find(i); if (!(r in index)) { index[r] = groups.length; groups.push([]); } groups[index[r]].push(t); });
+  return groups.map(function (g) {
+    var files = []; g.forEach(function (t) { t.files.forEach(function (f) { if (files.indexOf(f) < 0) files.push(f); }); });
+    return { key: g.length === 1 ? g[0].key : g[0].key + "-plus" + (g.length - 1), tasks: g, files: files };
+  });
+}
+function cleanTasks(raw) {
+  var seen = {};
+  return (raw || []).slice(0, PLAN.maxTasks).map(function (t, i) {
+    var key = String(t.key || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "task-" + (i + 1);
+    while (seen[key]) key = key + "-" + (i + 1);
+    seen[key] = true;
+    var files = (Array.isArray(t.files) ? t.files : []).map(norm).filter(function (f) { return f && f.charAt(0) !== "/" && f.split("/").indexOf("..") < 0; });
+    // No ownership given: assume it may touch anything, so it shares a lane with everything.
+    return { key: key, title: String(t.title || key).slice(0, 120), brief: String(t.brief || t.title || ""), files: files.length ? files : ["**"] };
+  });
+}
+
+function planTask() {
+  return "Split this goal into tasks for a team run. Goal: " + PLAN.goal + "\n\n" +
+    "At most " + PLAN.maxTasks + " tasks; up to 4 run in parallel, each in its own git worktree. " +
+    (PLAN.gate ? "Every task's result must pass " + JSON.stringify(PLAN.gate) + ". " : "") +
+    "Return tasks, questions (only blocking ones; empty when you can proceed) and notes.";
 }
 
 function workTask(lane) {
@@ -190,7 +261,8 @@ function finish(lane, writer, review, rounds, state) {
     runDir: lane.origin || null,
     error: (writer && writer.error) || null,
     summary: clip((review && review.summary) || (writer && writer.output), 800),
-    findings: (review && review.findings) || []
+    findings: (review && review.findings) || [],
+    report: clip(writer && writer.output, 1200)
   };
 }
 
@@ -208,7 +280,7 @@ function afterWrite(lane, writer, round) {
 
 function review(lane, writer, round) {
   var key = lane.key + "-verify-" + round;
-  return settle(key, runs.run(key, { agent: PLAN.verifierAgent, label: "Verify " + lane.key + " #" + round, task: verifyTask(lane, writer, round), outputSchema: VERDICT_SCHEMA }))
+  return settle(key, runs.run(key, withModel({ agent: PLAN.verifierAgent, label: "Verify " + lane.key + " #" + round, task: verifyTask(lane, writer, round), outputSchema: VERDICT_SCHEMA }, "verifier")))
     .then(function (v) {
       if (!v.ok && !v.structuredOutput) return finish(lane, writer, { summary: "Verifier failed: " + v.error, findings: [] }, round, "needs-human");
       var out = v.structuredOutput || {};
@@ -223,7 +295,7 @@ function review(lane, writer, round) {
 }
 
 function startLane(lane) {
-  var item = { agent: PLAN.workerAgent, label: "Implement " + lane.key, task: workTask(lane), worktree: true };
+  var item = withModel({ agent: PLAN.workerAgent, label: "Implement " + lane.key, task: workTask(lane), worktree: true }, "worker");
   if (GATE) item.gate = GATE;
   var key = lane.key + "-work";
   return settle(key, runs.run(key, item)).then(function (w) {
@@ -232,10 +304,24 @@ function startLane(lane) {
   });
 }
 
-const results = await Promise.all(PLAN.lanes.map(startLane));
+var lanes = PLAN.lanes;
+var planned = null;
+if (!lanes.length) {
+  var p = await settle("plan", runs.run("plan", withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
+  var out = p.structuredOutput || {};
+  var tasks = cleanTasks(out.tasks);
+  if (!tasks.length) {
+    return { goal: PLAN.goal, state: "needs-input", questions: out.questions || [], notes: out.notes || p.error || "planner returned no tasks", lanes: [] };
+  }
+  lanes = lanesFor(tasks);
+  planned = { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }), questions: out.questions || [], notes: out.notes || "" };
+}
+
+const results = await Promise.all(lanes.map(startLane));
 return {
   goal: PLAN.goal,
   gate: PLAN.gate || null,
+  plan: planned,
   lanes: results,
   next: "Call team_integrate with runDirs = the runDir of each passed lane, in this order. Lanes marked needs-human or failed need your decision."
 };

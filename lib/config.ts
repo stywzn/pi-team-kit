@@ -13,8 +13,14 @@ export interface PtkConfig {
     enabled: boolean;
     /** Seconds a bash call may run when the model passes no timeout. pi itself has no default. */
     defaultTimeoutSec: number;
+    /** Default for test runs (pytest, jest, playwright test, go test, npm test...). */
+    testTimeoutSec: number;
+    /** Default for installs and builds (npm ci, pip install, docker build, cargo build...). */
+    buildTimeoutSec: number;
     /** Hard ceiling, even when the model asks for more. */
     maxTimeoutSec: number;
+    /** Run test commands with CI=1 (unless set): no watch mode, no report server waiting for Ctrl+C. */
+    ciForTests: boolean;
     /** Set pager/prompt/telemetry env vars so tools never wait for a human. */
     nonInteractiveEnv: boolean;
     /** Refuse dev servers, watchers, `tail -f`, REPLs and TUIs in the foreground. */
@@ -41,6 +47,12 @@ export interface PtkConfig {
     enabled: boolean;
     runTimeoutSec: number;
   };
+  terminal: {
+    /** Show working/done in the terminal title, so tmux window names reflect each pi session. */
+    title: boolean;
+    /** Ring the bell when a run that took at least this many seconds finishes (tmux flags the window). 0 = off. */
+    bellAfterSec: number;
+  };
   team: {
     /** Workers running at the same time. */
     maxParallel: number;
@@ -51,8 +63,12 @@ export interface PtkConfig {
     gateTimeoutSec: number;
     /** Deadline for one whole team run. */
     runTimeoutMin: number;
+    plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
+    /** Model per role, "provider/model" as in `pi --list-models`; "" = the agent's default (the main session's model).
+     *  A verifier from a different model family than the workers catches more of their mistakes. */
+    models: { planner: string; worker: string; verifier: string };
   };
 }
 
@@ -60,7 +76,10 @@ export const DEFAULTS: PtkConfig = {
   guard: {
     enabled: true,
     defaultTimeoutSec: 180,
-    maxTimeoutSec: 1200,
+    testTimeoutSec: 900,
+    buildTimeoutSec: 600,
+    maxTimeoutSec: 1800,
+    ciForTests: true,
     nonInteractiveEnv: true,
     blockLongRunners: true,
     preferFastSearch: "block",
@@ -69,14 +88,17 @@ export const DEFAULTS: PtkConfig = {
   facts: { enabled: true, checkTimeoutMs: 1500, maxFacts: 40 },
   plainTalk: { enabled: true, acronymCheck: true, allow: [] },
   toolbox: { enabled: true, runTimeoutSec: 300 },
+  terminal: { title: true, bellAfterSec: 20 },
   team: {
     maxParallel: 4,
     maxRounds: 3,
     gate: "",
-    gateTimeoutSec: 600,
+    gateTimeoutSec: 900,
     runTimeoutMin: 60,
+    plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
+    models: { planner: "", worker: "", verifier: "" },
   },
 };
 
@@ -162,6 +184,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   const g = config.guard;
   g.defaultTimeoutSec = clamp(g.defaultTimeoutSec, 5, 86_400);
   g.maxTimeoutSec = clamp(g.maxTimeoutSec, g.defaultTimeoutSec, 86_400);
+  g.testTimeoutSec = clamp(g.testTimeoutSec, 5, g.maxTimeoutSec);
+  g.buildTimeoutSec = clamp(g.buildTimeoutSec, 5, g.maxTimeoutSec);
   config.team.maxParallel = clamp(Math.round(config.team.maxParallel), 1, 8);
   config.team.maxRounds = clamp(Math.round(config.team.maxRounds), 1, 10);
   return { config, files, warnings };

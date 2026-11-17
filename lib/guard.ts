@@ -68,6 +68,15 @@ export function longRunnerReason(seg: Segment): string | undefined {
     return `\`${prog}\` keeps running until stopped`;
   if (["tsc", "jest", "vitest", "mocha", "esbuild", "rollup", "webpack", "tailwindcss", "sass", "babel"].includes(prog) && watchFlag)
     return `\`${prog}\` in watch mode never exits`;
+  // Test tooling that waits for a human: report servers, GUIs, watch modes.
+  if (prog === "playwright" && sub === "show-report") return "`playwright show-report` starts a report server";
+  if (prog === "playwright" && sub === "test" && has("--ui", "--debug", "--headed-debug")) return "`playwright test --ui/--debug` is interactive";
+  if (prog === "cypress" && sub === "open") return "`cypress open` is an interactive GUI (use `cypress run`)";
+  if (prog === "ng" && sub === "test" && !has("--watch=false", "--no-watch")) return "`ng test` watches by default (add --watch=false)";
+  if (prog === "karma" && sub === "start" && !has("--single-run")) return "`karma start` watches by default (add --single-run)";
+  if (["ptw", "pytest-watch", "pytest-watcher"].includes(prog)) return `\`${prog}\` re-runs tests forever`;
+  if (prog === "pytest" && has("--looponfail", "-f")) return "`pytest --looponfail` waits for file changes";
+  if (prog === "vitest" && (sub === "watch" || sub === "dev" || has("--ui"))) return "`vitest watch/--ui` never exits (use `vitest run`)";
   if (prog === "webpack" && sub === "serve") return "`webpack serve` starts a dev server";
   if (prog === "ng" && sub === "serve") return "`ng serve` starts a dev server";
   if (prog === "tsx" && sub === "watch") return "`tsx watch` never exits";
@@ -142,6 +151,82 @@ export function fastSearchHint(seg: Segment, opts: Pick<GuardOptions, "hasRg" | 
   return undefined;
 }
 
+/** Also look inside `bash -c "..."`, `sh -c '...'` and `eval ...`, so wrapping a command does not hide it. */
+export function expandSegments(segments: Segment[], depth = 0): Segment[] {
+  if (depth > 3) return segments;
+  const out: Segment[] = [];
+  for (const seg of segments) {
+    out.push(seg);
+    const argv = effectiveCommand(seg.argv).argv;
+    const prog = argv.length ? baseName(argv[0]) : "";
+    let inner: string | undefined;
+    if (["bash", "sh", "zsh", "dash", "ksh"].includes(prog)) {
+      const c = argv.findIndex((a, i) => i > 0 && /^-[a-z]*c[a-z]*$/.test(a));
+      if (c > 0) inner = argv[c + 1];
+    } else if (prog === "eval") inner = argv.slice(1).join(" ");
+    if (inner) {
+      const nested = splitSegments(inner).map((s) => ({ ...s, background: s.background || seg.background }));
+      out.push(...expandSegments(nested, depth + 1));
+    }
+  }
+  return out;
+}
+
+export type CommandClass = "test" | "build" | "default";
+
+const TEST_PROGS = new Set(["pytest", "py.test", "jest", "vitest", "mocha", "ava", "tap", "karma", "tox", "nox", "phpunit", "rspec", "ctest", "behave", "robot"]);
+const PKG_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+
+/** Decide which default timeout a command gets. Tests may take long; most other commands should not. */
+export function classifyCommand(command: string): CommandClass {
+  let cls: CommandClass = "default";
+  for (const seg of expandSegments(splitSegments(command))) {
+    let argv = effectiveCommand(seg.argv).argv;
+    if (argv.length === 0) continue;
+    let prog = baseName(argv[0]);
+    // npx playwright test, uv run pytest, poetry run pytest, python -m pytest
+    if (["npx", "bunx", "pnpx"].includes(prog) || ((prog === "uv" || prog === "poetry" || prog === "pdm" || prog === "pipenv") && argv[1] === "run")) {
+      argv = argv.slice(prog === "npx" || prog === "bunx" || prog === "pnpx" ? 1 : 2).filter((a) => a !== "-y" && a !== "--yes");
+      prog = argv.length ? baseName(argv[0]) : "";
+    }
+    if (/^python(\d(\.\d+)?)?$/.test(prog) && argv[1] === "-m") {
+      argv = argv.slice(2);
+      prog = argv[0] ?? "";
+    }
+    const sub = argv.slice(1).find((a) => !a.startsWith("-"));
+    const isTest =
+      TEST_PROGS.has(prog) ||
+      prog === "unittest" ||
+      (prog === "playwright" && sub === "test") ||
+      (prog === "cypress" && sub === "run") ||
+      (prog === "go" && sub === "test") ||
+      (prog === "cargo" && (sub === "test" || sub === "nextest")) ||
+      (prog === "dotnet" && sub === "test") ||
+      (prog === "deno" && sub === "test") ||
+      ((prog === "mvn" || prog === "mvnw") && argv.some((a) => a === "test" || a === "verify")) ||
+      ((prog === "gradle" || prog === "gradlew") && argv.some((a) => a === "test" || a === "check")) ||
+      (PKG_MANAGERS.has(prog) && (sub === "test" || sub === "t" || ((sub === "run" || sub === "run-script") && /^(test|e2e|spec)/.test(argv[argv.indexOf(sub) + 1] ?? "")))) ||
+      (prog === "make" && argv.slice(1).some((a) => /^(test|check|e2e)/.test(a)));
+    if (isTest) return "test";
+    const isBuild =
+      (PKG_MANAGERS.has(prog) && ["install", "i", "ci", "add", "update", "upgrade"].includes(sub ?? "")) ||
+      (PKG_MANAGERS.has(prog) && (sub === "run" || sub === "run-script") && /^build/.test(argv[argv.indexOf(sub) + 1] ?? "")) ||
+      (/^pip\d?$/.test(prog) && sub === "install") ||
+      (prog === "uv" && ["sync", "add", "pip", "lock"].includes(sub ?? "")) ||
+      (prog === "poetry" && ["install", "add", "lock", "update"].includes(sub ?? "")) ||
+      ((prog === "apt-get" || prog === "apt" || prog === "dnf" || prog === "brew") && ["install", "update", "upgrade"].includes(sub ?? "")) ||
+      ((prog === "cargo" || prog === "go") && ["build", "install", "fetch"].includes(sub ?? "")) ||
+      ((prog === "mvn" || prog === "mvnw") && argv.some((a) => a === "package" || a === "install")) ||
+      ((prog === "gradle" || prog === "gradlew") && argv.some((a) => a === "build" || a === "assemble")) ||
+      (prog === "docker" && (["build", "pull"].includes(sub ?? "") || (sub === "compose" && argv.some((a) => a === "build" || a === "pull")))) ||
+      (prog === "playwright" && sub === "install") ||
+      prog === "make" ||
+      (prog === "cmake" && argv.includes("--build"));
+    if (isBuild) cls = "build";
+  }
+  return cls;
+}
+
 function safeRegExp(source: string): RegExp | undefined {
   try {
     return new RegExp(source);
@@ -162,7 +247,7 @@ export function inspectBash(command: string, opts: GuardOptions): GuardDecision 
     notes.push(`Known pitfall "${p.id}": ${p.message}`);
   }
 
-  const segments = splitSegments(command);
+  const segments = expandSegments(splitSegments(command));
   if (opts.blockLongRunners) {
     for (const seg of segments) {
       const why = longRunnerReason(seg);
@@ -194,6 +279,12 @@ export function inspectBash(command: string, opts: GuardOptions): GuardDecision 
 /** Saved pitfall regexes run on every bash call, so refuse shapes prone to catastrophic backtracking. */
 export function unsafeRegex(source: string): boolean {
   return /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]/.test(source) || source.length > 300;
+}
+
+/** Prefix test commands with CI=1 unless the command or environment already sets CI. */
+export function withCi(command: string, env: NodeJS.ProcessEnv): string {
+  if (env.CI !== undefined || /(^|[\s;&|(])(export\s+)?CI=/.test(command)) return command;
+  return `export CI=1\n${command}`;
 }
 
 /** Timeout to use for a bash call: fill in the default, never exceed the ceiling. */
@@ -228,6 +319,8 @@ export const NON_INTERACTIVE_ENV: Record<string, string> = {
   PIP_DISABLE_PIP_VERSION_CHECK: "1",
   HOMEBREW_NO_AUTO_UPDATE: "1",
   HOMEBREW_NO_ENV_HINTS: "1",
+  PLAYWRIGHT_HTML_OPEN: "never",
+  PW_TEST_HTML_REPORT_OPEN: "never",
   NEXT_TELEMETRY_DISABLED: "1",
   DOTNET_CLI_TELEMETRY_OPTOUT: "1",
   DO_NOT_TRACK: "1",

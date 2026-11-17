@@ -6,6 +6,7 @@ export const PLAIN_TALK_RULES = `Write for a busy engineer who did not watch you
 - First sentence: the answer or the outcome. Details after, only if they help.
 - Reply in the user's language. Short sentences, everyday words. No filler, hype, or emoji headings.
 - No unexplained jargon or abbreviations (SpaceX rule: acronyms seriously suck). The first time a term the user may not know appears, explain it in a few plain words, e.g. "worktree (a separate checkout of the repo)". Never invent abbreviations.
+- Keep an established English technical term when it is more precise than a translation (flaky test, fixture, mock, assertion, race condition, rollback, regression); don't force-translate it, and don't mix languages beyond that.
 - Say what you did, what you did not do, and what you did not verify. Never claim a test passed unless you ran it.
 - Commands in code blocks, paths in backticks. A short list or table beats a long paragraph; no headings for short answers.`;
 
@@ -13,7 +14,8 @@ const BUILTIN_ALLOW = new Set(
   (
     "API APIS URL URLS URI HTTP HTTPS JSON YAML TOML XML HTML CSS JS TS JSX TSX SQL CSV PDF PNG JPG JPEG GIF SVG UTF ASCII " +
     "CPU GPU RAM SSD OS ID IDS UI UX CLI GUI IDE SDK PR PRS CI CD DNS IP TCP UDP SSH TLS SSL VPN LAN USB AI LLM OK " +
-    "KB MB GB TB AM PM UTC GMT EOF README TODO FIXME MIT GPL BSD WSL GNU MACOS IOS NPM PIP UV FAQ ETA PS NB"
+    "KB MB GB TB AM PM UTC GMT EOF README TODO FIXME MIT GPL BSD WSL GNU MACOS IOS NPM PIP UV FAQ ETA PS NB " +
+    "E2E QA TDD BDD UAT DOM XPATH REST GRPC JWT OAUTH CORS DB ORM CRUD HTTP2 WS"
   ).split(" "),
 );
 

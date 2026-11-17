@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import { agentDir, findRepoRoot, globalDataDir, loadConfig, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { inspectBash, looksLikeTimeout, NON_INTERACTIVE_ENV, resolveTimeout, type Pitfall } from "../lib/guard.ts";
+import { classifyCommand, inspectBash, looksLikeTimeout, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, patchesFromHandoff, planLanes, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
@@ -179,7 +179,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
     sections["environment"] = env.join("\n");
     if (c.guard.enabled)
       sections["command-rules"] =
-        `bash calls are stopped after ${c.guard.defaultTimeoutSec}s unless you pass "timeout" (max ${c.guard.maxTimeoutSec}s); pass a bigger timeout only for work that really needs it. ` +
+        `bash calls without "timeout" stop after ${c.guard.defaultTimeoutSec}s (tests ${c.guard.testTimeoutSec}s, installs/builds ${c.guard.buildTimeoutSec}s, max ${c.guard.maxTimeoutSec}s); ` +
+        "run the narrowest test that proves the point (one file or one test name) before the full suite. Test commands run with CI=1. " +
         "Servers, watchers and anything that waits forever go through the toolbox bg tool, never the foreground. " +
         "Search with the grep/find/ls tools or rg/fd, not grep -r or find -name. Prefer one command with && over several calls, and run independent tool calls in parallel.";
     if (c.toolbox.enabled && state.tools.length)
@@ -234,8 +235,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
       cwd: state.cwd,
     });
     if (decision.kind === "block") return { block: true, reason: decision.reason };
-    event.input.command = decision.command;
-    const t = resolveTimeout(event.input.timeout, g.defaultTimeoutSec, g.maxTimeoutSec);
+    const cls = classifyCommand(decision.command);
+    event.input.command = cls === "test" && g.ciForTests ? withCi(decision.command, process.env) : decision.command;
+    const classDefault = cls === "test" ? g.testTimeoutSec : cls === "build" ? g.buildTimeoutSec : g.defaultTimeoutSec;
+    const t = resolveTimeout(event.input.timeout, classDefault, g.maxTimeoutSec);
     event.input.timeout = t.timeout;
     const notes = [...decision.notes];
     if (t.capped) notes.push(`Timeout capped at ${g.maxTimeoutSec}s. For longer jobs use toolbox bg and poll its logs.`);
@@ -386,14 +389,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
     label: "Team run",
     description:
       "Start a team run: each lane gets a worker in its own git worktree, the gate command must pass, a fresh read-only verifier checks the patch, and failed checks go back to the same worker (bounded rounds). Tasks that share files are merged into one lane so lanes never conflict. Runs in the background; you are notified when it finishes, then call team_integrate.",
-    promptSnippet: "Run a planned set of tasks with parallel workers, a verifier and automatic rework",
+    promptSnippet: "Run a goal with a planner, parallel workers, a verifier and automatic rework",
     promptGuidelines: [
-      "Use team_run only after splitting the goal into tasks with disjoint file ownership and self-contained briefs; ask the user first if the goal is unclear.",
-      "When a team_run finishes, call team_integrate with the runDir of every passed lane, then report results in plain words.",
+      "Use team_run for work that splits into parallel parts. Pass only `goal` to let the team-planner split it (keeps your context small), or pass `tasks` with disjoint file ownership when you already know the split. Ask the user first only if the goal itself is unclear.",
+      "While a team_run is running, answer workers' supervisor questions yourself from the goal and the code; escalate to the user only product or scope decisions. Do not ask the user to talk to workers.",
+      "When a team_run finishes, call team_integrate with the runDir of every passed lane, then report results in plain words. If it returned state needs-input, answer the planner's questions (ask the user only if you cannot) and run again with tasks.",
     ],
     parameters: Type.Object({
-      goal: Type.String({ description: "The overall goal in one or two sentences" }),
-      tasks: Type.Array(TaskSchema, { minItems: 1, maxItems: 12 }),
+      goal: Type.String({ description: "The overall goal in one or two sentences, including how to tell it is done" }),
+      tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1, maxItems: 12, description: "Omit to let the team-planner agent split the goal inside the run" })),
       gate: Type.Optional(Type.String({ description: "Command that must pass in every worktree; default: configured or detected test command" })),
       maxRounds: Type.Optional(Type.Number({ description: "Verifier rounds per lane before a human decides" })),
     }),
@@ -404,7 +408,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (dirty.length) throw new Error(`Commit or stash these first; workers branch from a clean HEAD:\n${dirty.slice(0, 20).join("\n")}`);
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
-      const tasks = validateTasks(params.tasks as TeamTask[]);
+      const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[]) : [];
       const lanes = planLanes(tasks);
       const gate = (params.gate ?? t.gate ?? "").trim() || state.env?.testCommand || "";
       const plan = {
@@ -415,6 +419,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
         maxRounds: Math.max(1, Math.min(10, Math.round(params.maxRounds ?? t.maxRounds))),
         workerAgent: t.workerAgent,
         verifierAgent: t.verifierAgent,
+        plannerAgent: t.plannerAgent,
+        maxTasks: 8,
+        models: t.models,
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),
@@ -423,14 +430,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
       const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
+      const roles = Object.entries(t.models).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
       return {
         content: [
           {
             type: "text" as const,
             text:
-              `Team run started in the background: ${lanes.length} lane(s), up to ${t.maxParallel} at once, gate ${gate ? `\`${gate}\`` : "(none: verifier only)"}, max ${plan.maxRounds} round(s).\n` +
-              `${laneLines.join("\n")}\n` +
-              (lanes.length < tasks.length ? "Tasks sharing files were merged into one lane.\n" : "") +
+              `Team run started in the background: ${lanes.length ? `${lanes.length} lane(s)` : "the team-planner splits the goal first"}, up to ${t.maxParallel} at once, gate ${gate ? `\`${gate}\`` : "(none: verifier only)"}, max ${plan.maxRounds} round(s)${roles ? `, models ${roles}` : ""}.\n` +
+              (laneLines.length ? `${laneLines.join("\n")}\n` : "") +
+              (lanes.length && lanes.length < tasks.length ? "Tasks sharing files were merged into one lane.\n" : "") +
               "You will be woken when it finishes. Meanwhile the fleet view shows progress; workers may ask you questions through the supervisor channel.",
           },
         ],
@@ -526,6 +534,30 @@ export default function piTeamKit(pi: ExtensionAPI) {
     },
   });
 
+  // ---------- terminal title and bell (tmux shows them per window) ----------
+
+  let runStarted = 0;
+  const baseTitle = () => {
+    const name = pi.getSessionName();
+    const dir = basename(state.cwd);
+    return name ? `π ${name} · ${dir}` : `π ${dir}`;
+  };
+
+  pi.on("agent_start", async (_event, ctx) => {
+    if (!ctx.hasUI) return;
+    runStarted = Date.now();
+    if (state.config.terminal.title) ctx.ui.setTitle(`● ${baseTitle()}`);
+  });
+
+  pi.on("agent_settled", async (event, ctx) => {
+    if (!ctx.hasUI || !runStarted) return;
+    const c = state.config.terminal;
+    const long = c.bellAfterSec > 0 && (Date.now() - runStarted) / 1000 >= c.bellAfterSec && !event.aborted;
+    runStarted = 0;
+    if (c.title) ctx.ui.setTitle(`${long ? "✓ " : ""}${baseTitle()}`);
+    if (long) process.stdout.write("\x07"); // tmux marks the window; terminals flash or notify
+  });
+
   // ---------- /ptk ----------
 
   pi.registerCommand("ptk", {
@@ -544,8 +576,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const report = [
         `config: ${loadConfig(ctx.cwd, process.env, state.trusted).files.join(", ") || "defaults"}${state.configWarnings.length ? `\n  warnings: ${state.configWarnings.join("; ")}` : ""}`,
         `project trust: ${state.trusted ? "yes (project config, facts and toolbox loaded)" : "no (project .pi/ptk.json, facts and toolbox ignored)"}`,
-        `guard: ${g.enabled ? `on, timeout ${g.defaultTimeoutSec}s (max ${g.maxTimeoutSec}s), search=${g.preferFastSearch}` : "off"}`,
-        `pi-subagents: ${subagents}; team gate: ${state.config.team.gate || state.env?.testCommand || "(none)"}`,
+        `guard: ${g.enabled ? `on, timeout ${g.defaultTimeoutSec}s / tests ${g.testTimeoutSec}s / builds ${g.buildTimeoutSec}s (max ${g.maxTimeoutSec}s), search=${g.preferFastSearch}` : "off"}`,
+        `pi-subagents: ${subagents}; team gate: ${state.config.team.gate || state.env?.testCommand || "(none)"}; models: ${Object.entries(state.config.team.models).map(([r, m]) => `${r}=${m || "default"}`).join(", ")}`,
         `toolbox: ${state.tools.map((t) => `${t.name}[${t.layer}]`).join(", ") || "empty"}`,
         `facts: ${state.facts.length} (${state.facts.filter((f) => f.stale).length} stale), pitfalls: ${state.pitfalls.length}`,
         "",
