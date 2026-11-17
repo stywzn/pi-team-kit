@@ -212,6 +212,7 @@ switch (cmd) {
           plannerAgent: t.plannerAgent,
           maxTasks: t.maxTasks,
           models: t.models,
+          childTimeoutMs: t.childTimeoutMin * 60_000,
         }),
       );
     }

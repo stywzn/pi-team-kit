@@ -211,3 +211,17 @@ test("lanes run in parallel and are reported in plan order", async () => {
   });
   assert.deepEqual(result.lanes.map((l: { lane: string; state: string }) => [l.lane, l.state]), [["a", "passed"], ["b", "needs-human"]]);
 });
+
+test("every child run gets the configured deadline (pi-subagents would stop it after 30 minutes), and a lane keeps why it was sent back", async () => {
+  let reviews = 0;
+  const { result, calls } = await simulate({ childTimeoutMs: 44 * 60_000 }, (key) =>
+    key.includes("verify")
+      ? { structuredOutput: ++reviews === 1 ? { verdict: "rework", summary: "bug", findings: [{ file: "a.py", issue: "off by one", fix: "use <=" }] } : { verdict: "pass", summary: "ok", findings: [] } }
+      : {},
+  );
+  assert.deepEqual(calls.map((c) => c.key), ["one-work", "one-verify-1", "one-fix-1", "one-verify-2"]);
+  for (const c of calls) assert.equal((c.item as { timeoutMs?: number }).timeoutMs, 2_640_000, `${c.key} has the deadline`);
+  assert.deepEqual(result.lanes[0].history, [{ round: 1, findings: [{ file: "a.py", issue: "off by one", fix: "use <=" }] }]);
+  const plain = await simulate({}, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "fine", findings: [] } } : {}));
+  assert.equal((plain.calls[0].item as { timeoutMs?: number }).timeoutMs, undefined, "no setting: pi-subagents decides");
+});

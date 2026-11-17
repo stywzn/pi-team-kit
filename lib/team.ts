@@ -29,6 +29,8 @@ export interface TeamPlan {
   plannerAgent?: string;
   maxTasks?: number;
   models?: { planner?: string; worker?: string; verifier?: string };
+  /** Deadline for each planner, worker and verifier run; pi-subagents' own default is 30 minutes. */
+  childTimeoutMs?: number;
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -170,7 +172,9 @@ function settle(key, promise) {
   });
 }
 
-function withModel(item, role) { var m = PLAN.models && PLAN.models[role]; if (m) item.model = m; return item; }
+function withModel(item, role) { var m = PLAN.models && PLAN.models[role]; if (m) item.model = m; return bounded(item); }
+// Each child gets the configured deadline (pi-subagents would stop it after 30 minutes otherwise).
+function bounded(item) { if (PLAN.childTimeoutMs) item.timeoutMs = PLAN.childTimeoutMs; return item; }
 
 // Lane planning, same rules as planLanes() in lib/team.ts (tests check they agree).
 function norm(p) { return String(p || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""); }
@@ -273,7 +277,7 @@ function noteRound(lane, entry) {
 }
 
 function resumeItem(writer, label, task) {
-  return { resume: writer.runId, label: label, task: task, acceptance: RESUME_ACCEPTANCE };
+  return bounded({ resume: writer.runId, label: label, task: task, acceptance: RESUME_ACCEPTANCE });
 }
 
 function afterWrite(lane, writer, round) {

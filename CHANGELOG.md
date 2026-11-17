@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.2] - 2026-11-18
+
+- Each planner, worker and verifier run in a team run gets `team.childTimeoutMin` (default 44 minutes). pi-subagents stops a child after 30 minutes by default, too short for a worker running a slow UI suite. The whole run's default deadline `team.runTimeoutMin` goes from 60 to 120 minutes, so a 44-minute worker still has time for a rework round.
+- Direct `subagent` calls (outside team runs) follow pi-subagents' own setting: `"timeoutMs": 2640000` in `~/.pi/agent/extensions/subagent/config.json` for 44 minutes.
+- Verified: test/e2e/rework.sh passes with the deadline on every child, including resumed rework rounds (and from a session inside the repo, after 0.6.1).
+
 ## [0.6.1] - 2026-11-18
 
 - Team runs work when pi was started outside the project (the home folder on a company machine): `team_run` and `team_integrate` take `repo`, and `team_integrate` defaults to the repo of the last run. Before, `team_run` refused, and a lead fell back to plain subagents sharing one working tree, without worktrees or lane planning (seen in real use).

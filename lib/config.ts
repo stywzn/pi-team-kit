@@ -86,8 +86,11 @@ export interface PtkConfig {
     /** Shell command that must pass in every worker's worktree. Auto-detected when empty. */
     gate: string;
     gateTimeoutSec: number;
-    /** Deadline for one whole team run. */
+    /** Deadline for one whole team run (planning, every lane and its rework rounds). */
     runTimeoutMin: number;
+    /** Deadline for each planner, worker and verifier run. pi-subagents stops a child after 30 minutes by default,
+     *  too short for a worker running a slow suite (UI tests). */
+    childTimeoutMin: number;
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -149,7 +152,8 @@ export const DEFAULTS: PtkConfig = {
     maxRounds: 3,
     gate: "",
     gateTimeoutSec: 900,
-    runTimeoutMin: 60,
+    runTimeoutMin: 120,
+    childTimeoutMin: 44,
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -282,6 +286,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.maxParallel = clamp(Math.round(config.team.maxParallel), 1, 8);
   config.team.maxTasks = clamp(Math.round(config.team.maxTasks), 1, 12);
   config.team.maxRounds = clamp(Math.round(config.team.maxRounds), 1, 10);
+  config.team.childTimeoutMin = clamp(Math.round(config.team.childTimeoutMin), 5, 1440);
+  config.team.runTimeoutMin = clamp(Math.round(config.team.runTimeoutMin), config.team.childTimeoutMin, 2880);
   return { config, files, warnings };
 }
 

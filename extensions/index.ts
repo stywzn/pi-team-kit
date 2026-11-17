@@ -614,7 +614,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
           "",
           `Gate: ${gate || "(none: verifier only)"}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
-          `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min. It runs unattended after you confirm.`,
+          `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min (${t.childTimeoutMin} min per worker run). It runs unattended after you confirm.`,
         ].join("\n");
         const ok = await ctx.ui.confirm("Start this team run?", summary);
         if (!ok) throw new Error("The user did not confirm the brief. Ask what to change, update the brief, then call team_run again.");
@@ -630,6 +630,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         plannerAgent: t.plannerAgent,
         maxTasks: t.maxTasks,
         models: t.models,
+        childTimeoutMs: t.childTimeoutMin * 60_000,
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),

@@ -83,6 +83,7 @@ cd ~/code/ptk-demo && pi
 | 某一路 needs-human | 主会话会总结审查员的意见并给建议，你拍板就行 |
 | 同样的坑踩了两次 | `/skill:retro`：把教训变成检查、坑或保存的事实，而不是写进文档 |
 | 确认框里发现简报不对 | 选 No，主会话会问你要改什么，改完再确认 |
+| worker 跑到一半被停（超时） | team 里每个子 agent 默认 44 分钟（`team.childTimeoutMin`），整次运行 120 分钟（`team.runTimeoutMin`）。直接用 subagent 时，在 `~/.pi/agent/extensions/subagent/config.json` 里写 `{ "timeoutMs": 2640000 }`（Windows 是 `%USERPROFILE%\.pi\agent\extensions\subagent\config.json`） |
 | 命令被拦了 | 看拦截原因，它会告诉你正确做法（比如改用 `bg`） |
 
 ## 7. 换会话接着干、上下文怎么管
