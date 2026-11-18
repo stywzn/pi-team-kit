@@ -1,0 +1,6 @@
+{
+  "name": "md2docx",
+  "description": "Convert Markdown to a Word .docx (headings, lists, tables, code, quotes, links, local images, Chinese fonts). Needs no Word, pandoc or Python.",
+  "usage": "md2docx <input.md> [output.docx]",
+  "run": ["node", "run.mjs"]
+}

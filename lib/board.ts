@@ -32,13 +32,15 @@ export interface ChangedFile {
 
 export interface LeadCard {
   name: string;
-  /** host:pid of the pi process that owns the card. */
+  /** host:pid:instance of the session that owns the card (one process can host many sessions). */
   owner: string;
   cwd: string;
   /** Key of the repository's git dir: equal for every checkout and worktree of one repo. */
   repo?: string;
   /** pi session name, when set. */
   title?: string;
+  /** The session file: one conversation open in a terminal and in a browser gives two cards with one file. */
+  session?: string;
   status: string;
   working: boolean;
   files: ChangedFile[];
@@ -109,7 +111,7 @@ export function readCard(dir: string, name: string): LeadCard | undefined {
     const c = JSON.parse(readFileSync(cardFile(dir, name), "utf8")) as LeadCard;
     if (!c || c.name !== name || !str(c.owner) || !str(c.cwd) || !str(c.status) || !str(c.updatedAt) || !str(c.startedAt)) return undefined;
     const files = Array.isArray(c.files) ? c.files.filter((f) => f && str(f.path) && str(f.at)).slice(-MAX_FILES) : [];
-    return { ...c, working: c.working === true, files, repo: str(c.repo) ? c.repo : undefined, title: str(c.title) ? c.title : undefined };
+    return { ...c, working: c.working === true, files, repo: str(c.repo) ? c.repo : undefined, title: str(c.title) ? c.title : undefined, session: str(c.session) ? c.session : undefined };
   } catch {
     return undefined;
   }
@@ -292,6 +294,57 @@ export function recordFile(files: ChangedFile[], rel: string, now = Date.now(), 
   const key = fileKey(path);
   const kept = files.filter((f) => fileKey(f.path) !== key || f.repo !== repo);
   return [...kept, { path, at: new Date(now).toISOString(), ...(repo ? { repo } : {}) }].slice(-MAX_FILES);
+}
+
+/** Past this many changed or untracked files a repo is not snapshotted around shell commands. */
+export const MAX_SNAPSHOT = 1000;
+
+/** A file's size and mtime, or "gone". */
+export function fileState(root: string, rel: string): string {
+  try {
+    const s = statSync(join(root, rel));
+    return `${s.size}:${s.mtimeMs}`;
+  } catch {
+    return "gone";
+  }
+}
+
+/**
+ * The files `git status --porcelain -z --untracked-files=all` lists, each with its size and mtime, so a file
+ * already dirty that a command changes again is seen too. Undefined when the repo has too many to compare.
+ */
+export function statusSnapshot(root: string, porcelainZ: string, max = MAX_SNAPSHOT): Map<string, string> | undefined {
+  const parts = porcelainZ.split("\0");
+  const snap = new Map<string, string>();
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (entry.length < 4) continue;
+    const names = [entry.slice(3)];
+    if (/[RC]/.test(entry.slice(0, 2))) names.push(parts[++i] ?? ""); // a rename or copy: the old name follows
+    for (const rel of names) {
+      if (!rel || rel.startsWith(".pi/subagents/")) continue;
+      if (snap.size >= max) return undefined;
+      snap.set(rel, fileState(root, rel));
+    }
+  }
+  return snap;
+}
+
+/**
+ * Files a command changed: newly listed, changed again, or off the list with other content now (a revert).
+ * A file that left the list unchanged was committed, not changed.
+ */
+export function changedBetween(before: Map<string, string>, after: Map<string, string>, stateNow: (rel: string) => string): string[] {
+  const out = [...after].filter(([f, s]) => before.get(f) !== s).map(([f]) => f);
+  for (const [f, s] of before) if (!after.has(f) && stateNow(f) !== s) out.push(f);
+  return out;
+}
+
+/** Where a shell command may change files: its path-like words (absolute, ~, ./, ../, C:\) and cd targets. */
+export function pathsInCommand(command: string): string[] {
+  const words = command.split(/[\s;&|()<>"'`=,]+/).filter((w) => /^(\/|~[\\/]|\.\.?[\\/]|[A-Za-z]:[\\/])/.test(w));
+  const cds = [...command.matchAll(/(?:^|[\s;&|(])(?:cd|pushd|Set-Location)\s+["']?([^\s;&|"')]+)/gi)].map((m) => m[1]);
+  return [...new Set([...words, ...cds])].slice(0, 20);
 }
 
 /** Other running leads that changed this file of this repo within OVERLAP_MS, wherever their sessions started. */

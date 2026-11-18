@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0] - 2026-11-18
+
+pi in the browser, alongside the terminal.
+
+- `ptk web` starts [pi-web](https://github.com/agegr/pi-web) (pinned to 0.17.0, which runs the same pi 1.5.2 SDK): pasting images, a session list, file and diff previews. It refuses to listen beyond this machine without `PI_WEB_PASSWORD`, and needs Node.js 22.19+.
+- One process can host many sessions (pi-web runs all of them in its server): each session is now its own lead on the board, with its own owner id, so none takes another's name or mail. A session the host disposes without `session_shutdown` leaves the board within seconds instead of being kept alive by its timer.
+- The same conversation open in two places (terminal and browser, or two terminals) is flagged in both: each keeps its own copy and both append to the same session file. Cards carry the session file.
+- Files changed by shell commands (`sed -i`, scripts, PowerShell) count for the board's conflict check: while another lead is online, a lead's shell call is bracketed by `git status` in the repos it may touch. A shell command cannot be held back beforehand, so a file another lead changed recently gets a note in the result to tell that lead.
+- A lead with a team run still going is kept open by pi-web's liveness registry; pi-web otherwise closes sessions idle for 10 minutes and the result would come back to nobody.
+- Terminal title and desktop notifications only in the terminal UI; `/continue` fills the input box in the terminal and in pi-web.
+- Toolbox `md2docx`: Markdown to Word with headings, lists, tables, code, quotes, links, local images and Chinese fonts; no Word, pandoc or Python (checked by opening the result in Word).
+- File paths in a lead's reply become links: Ctrl+click in the terminal opens the file with its default app (from WSL, through `\\wsl.localhost`); in pi-web a click downloads it.
+- The confirm dialog keeps its lines apart in pi-web, which renders it as markdown.
+- From an independent review: board snapshots use `git --no-optional-locks` (never block another lead's commit) with fsmonitor off; only repos another running lead works in are watched; a file another lead changed during the command, or one a commit took off the list, is not counted; renames record both names; a malformed card cannot crash the host process; pi-web liveness leases are released when a session is disposed; `ptk web` passes only plain words to cmd.exe.
+
 ## [0.7.1] - 2026-11-18
 
 Review and hardening of 0.7.0.

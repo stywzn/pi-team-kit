@@ -10,6 +10,7 @@
 //   ptk leads [n]               lead sessions running on this machine, their status and the last n messages
 //   ptk playbooks [check [dir]] list playbooks; check = enforce the length limits (for a team playbook repo's CI)
 //   ptk feedback [days] [--repo name]  where the tooling cost time (from pi's session files), to hand to an agent
+//   ptk web [-p port] [-H host] pi in the browser (pi-web): images, session list; the terminal keeps working
 
 import { spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -26,6 +27,7 @@ import { detectEnv, formatEnv, realProbe, which } from "../lib/env.ts";
 import { buildTeamScript, planLanes, roleModels, validateTasks, type TeamTask } from "../lib/team.ts";
 import { discoverTools, formatToolList, toolArgv } from "../lib/toolbox.ts";
 import { modelCaps } from "../lib/session.ts";
+import { webCommand } from "../lib/web.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cwd = process.cwd();
@@ -248,7 +250,19 @@ switch (cmd) {
     console.log(formatFriction(signals, { days, sessions }));
     break;
   }
+  case "web": {
+    const w = webCommand(rest, process.env);
+    if (w.error !== undefined) {
+      console.error(w.error);
+      process.exit(2);
+    }
+    console.log(`Starting pi-web ${w.argv[1].split("@").pop()} (first start downloads it). Terminal pi keeps working alongside; Ctrl+C stops the web UI.`);
+    // npx is a .cmd on Windows, which Node starts only through the shell; webCommand allows plain words only
+    const r = process.platform === "win32" ? spawnSync(`npx ${w.argv.join(" ")}`, { stdio: "inherit", shell: true }) : spawnSync("npx", w.argv, { stdio: "inherit" });
+    if (r.error) console.error(`Could not start npx (${r.error.message}). Is Node.js with npm on PATH?`);
+    process.exit(r.status ?? 1);
+  }
   default:
-    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n] | playbooks [check [dir]] | feedback [days] [--repo name]");
+    console.log("usage: ptk doctor [--strict] [--fix] | env | tools | run <name> [args...] | facts [share] | caps [--apply] | demo [dir] | plan <tasks.json> [--script] | leads [n] | playbooks [check [dir]] | feedback [days] [--repo name] | web [pi-web options]");
     process.exit(cmd ? 2 : 0);
 }

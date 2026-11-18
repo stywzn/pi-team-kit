@@ -135,6 +135,25 @@ cd ~/code/ptk-demo && pi
 
 - api 改完用 `leads` 工具发消息给 web。要求对方跟着改时带 `update=true`：web 正在跑就在下一步之前收到（不打断），空闲就被叫醒，去改自己的代码、文档、状态，再回 api 一句。
 - 防止来回没完：被消息叫醒的会话再发消息，只能把对方叫醒一次（A→B→A 之后就不再叫醒，消息留着等下一轮看）。
-- 防止改冲突：同一个仓库（包括它的 worktree）里，A 要改 B 最近 30 分钟改过的文件，会先被拦下，提示先告诉 B；告诉之后放行。只认 pi 的 edit/write 工具改的文件，用 bash 命令改的看不到。
+- 防止改冲突：同一个仓库（包括它的 worktree）里，A 要改 B 最近 30 分钟改过的文件，会先被拦下，提示先告诉 B；告诉之后放行。用 shell 命令（`sed -i`、脚本、PowerShell）改的文件也算：有别的主会话在线时，命令前后各看一次 `git status`；命令没法事先拦，所以是在结果里提示"先告诉 B"。
 - `/leads`（pi 里）或 `ptk leads`（shell 里，SSH 远程也能看）看谁在线、各自在做什么、最近的消息；`/leads name <名字>` 改名。对方不在线时消息会留着，下一个用这个名字的会话（通常是同一个仓库里 `/continue` 接手的那个）打开时就收到。
 - 关掉：`~/.pi/agent/ptk.json` 里 `"leads": { "enabled": false }`；只想通知、不想叫醒对方：`"wake": false`。
+
+## 9. 在浏览器里用
+
+```bash
+node ~/.pi/agent/git/github.com/stywzn/pi-team-kit/bin/ptk.ts web
+```
+
+第一次会下载 [pi-web](https://github.com/agegr/pi-web)（固定用测过的版本），然后自动打开 `http://127.0.0.1:30141`。要 Node.js 22.19 以上。图片直接粘贴或拖进输入框（deepseek-flash 能看图，v4-pro 不能）；左边是按项目分组的会话，能接着聊、改名、分叉。
+
+和终端一起用：
+
+- 是同一个 pi：配置、模型、会话文件、本包都共用，终端开的会话浏览器里能看到，反过来也一样。
+- 同一个对话别两边同时聊：两边各有一份，互相看不到对方新说的，还会写进同一个会话文件。两边都开着时两边都会提醒，留一边就行。
+- 每个浏览器会话都是一个主会话，和终端的一起出现在 `/leads` 里，改同一个文件照样先拦下。
+- pi-web 会关掉闲置 10 分钟的会话；团队运行还没跑完的会话不会被关（`PI_WEB_IDLE_TIMEOUT_MS` 可以改这个时间）。
+- 从别的电脑访问：`PI_WEB_PASSWORD=<长随机密码> ptk web -H 0.0.0.0`，只在可信的内网或 VPN 里用。没设密码时 `ptk web` 拒绝监听本机以外的地址。Windows PowerShell 里先 `$env:PI_WEB_PASSWORD = "..."`。
+- 端口被占：`ptk web -p 8080`。停止：在那个窗口按 Ctrl+C。
+
+回复里提到的文件（md、docx、pdf、html、图片等）会变成链接：终端里 Ctrl+点击用默认程序打开（WSL 里打开的是 Windows 那边看到的同一个文件），浏览器里点击下载，也可以在左下文件栏预览。tmux 里要先让它转发链接：`set -as terminal-features ',*:hyperlinks'`，否则链接地址显示在括号里。

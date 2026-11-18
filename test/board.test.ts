@@ -1,7 +1,7 @@
 // Lead board: lead sessions see each other, pass messages, and do not change the same file unannounced.
 // (A test for leads started outside the repo is at the end of this file.)
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,8 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import {
   ackInbox,
+  changedBetween,
+  fileState,
   claimName,
   fileKey,
   formatBoard,
@@ -19,6 +21,7 @@ import {
   MAX_TEXT,
   MAX_UNREAD,
   overlaps,
+  pathsInCommand,
   peersSection,
   readCard,
   readCards,
@@ -30,6 +33,7 @@ import {
   shouldWake,
   slugName,
   STALE_MS,
+  statusSnapshot,
   takeInbox,
   validName,
   writeCard,
@@ -253,4 +257,45 @@ test("a lead started in its home folder: files carry their own repo, so conflict
   assert.deepEqual(overlaps(cards, "me", repo, "tests/test_cart.py", now).map((c) => c.name), ["hostapp-test"], "older cards without a per-file repo still count");
   assert.deepEqual(overlaps(cards, "me", "/d/dev/other/.git", "tests/test_login.py", now), [], "the same path in another repo is no conflict");
   assert.equal(recordFile(recordFile([], "README.md", T0, "/a/.git"), "README.md", T0, "/b/.git").length, 2, "the same path in two repos is two files");
+});
+
+test("files changed by a shell command: git status before and after, also a file that was dirty already", () => {
+  const repo = mkdtempSync(join(tmpdir(), "ptk-shell-"));
+  const git = (...a: string[]) => spawnSync("git", ["-C", repo, ...a], { encoding: "utf8" });
+  const status = () => statusSnapshot(repo, git("status", "--porcelain", "-z", "--untracked-files=all").stdout)!;
+  git("init", "-q");
+  for (const f of ["a.js", "b.js", "c.js", "old name.js"]) writeFileSync(join(repo, f), `${f}\n`);
+  git("add", ".");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+  writeFileSync(join(repo, "b.js"), "dirty before\n");
+  writeFileSync(join(repo, "c.js"), "dirty, then reverted\n");
+  mkdirSync(join(repo, ".pi", "subagents"), { recursive: true });
+  writeFileSync(join(repo, ".pi", "subagents", "run.json"), "{}");
+  const before = status();
+  assert.ok(!before.has(".pi/subagents/run.json"), "pi-subagents' own files are not the lead's changes");
+  writeFileSync(join(repo, "a.js"), "changed\n");
+  writeFileSync(join(repo, "b.js"), "dirty before, changed again!\n");
+  git("checkout", "--", "c.js");
+  mkdirSync(join(repo, "new dir"));
+  writeFileSync(join(repo, "new dir", "n.js"), "new\n");
+  git("mv", "old name.js", "renamed.js");
+  const now = (rel: string) => fileState(repo, rel);
+  assert.deepEqual(changedBetween(before, status(), now).sort(), ["a.js", "b.js", "c.js", "new dir/n.js", "old name.js", "renamed.js"], "a rename records both names");
+  assert.deepEqual(changedBetween(status(), status(), now), [], "nothing changed, nothing reported");
+  // A commit takes files off the list without changing them: not a change.
+  const dirty = status();
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "more");
+  assert.deepEqual(changedBetween(dirty, status(), now).filter((f) => f !== "new dir/n.js"), [], "a commit is not a change");
+  // A rename git shows only in the worktree column (" R new\0old"), after git add -N.
+  const wt = statusSnapshot(repo, " R src/new name.js\0src/old name.js\0?? x.js\0")!;
+  assert.deepEqual([...wt.keys()], ["src/new name.js", "src/old name.js", "x.js"]);
+  assert.equal(statusSnapshot(repo, Array.from({ length: 1001 }, (_, i) => `?? f${i}`).join("\0")), undefined, "too many files: not compared");
+});
+
+test("where a shell command may change files: paths and cd targets", () => {
+  assert.deepEqual(pathsInCommand(`cd /home/u/web && sed -i 's|a|b|' src/x.js`), ["/home/u/web"]);
+  assert.deepEqual(pathsInCommand(`cd web; sed -i s/a/b/ ./src/x.js > ~/out.txt`).sort(), ["./src/x.js", "web", "~/out.txt"].sort());
+  assert.deepEqual(pathsInCommand(String.raw`Set-Location D:\dev\app; (Get-Content "C:/x/y.txt") | Set-Content ..\z.txt`).sort(), [String.raw`..\z.txt`, "C:/x/y.txt", String.raw`D:\dev\app`].sort());
+  assert.deepEqual(pathsInCommand("npm test"), []);
+  assert.ok(pathsInCommand(Array.from({ length: 50 }, (_, i) => `/p${i}`).join(" ")).length <= 20, "capped");
 });

@@ -8,7 +8,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,7 @@ import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions
 import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
+import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
 import {
   appendRetired,
   applyChanges,
@@ -40,6 +41,9 @@ import {
 } from "../lib/playbook.ts";
 import {
   ackInbox,
+  changedBetween,
+  fileKey,
+  fileState,
   claimName,
   formatBoard,
   formatIncoming,
@@ -48,6 +52,7 @@ import {
   MAX_WAKE_HOPS,
   OVERLAP_MS,
   overlaps,
+  pathsInCommand,
   peersSection,
   readCard,
   readCards,
@@ -57,6 +62,7 @@ import {
   removeCard,
   sendMessage,
   shouldWake,
+  statusSnapshot,
   slugName,
   validName,
   writeCard,
@@ -75,8 +81,6 @@ import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** customType of messages from other leads, so a run they start can be told apart from one a person started. */
 const BOARD_MESSAGE = "ptk-lead-message";
-/** globalThis key of the one session per process that sits on the lead board. */
-const BOARD_SEAT = Symbol.for("pi-team-kit.board-seat");
 /** The team agents' own thinking levels (agents/*.md), shown when nothing overrides them. */
 const AGENT_THINKING = { planner: "max", worker: "high", verifier: "max" } as const;
 type TeamRole = keyof typeof AGENT_THINKING;
@@ -352,6 +356,25 @@ export default function piTeamKit(pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
   });
 
+  // File paths in a lead's reply become links (lib/link.ts): Ctrl+click in the terminal opens the file with its
+  // default app (Word, a PDF viewer); in pi-web a click downloads it.
+  pi.on("message_end", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD || role !== "lead") return;
+    const toUrl = piWebLiveness() ? piWebUrl : ctx.mode === "tui" ? (abs: string) => fileUrl(abs) : undefined;
+    const msg = event.message as { role?: string; content?: unknown };
+    if (!toUrl || msg.role !== "assistant" || !Array.isArray(msg.content)) return;
+    const bases = [ctx.cwd, lastTeamRepo].filter((b): b is string => Boolean(b));
+    let changed = false;
+    const content = msg.content.map((p: { type?: string; text?: string }) => {
+      if (p?.type !== "text" || !p.text) return p;
+      const text = linkFilePaths(p.text, toUrl, bases, homedir());
+      if (text === p.text) return p;
+      changed = true;
+      return { ...p, text };
+    });
+    return changed ? { message: { ...event.message, content } as typeof event.message } : undefined;
+  });
+
   pi.on("message_end", async (event, ctx) => {
     const c = state.config.plainTalk;
     if (!c.enabled || !c.acronymCheck) return;
@@ -545,6 +568,43 @@ export default function piTeamKit(pi: ExtensionAPI) {
   let lastTeamRepo: string | undefined;
   const workRepo = (cwd: string) => findRepoRoot(cwd) ?? lastTeamRepo;
 
+  // pi-web closes a session idle for 10 minutes. A lead whose team run is still going in the background must
+  // stay open to get the result: pi-web's liveness registry (absent anywhere else, then nothing happens).
+  let teamRunUntil = 0;
+  let releaseLiveness = () => {};
+  type Liveness = { version?: number; register?: (p: { name: string; sessionId: string; sessionFile?: string; isActive: () => boolean }) => () => void };
+  const piWebLiveness = () => (globalThis as Record<symbol, Liveness | undefined>)[Symbol.for("@agegr/pi-web/session-liveness/v1")];
+  pi.on("session_start", async (_event, ctx) => {
+    releaseLiveness();
+    releaseLiveness = () => {};
+    const reg = piWebLiveness();
+    if (reg?.version !== 1 || typeof reg.register !== "function" || process.env.PI_SUBAGENT_CHILD) return;
+    try {
+      let release = () => {};
+      release = reg.register({
+        name: "pi-team-kit",
+        sessionId: ctx.sessionManager.getSessionId(),
+        sessionFile: ctx.sessionManager.getSessionFile() || undefined,
+        isActive: () => {
+          try {
+            ctx.isIdle(); // throws once the host disposed the session, also without session_shutdown
+          } catch {
+            queueMicrotask(() => typeof release === "function" && release());
+            return false;
+          }
+          return Date.now() < teamRunUntil;
+        },
+      });
+      if (typeof release === "function") releaseLiveness = release;
+    } catch {
+      /* an older or changed registry: pi-web's own idle rule applies */
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    releaseLiveness();
+    releaseLiveness = () => {};
+  });
+
   // Thinking per role for this session only, said in the conversation: over ptk.json, over the agents' defaults.
   // Kept as a session entry, so it survives /reload and /resume of this session but no other session sees it.
   let sessionThinking: Partial<Record<TeamRole, string>> = {};
@@ -724,7 +784,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (t.confirm && ctx.hasUI) {
         const summary = [
           `Repository: ${root}`,
-          briefText,
+          ...briefText.split("\n"),
           ...(pb ? [`Playbook: ${pb.name} (${pb.uses} earlier use(s))`] : []),
           ...(params.digests?.length ? [`Reader digests: ${params.digests.join(", ")}`] : []),
           "",
@@ -732,7 +792,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
           `Models: ${modelText}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
           `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min (${t.childTimeoutMin} min per worker run). It runs unattended after you confirm.`,
-        ].join("\n");
+        ].join(piWebLiveness() ? "\n\n" : "\n"); // pi-web renders the dialog as markdown, where one newline is a space
         const ok = await ctx.ui.confirm("Start this team run?", summary);
         if (!ok) throw new Error("The user did not confirm the brief. Ask what to change, update the brief, then call team_run again.");
       }
@@ -757,6 +817,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         options: { timeoutMs: t.runTimeoutMin * 60_000 },
       });
       lastTeamRepo = root;
+      teamRunUntil = Date.now() + (t.runTimeoutMin + 10) * 60_000;
       saveLead(root, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}) } }, ctx.sessionManager.getSessionFile());
       const elsewhere = root !== findRepoRoot(ctx.cwd) ? `Repository: ${root} (this session runs elsewhere; team_integrate uses it too).\n` : "";
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
@@ -793,6 +854,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session runs in another folder (default: the repo of the last team_run)" })),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
+      teamRunUntil = 0; // the run is back; a browser host may close this session when idle again
       const root = repoFor(ctx.cwd, params.repo);
       const dirty = await dirtyFiles(root);
       if (dirty.length) throw new Error(`The checkout has uncommitted changes; commit or stash them first so patches apply cleanly:\n${dirty.slice(0, 20).join("\n")}`);
@@ -905,8 +967,11 @@ export default function piTeamKit(pi: ExtensionAPI) {
   // ---------- terminal: title with session name and directory, notification when a long run ends ----------
 
   let runStarted = 0;
+  // Terminal only: in a browser host (pi-web runs sessions in RPC mode) the escape sequences would end up in
+  // the server's log, and the host has its own titles and notifications.
+  const inTerminal = (ctx: ExtensionContext) => ctx.hasUI && ctx.mode === "tui";
   const setTitle = (ctx: ExtensionContext, working: boolean) => {
-    if (state.config.terminal.title && ctx.hasUI) ctx.ui.setTitle(terminalTitle(pi.getSessionName(), basename(state.cwd), working));
+    if (state.config.terminal.title && inTerminal(ctx)) ctx.ui.setTitle(terminalTitle(pi.getSessionName(), basename(state.cwd), working));
   };
 
   pi.on("session_start", async (_event, ctx) => setTitle(ctx, false));
@@ -921,13 +986,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
-    if (!ctx.hasUI) return;
+    if (!inTerminal(ctx)) return;
     runStarted = Date.now();
     setTitle(ctx, true);
   });
 
   pi.on("agent_settled", async (event, ctx) => {
-    if (!ctx.hasUI || !runStarted) return;
+    if (!inTerminal(ctx) || !runStarted) return;
     const secs = (Date.now() - runStarted) / 1000;
     runStarted = 0;
     setTitle(ctx, false);
@@ -1049,7 +1114,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (!s) return ctx.ui.notify(`No earlier lead session recorded for ${lf ? lf.root : `${where} (not a git repository; name the project: /continue <repo path>)`}.`, "info");
       lastTeamRepo = lf.root;
       const message = continuationMessage(s);
-      if (ctx.mode === "tui") {
+      // Terminal or pi-web: let the person read it before sending. Other clients may ignore the editor text.
+      if (ctx.mode === "tui" || (ctx.hasUI && piWebLiveness())) {
         ctx.ui.setEditorText(message);
         ctx.ui.notify("Takeover message is in the editor: review it and press Enter.", "info");
       } else pi.sendUserMessage(message);
@@ -1304,10 +1370,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
   const lb = {
     dir: join(globalDataDir(), "board"),
     name: "",
-    owner: `${hostname()}:${process.pid}`,
+    // host:pid:instance — one process can host many sessions (pi-web), each its own lead
+    owner: `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`,
     startedAt: new Date().toISOString(),
     root: undefined as string | undefined,
     repo: undefined as string | undefined,
+    /** Repos this lead changed files in: where its shell commands are watched (see SHELL_TOOLS). */
+    roots: new Set<string>(),
     status: "",
     files: [] as ChangedFile[],
     busy: false,
@@ -1321,6 +1390,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
     ctx: undefined as ExtensionContext | undefined,
   };
   const boardOn = () => state.config.leads.enabled && !isChildProcess;
+  const sessionFile = () => {
+    try {
+      return lb.ctx?.sessionManager.getSessionFile();
+    } catch {
+      return undefined;
+    }
+  };
   const liveCards = (): LeadCard[] => {
     try {
       return readCards(lb.dir);
@@ -1333,6 +1409,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     cwd: state.cwd,
     repo: lb.repo,
     title: pi.getSessionName() || undefined,
+    session: sessionFile(),
     status: lb.status,
     working: lb.busy,
     files: lb.files,
@@ -1447,6 +1524,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const abs = resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir()));
     const root = findRepoRoot(dirname(abs));
     if (!root) return undefined;
+    lb.roots.add(root);
     const rel = relative(root, abs);
     return rel && !rel.startsWith("..") && !isAbsolute(rel) ? { rel: rel.replace(/\\/g, "/"), repo: repoKey(root) } : undefined;
   };
@@ -1454,13 +1532,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     lb.ctx = ctx;
     if (!boardOn()) return;
-    // One board seat per process. pi-subagents 0.88 runs foreground (async: false) subagents as sessions inside
-    // the lead's own process without PI_SUBAGENT_CHILD; today it loads no ambient extensions into them (checked:
-    // only its async runner does), but any in-process session that did load this one must not take the lead's
-    // name and mail. The lead's session starts first and holds the seat until it shuts down (/new, /reload, exit).
-    const seat = globalThis as unknown as Record<symbol, object | undefined>;
-    if (seat[BOARD_SEAT] && seat[BOARD_SEAT] !== lb) return;
-    seat[BOARD_SEAT] = lb;
+    // Every session is its own lead, also when one process hosts many (pi-web runs all its sessions in its
+    // server process): each extension instance has its own owner id, so no session can take another's name
+    // or mail. (pi-subagents' in-process foreground subagents load no ambient extensions, checked in 0.88.)
     lb.root = findRepoRoot(ctx.cwd);
     lb.repo = lb.root ? pathKey(gitCommonDir(lb.root)) : undefined;
     if (!lb.name) {
@@ -1471,18 +1545,56 @@ export default function piTeamKit(pi: ExtensionAPI) {
         return; // read-only home or similar: run without the board
       }
     } else beat();
+    twinsWarned.clear();
+    warnTwins();
     if (!lb.timer) {
+      let ticks = 0;
       lb.timer = setInterval(() => {
-        void deliverMail();
-        if (Date.now() - lb.lastBeat > 30_000) beat();
+        // A host that disposes a session without session_shutdown (one server process, many sessions) must
+        // not leave this timer heartbeating a card for a session that is gone.
+        try {
+          if (!ctxAlive()) return leaveBoard();
+          void deliverMail();
+          if (Date.now() - lb.lastBeat > 30_000) beat();
+          if (++ticks % 5 === 0) warnTwins();
+        } catch {
+          /* never let a bad card or file take down the process (pi-web hosts every session in it) */
+        }
       }, 2_000);
       lb.timer.unref?.();
     }
   });
 
-  pi.on("session_shutdown", async () => {
-    const seat = globalThis as unknown as Record<symbol, object | undefined>;
-    if (seat[BOARD_SEAT] === lb) delete seat[BOARD_SEAT];
+  // One conversation open in two places (a terminal and the browser, or two terminals): each keeps its own
+  // copy and both append to the same session file. Said on both sides, once per other window.
+  const twinsWarned = new Set<string>();
+  const warnTwins = () => {
+    const mine = sessionFile();
+    if (!mine || !lb.name) return;
+    for (const c of liveCards()) {
+      if (c.owner === lb.owner || !c.session || pathKey(c.session) !== pathKey(mine) || twinsWarned.has(c.owner)) continue;
+      twinsWarned.add(c.owner);
+      try {
+        lb.ctx?.ui.notify(
+          `This conversation is also open in another window (lead ${c.name}, ${c.working ? "working" : "idle"}). The two do not see each other's turns and both write to the same session: carry on in one and close the other, or start a new session here.`,
+          "warning",
+        );
+      } catch {
+        /* stale context */
+      }
+    }
+  };
+
+  /** False once pi has invalidated this session's context (disposed, replaced or reloaded). */
+  const ctxAlive = () => {
+    try {
+      lb.ctx?.isIdle();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const leaveBoard = () => {
     if (lb.timer) clearInterval(lb.timer);
     lb.timer = undefined;
     if (lb.name) {
@@ -1493,7 +1605,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
     }
     lb.name = "";
-  });
+  };
+
+  pi.on("session_shutdown", async () => leaveBoard());
 
   pi.on("agent_start", async () => {
     lb.busy = true;
@@ -1530,6 +1644,89 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (!target) return;
     lb.files = recordFile(lb.files, target.rel, Date.now(), target.repo);
     beat();
+  });
+
+  // Shell commands change files too (sed -i, scripts, PowerShell Set-Content). A lead's shell call is bracketed
+  // by git status in the repos it may touch that another running lead works in too: what changed is recorded
+  // like an edit. A shell command cannot be held back beforehand, so a file another lead changed recently gets
+  // a note in the result instead.
+  const SHELL_TOOLS = new Set(["bash", "powershell"]);
+  type Snaps = { started: number; roots: Map<string, Map<string, string>> };
+  const shellSnaps = new Map<string, Snaps>();
+  /** Repos too big or too slow to snapshot: not tried again in this session. */
+  const skipRoots = new Set<string>();
+  const snapshotAll = async (roots: string[]): Promise<Snaps["roots"]> => {
+    const out: Snaps["roots"] = new Map();
+    await Promise.all(
+      roots.map(async (root) => {
+        // No optional locks: a status here must never make another lead's git commit fail on index.lock.
+        // No fsmonitor: a repo's own config must not start a program because a command named the repo.
+        const r = await pi.exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain", "-z", "--untracked-files=all"], { cwd: root, timeout: 5_000 }).catch(() => undefined);
+        const snap = r?.code === 0 ? statusSnapshot(root, r.stdout) : undefined;
+        if (snap) out.set(root, snap);
+        else skipRoots.add(root);
+      }),
+    );
+    return out;
+  };
+  const shellRoots = (command: string, others: LeadCard[]): string[] => {
+    const shared = new Set(others.flatMap((c) => [c.repo, ...c.files.map((f) => f.repo ?? c.repo)]).filter(Boolean));
+    const named: string[] = [];
+    for (const p of pathsInCommand(command)) {
+      const abs = resolve(state.cwd, p.replace(/^~(?=$|[\\/])/, homedir()));
+      let dir = abs;
+      try {
+        if (!statSync(abs).isDirectory()) dir = dirname(abs);
+      } catch {
+        dir = dirname(abs);
+      }
+      const root = findRepoRoot(dir);
+      if (root) named.push(root);
+    }
+    const all = [...named, ...(lb.root ? [lb.root] : []), ...(lastTeamRepo ? [lastTeamRepo] : []), ...lb.roots];
+    return [...new Set(all)].filter((r) => !skipRoots.has(r) && pathKey(r) !== pathKey(homedir()) && shared.has(repoKey(r))).slice(0, 4);
+  };
+  pi.on("tool_call", async (event) => {
+    if (!SHELL_TOOLS.has(event.toolName)) return;
+    shellSnaps.delete(event.toolCallId);
+    if (!lb.name) return;
+    const others = liveCards().filter((c) => c.owner !== lb.owner);
+    if (!others.length) return;
+    const roots = shellRoots(String((event.input as { command?: unknown }).command ?? ""), others);
+    if (!roots.length) return;
+    if (shellSnaps.size > 20) shellSnaps.clear(); // calls another handler blocked never get a result
+    const started = Date.now();
+    shellSnaps.set(event.toolCallId, { started, roots: await snapshotAll(roots) });
+  });
+  pi.on("tool_result", async (event) => {
+    if (!SHELL_TOOLS.has(event.toolName)) return;
+    const before = shellSnaps.get(event.toolCallId);
+    if (!before) return;
+    shellSnaps.delete(event.toolCallId);
+    if (!lb.name) return;
+    const after = await snapshotAll([...before.roots.keys()]);
+    const now = Date.now();
+    const cards = liveCards();
+    const clash = new Map<string, string[]>();
+    let changed = 0;
+    for (const [root, snap] of before.roots) {
+      const later = after.get(root);
+      if (!later) continue;
+      const key = repoKey(root);
+      // Another lead in the same checkout may have changed a file while this command ran: theirs, not ours.
+      const theirs = (f: string) => cards.some((c) => c.owner !== lb.owner && c.files.some((x) => (x.repo ?? c.repo) === key && fileKey(x.path) === fileKey(f) && Date.parse(x.at) >= before.started));
+      for (const f of changedBetween(snap, later, (rel) => fileState(root, rel))) {
+        if (theirs(f)) continue;
+        changed++;
+        for (const c of overlaps(cards, lb.name, key, f, now)) if (now - (lb.told.get(c.name) ?? 0) > OVERLAP_MS) clash.set(c.name, [...(clash.get(c.name) ?? []), f]);
+        lb.files = recordFile(lb.files, f, now, key);
+      }
+    }
+    if (changed) beat();
+    if (!clash.size) return;
+    const names = [...clash.keys()].join(", ");
+    const note = `Note: this command changed ${[...clash].map(([n, fs]) => `${fs.slice(0, 5).join(", ")} (changed by lead ${n} in the last 30 minutes)`).join("; ")}. Tell ${names} now with the leads tool: what you changed and why, update=true if they must adjust.`;
+    return { content: [...event.content, { type: "text" as const, text: `\n\n${note}` }] };
   });
 
   if (!isChildProcess)
