@@ -18,6 +18,7 @@ test("pi-web download links are encoded the way pi-web encodes them", () => {
   assert.equal(piWebUrl("/home/way/x y.docx"), "/api/files/home/way/x%20y.docx?type=download");
   assert.equal(piWebUrl("D:\\dev\\报告.docx"), `/api/files/D%3A/dev/${encodeURIComponent("报告.docx")}?type=download`);
   assert.equal(piWebUrl("\\\\server\\share\\a.pdf"), "/api/files/%2F%2Fserver/share/a.pdf?type=download");
+  assert.equal(piWebUrl("/x/a).pdf"), "/api/files/x/a%29.pdf?type=download", "a parenthesis cannot end the markdown link");
 });
 
 test("paths of existing files in a reply become links; code blocks, links and missing files stay as they are", () => {
@@ -38,4 +39,7 @@ test("paths of existing files in a reply become links; code blocks, links and mi
   const t0 = performance.now();
   assert.ok(L(long).endsWith("(U</out/report.docx>)"));
   assert.ok(performance.now() - t0 < 200, "a long reply is linked fast");
+  const t1 = performance.now();
+  L("+".repeat(50_000) + " " + "~a".repeat(20_000));
+  assert.ok(performance.now() - t1 < 500, `a long run of odd characters stays linear (${Math.round(performance.now() - t1)}ms)`);
 });

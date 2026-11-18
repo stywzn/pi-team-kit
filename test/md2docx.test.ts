@@ -1,7 +1,7 @@
 // md2docx: a valid .docx (zip of XML) from Markdown, with no Word, pandoc or Python.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -41,12 +41,22 @@ test("md2docx: headings, lists, table, code, quote, link, local image, escaping;
   assert.match(parts.get("word/numbering.xml")!, /<w:startOverride w:val="3"\/>/, "an ordered list starting at 3 starts at 3");
 });
 
-test("md2docx: unsafe links stay text, missing images do not fail, control characters are dropped", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ptk-docx-"));
-  writeFileSync(join(dir, "a.md"), "[x](javascript:alert(1)) ![gone](nope.png) ![key](../../.ssh/id_rsa) bad\u0001char\n");
-  const r = spawnSync(process.execPath, [tool, join(dir, "a.md")], { encoding: "utf8" });
+test("md2docx: unsafe links stay text, missing images do not fail, characters XML cannot hold are dropped", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "ptk-docx-")), "my.dir");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "a"), "---\nname: meta\n---\n[x](javascript:alert(1)) ![gone](nope.png) ![key](../../.ssh/id_rsa) bad\u0001char ￿ \ud800 end\n");
+  const r = spawnSync(process.execPath, [tool, join(dir, "a")], { encoding: "utf8" });
   assert.equal(r.status, 0, r.stderr);
-  const parts = unzip(readFileSync(join(dir, "a.docx")));
+  const parts = unzip(readFileSync(join(dir, "a.docx"))); // no extension, folder with a dot: written next to the input
+  assert.ok(!parts.get("word/document.xml")!.includes("meta"), "front matter is not part of the document");
+  assert.ok(!/￿/.test(Buffer.from(parts.get("word/document.xml")!, "latin1").toString("utf8")), "U+FFFF is not valid XML");
+  // Truncated images become text instead of crashing; a folder is refused.
+  writeFileSync(join(dir, "t.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  writeFileSync(join(dir, "t.jpg"), Buffer.from([0xff, 0xd8, 0xff, 0xc0]));
+  writeFileSync(join(dir, "img.md"), "![a](t.png) ![b](t.jpg)\n");
+  assert.equal(spawnSync(process.execPath, [tool, join(dir, "img.md")]).status, 0, "truncated images");
+  assert.ok(unzip(readFileSync(join(dir, "img.docx"))).get("word/document.xml")!.includes("[a]"));
+  assert.equal(spawnSync(process.execPath, [tool, dir]).status, 2, "a folder is not a file");
   assert.ok(!parts.get("word/_rels/document.xml.rels")!.includes("javascript"));
   assert.ok(![...parts.keys()].some((k) => k.startsWith("word/media/")), "only existing png/jpeg/gif files are embedded");
   assert.ok(!parts.get("word/document.xml")!.includes("\u0001"));

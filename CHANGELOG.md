@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.1] - 2026-11-18
+
+Fixes found by checking 0.8.0 with real documents and odd inputs.
+
+- md2docx: a truncated or odd image no longer crashes the conversion (it stays as text); a folder as input is refused; characters XML cannot hold are dropped; YAML front matter is left out.
+- md2docx and md2pdf: a file without an extension in a folder with a dot in its name (`my.dir/README`) is written next to the input, not one folder up.
+- File links: a long run of odd characters in a reply is linked in linear time (was quadratic); a `)` in a file name no longer cuts the pi-web link short.
+- TUTORIAL: the whole-run limit is 120 minutes, not 60.
+
 ## [0.8.0] - 2026-11-18
 
 pi in the browser, alongside the terminal.

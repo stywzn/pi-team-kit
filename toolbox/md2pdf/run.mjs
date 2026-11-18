@@ -57,14 +57,15 @@ function inlineImages(html, baseDir) {
 
 const source = readFileSync(input, "utf8");
 const isHtml = /\.html?$/i.test(input);
-const title = path.basename(input).replace(/\.[^.]+$/, "");
-const bodyHtml = isHtml ? source : marked.parse(source, { gfm: true });
+const title = path.basename(input).replace(/\.[^.]+$/, "").replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"));
+const bodyHtml = isHtml ? source : marked.parse(source.replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n/, ""), { gfm: true }); // YAML front matter is metadata
 let html = isHtml && /<html[\s>]/i.test(source)
   ? source
   : `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>${STYLE}${extraCss ? readFileSync(extraCss, "utf8") : ""}</style></head><body>${bodyHtml}</body></html>`;
 html = inlineImages(html, path.dirname(path.resolve(input)));
 
-const out = path.resolve(outArg ?? input.replace(/\.[^.]+$/, htmlOnly ? ".html" : ".pdf"));
+const parsed = path.parse(path.resolve(input)); // not a regex on the path: "my.dir/README" has no extension
+const out = path.resolve(outArg ?? path.join(parsed.dir, parsed.name + (htmlOnly ? ".html" : ".pdf")));
 if (htmlOnly) {
   writeFileSync(out, html);
   console.log(`wrote ${out}`);

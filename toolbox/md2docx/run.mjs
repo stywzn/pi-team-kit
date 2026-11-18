@@ -3,7 +3,7 @@
 // Markdown -> Word without Word, pandoc or Python: headings, lists, tables, code, quotes, links, local images,
 // Chinese fonts. Parsed with marked; the .docx (a zip of XML) is written here with node:zlib.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { marked } from "marked";
@@ -13,12 +13,16 @@ if (!input || input === "-h" || input === "--help") {
   console.log("usage: md2docx <input.md> [output.docx]");
   process.exit(input ? 0 : 2);
 }
-if (!existsSync(input)) {
-  console.error(`not found: ${input}`);
+if (!existsSync(input) || !statSync(input).isFile()) {
+  console.error(`not a file: ${input}`);
   process.exit(2);
 }
 const baseDir = path.dirname(path.resolve(input));
-const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
+// Characters XML 1.0 cannot hold (control characters, U+FFFE/U+FFFF, lone surrogates) are dropped: Word refuses them.
+const esc = (s) =>
+  String(s)
+    .replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f￾￿]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "");
 const rels = []; // [id, type, target, external]
 const media = []; // [name, bytes]
 const rel = (type, target, external) => {
@@ -35,16 +39,25 @@ function text(s, rPr = "") {
     .map((line) => line.split("\t").map((part) => (part ? `<w:r>${rPr && `<w:rPr>${rPr}</w:rPr>`}<w:t xml:space="preserve">${esc(part)}</w:t></w:r>` : "")).join(`<w:r><w:tab/></w:r>`))
     .join("<w:r><w:br/></w:r>");
 }
+/** Width and height of a PNG, GIF or JPEG; undefined for a truncated or odd file (it is then left out as text). */
 function imageSize(b) {
-  if (b[0] === 0x89 && b[1] === 0x50) return [b.readUInt32BE(16), b.readUInt32BE(20)];
-  if (b[0] === 0x47 && b[1] === 0x49) return [b.readUInt16LE(6), b.readUInt16LE(8)];
-  if (b[0] === 0xff && b[1] === 0xd8)
-    for (let i = 2; i + 9 < b.length; ) {
-      const marker = b[i + 1];
-      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) return [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
-      i += 2 + b.readUInt16BE(i + 2);
-    }
-  return undefined;
+  try {
+    let size;
+    if (b[0] === 0x89 && b[1] === 0x50) size = [b.readUInt32BE(16), b.readUInt32BE(20)];
+    else if (b[0] === 0x47 && b[1] === 0x49) size = [b.readUInt16LE(6), b.readUInt16LE(8)];
+    else if (b[0] === 0xff && b[1] === 0xd8)
+      for (let i = 2; i + 9 < b.length; ) {
+        const marker = b[i + 1];
+        if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+          size = [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
+          break;
+        }
+        i += 2 + b.readUInt16BE(i + 2);
+      }
+    return size && size[0] > 0 && size[1] > 0 && size[0] < 100_000 && size[1] < 100_000 ? size : undefined;
+  } catch {
+    return undefined;
+  }
 }
 function image(tok) {
   const file = /^(https?:|data:)/.test(tok.href) ? "" : path.resolve(baseDir, decodeURI(tok.href.split(/[?#]/)[0]));
@@ -152,7 +165,8 @@ function blocks(tokens, out, pStyle) {
 
 // ---------- package ----------
 const out = [];
-blocks(marked.lexer(readFileSync(input, "utf8"), { gfm: true }), out);
+// YAML front matter (agent and skill files) is metadata, not part of the document.
+blocks(marked.lexer(readFileSync(input, "utf8").replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n/, ""), { gfm: true }), out);
 const NS = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="${R}" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"`;
 const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>${out.join("")}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1304" w:bottom="1440" w:left="1304" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
 
@@ -226,7 +240,8 @@ function zip(files) {
   return Buffer.concat([...local, ...central, end]);
 }
 
-const target = path.resolve(outArg ?? input.replace(/\.[^.]+$/, "") + ".docx");
+const parsed = path.parse(path.resolve(input));
+const target = path.resolve(outArg ?? path.join(parsed.dir, `${parsed.name}.docx`));
 writeFileSync(
   target,
   zip([

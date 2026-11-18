@@ -9,7 +9,8 @@ const EXT = "md|markdown|docx?|pdf|html?|xlsx?|csv|pptx?|txt|log|png|jpe?g|gif|s
 const ENDS = new RegExp(`\\.(?:${EXT})$`, "i");
 const PATH_CHARS = "[^\\s`'\"<>|*?()\\[\\]，。；：！？、（）]";
 const BARE = new RegExp(
-  `(?<![\\w/\\\\.:-])(?:[A-Za-z]:[\\\\/]|~/|/|\\.{1,2}/)?${PATH_CHARS}*\\.(?:${EXT})(?![\\w/\\\\])`,
+  // bounded: an unbounded run would make a long token of odd characters quadratic
+  `(?<![\\w/\\\\.:-])(?:[A-Za-z]:[\\\\/]|~/|/|\\.{1,2}/)?${PATH_CHARS}{0,260}\\.(?:${EXT})(?![\\w/\\\\])`,
   "gi",
 );
 
@@ -33,7 +34,8 @@ export function piWebUrl(abs: string): string {
   const p = /^[A-Za-z]:[\\/]/.test(abs) || abs.startsWith("\\\\") ? abs.replace(/\\/g, "/") : abs;
   const parts = p.split("/").filter(Boolean);
   if (p.startsWith("//") && parts.length) parts[0] = `//${parts[0]}`;
-  return `/api/files/${parts.map(encodeURIComponent).join("/")}?type=download`;
+  // ( and ) too: an unbalanced one would end the markdown link early
+  return `/api/files/${parts.map((s) => encodeURIComponent(s).replace(/[()]/g, (c) => (c === "(" ? "%28" : "%29"))).join("/")}?type=download`;
 }
 
 /**
