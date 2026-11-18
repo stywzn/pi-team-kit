@@ -71,7 +71,7 @@ import {
 } from "../lib/board.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
+import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, trimPassingTest, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
@@ -424,11 +424,34 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const extra = [...(info?.notes ?? [])];
     if (event.isError && looksLikeTimeout(body))
       extra.push(`Stopped after ${info?.timeout ?? "?"}s by the ptk guard. If it is a server or watcher, use toolbox bg. If it is real work, rerun with a larger timeout (max ${state.config.guard.maxTimeoutSec}s) or narrow it (one test file, one package).`);
-    if (!extra.length) return;
+    // A passing test run's whole log would ride along in every later turn: keep its summary only.
+    const trimmed = state.config.guard.trimPassingTests ? trimPassingTest(String((event.input as { command?: unknown }).command ?? ""), body, event.isError) : undefined;
+    if (!extra.length && !trimmed) return;
     return {
-      content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${extra.join("\n[ptk] ")}` }],
+      content: [...(trimmed ? [{ type: "text" as const, text: trimmed }] : (event.content ?? [])), ...(extra.length ? [{ type: "text" as const, text: `\n[ptk] ${extra.join("\n[ptk] ")}` }] : [])],
       structuredContent: event.structuredContent,
     };
+  });
+
+  // The lead's long context is usually most of the cost: team.models.lead puts every lead session on that model.
+  pi.on("session_start", async (_event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD) return;
+    const now = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+    const want = (state.config.team.models.lead ?? "").trim();
+    try {
+      if (want && want !== now) {
+        const slash = want.indexOf("/");
+        const model = slash > 0 ? ctx.modelRegistry.find(want.slice(0, slash), want.slice(slash + 1)) : undefined;
+        if (!model) ctx.ui.notify(`team.models.lead: "${want}" is not a known model (pi --list-models).`, "warning");
+        else if (!(await pi.setModel(model))) ctx.ui.notify(`team.models.lead: could not switch to ${want} (no API key?).`, "warning");
+        return;
+      }
+      const team = (state.config.team.models.worker ?? "").trim();
+      if (!want && team && now && !team.startsWith(now) && /pro|opus|max|ultra/i.test(now))
+        ctx.ui.notify(`This lead runs on ${now}, the team on ${team}. The lead's long context is usually most of the cost: set team.models.lead in ptk.json to put leads on ${team.replace(/:\w+$/, "")} too.`, "info");
+    } catch {
+      /* stale context */
+    }
   });
 
   // ---------- facts ----------
@@ -556,6 +579,14 @@ export default function piTeamKit(pi: ExtensionAPI) {
     title: Type.String(),
     brief: Type.String({ description: "Self-contained: what to change, where, and how to tell it is done. The worker sees nothing else." }),
     files: Type.Array(Type.String(), { description: "Paths or globs this task owns (relative to repo root). Tasks sharing a path run in one lane." }),
+    verify: Type.Optional(
+      Type.Object(
+        { cmd: Type.String({ description: "focused command, e.g. pytest tests/test_login.py::test_lock -q" }), expect: Type.String({ description: 'what it prints when done, e.g. "1 passed"' }) },
+        { description: "How this task alone is proven done; the worker iterates with it, the verifier checks its output" },
+      ),
+    ),
+    caseIds: Type.Optional(Type.Array(Type.String(), { description: "Test case ids this task automates" })),
+    uses: Type.Optional(Type.Array(Type.String(), { description: "Fixtures, helpers or interfaces from other tasks this one builds on" })),
   });
 
   const leadFile = (cwd: string) => {
@@ -716,7 +747,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     promptGuidelines: [
       "Before team_run, settle the brief with the user: goal, doneWhen (the checks that prove it), outOfScope and your assumptions. Ask about anything unclear and wait; team_run shows the brief to the user for confirmation.",
       "The user often names a project by a keyword, not a path: find its folder yourself, pass it as repo, and say which folder you picked in the brief.",
-      "For a small, clear goal (one to three tasks whose files you already know), pass tasks yourself: it skips the planner run. Leave tasks out for anything larger or unclear.",
+      "For a small, clear goal (one to three tasks whose files you already know), pass tasks yourself: it skips the planner run. Give each a verify command and what it prints when done (for test automation also caseIds), and rules every task follows in constraints. Leave tasks out for anything larger or unclear.",
       "Leave gate out unless the detected test command is wrong. Do not work around the environment in it: workers' worktrees already have the project's virtualenv active and its ignored local files (.env) copied, and each lane runs only its own test files with a plain test command (a compound command runs whole in every lane).",
       "Once a team run is confirmed it runs unattended: the user may be away. Never wait for the user during it. Answer workers' supervisor questions yourself from the brief and the code; when a product decision is truly needed, take the conservative option and record it for the final report.",
       "When a team_run finishes, call team_integrate with the runDir of every passed lane right away, then write the final report. If it returned state needs-input, answer the planner's questions from the brief where you can (otherwise take the conservative option and say so) and run again with tasks.",
@@ -732,6 +763,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       playbook: Type.Optional(Type.String({ description: "Name of a matching playbook (lessons from earlier projects of this kind); its steps, tips, pitfalls and never-list travel with the goal" })),
       repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session was started in another folder" })),
       digests: Type.Optional(Type.Array(Type.String(), { description: "Topics of reader digests (digest tool) to hand to the planner and workers, so they skip reading the same material again" })),
+      constraints: Type.Optional(Type.Array(Type.String(), { maxItems: 10, description: "Rules every task follows, given word for word to each worker and verifier (e.g. each test creates its own uniquely named data and cleans up in teardown; no sleeps)" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = repoFor(ctx.cwd, params.repo);
@@ -746,7 +778,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
-      const lanes = planLanes(tasks);
+      const lanes = planLanes(tasks, t.maxParallel);
       const gate = (params.gate ?? t.gate ?? "").trim() || envFor(root)?.testCommand || "";
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
@@ -809,6 +841,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
         models,
         childTimeoutMs: t.childTimeoutMin * 60_000,
         laneTests: t.laneTests,
+        maxLanes: t.maxParallel,
+        constraints: (params.constraints ?? []).map((c) => c.trim()).filter(Boolean).slice(0, 10),
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),

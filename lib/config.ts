@@ -29,6 +29,8 @@ export interface PtkConfig {
     preferFastSearch: SearchPolicy;
     /** Rewrite `sudo x` to `sudo -n x` so a password prompt fails instead of hanging. */
     sudoNonInteractive: boolean;
+    /** Keep only the summary of a passing test run's output: the full log would ride along in every later turn. */
+    trimPassingTests: boolean;
   };
   facts: {
     enabled: boolean;
@@ -96,7 +98,7 @@ export interface PtkConfig {
     verifierAgent: string;
     /** Model per role, "provider/model" as in `pi --list-models`; "" = the agent's default (the main session's model).
      *  A verifier from a different model family than the workers catches more of their mistakes. */
-    models: { planner: string; worker: string; verifier: string };
+    models: { planner: string; worker: string; verifier: string; lead: string };
     /** Thinking level per role (off, minimal, low, medium, high, xhigh, max); "" = the agent's own: max for the planner
      *  and the verifier (splitting and checking decide the run), high for workers (they follow a detailed brief).
      *  Levels a model does not support are clamped by pi. For one session, say it in the conversation instead
@@ -141,6 +143,7 @@ export const DEFAULTS: PtkConfig = {
     blockLongRunners: true,
     preferFastSearch: "block",
     sudoNonInteractive: true,
+    trimPassingTests: true,
   },
   // Checks run in the background at session start, so a few seconds cost nothing; too short a limit only produces "unknown".
   facts: { enabled: true, checkTimeoutMs: 5000, maxFacts: 40 },
@@ -169,7 +172,8 @@ export const DEFAULTS: PtkConfig = {
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
-    models: { planner: "", worker: "", verifier: "" },
+    // lead: when set, lead sessions switch to it at start; the lead's long context is usually most of the cost
+    models: { planner: "", worker: "", verifier: "", lead: "" },
     thinking: { planner: "", worker: "", verifier: "" },
     laneTests: true,
     linkIntoWorktrees: [".venv", "venv", ".env", ".env.local", "node_modules"],

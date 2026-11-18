@@ -395,3 +395,14 @@ export const NON_INTERACTIVE_ENV: Record<string, string> = {
   DOTNET_CLI_TELEMETRY_OPTOUT: "1",
   DO_NOT_TRACK: "1",
 };
+
+/**
+ * A passing test run's full log adds tokens, not information: keep its last lines (the summary). Failures and
+ * listings (--collect-only, --list) are never cut. Undefined = keep the output as it is.
+ */
+export function trimPassingTest(command: string, output: string, failed: boolean, keep = 15): string | undefined {
+  if (failed || classifyCommand(command) !== "test" || /--collect-only|--co\b|--list|--help/.test(command)) return undefined;
+  const lines = output.replace(/\n+$/, "").split("\n");
+  if (lines.length <= keep * 2 + 10) return undefined;
+  return `[ptk] passed; the last ${keep} of ${lines.length} lines (the rest of a passing run's log is not kept):\n${lines.slice(-keep).join("\n")}`;
+}

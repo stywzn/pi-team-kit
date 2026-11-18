@@ -9,6 +9,13 @@ export interface TeamTask {
   brief: string;
   /** Paths or globs this task owns. Two tasks that share any path end up in the same lane. */
   files: string[];
+  /** The focused command that proves the task done and what it prints then ("1 passed"). The worker iterates with
+   *  it; its output goes to the verifier as evidence, not to the lead. */
+  verify?: { cmd: string; expect: string };
+  /** Test case ids this task automates; the verifier checks each one. */
+  caseIds?: string[];
+  /** Fixtures, helpers or interfaces from other tasks this task builds on, by name. */
+  uses?: string[];
 }
 
 export interface Lane {
@@ -33,6 +40,10 @@ export interface TeamPlan {
   childTimeoutMs?: number;
   /** Each lane's gate runs only the test files the lane owns (see narrowGate in the script). */
   laneTests?: boolean;
+  /** Lanes beyond this are merged into the smallest ones: they would only queue, and each lane costs a worker and a verifier. */
+  maxLanes?: number;
+  /** Rules for every task, copied word for word to each worker and verifier (e.g. unique test data, cleanup in teardown). */
+  constraints?: string[];
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -61,7 +72,17 @@ export function validateTasks(tasks: TeamTask[], maxTasks = 12): TeamTask[] {
     const files = (Array.isArray(t.files) ? t.files : []).map((f) => normalizePath(String(f))).filter(Boolean);
     if (files.length === 0) problems.push(`${at}.files: list the paths or globs this task owns`);
     for (const f of files) if (f.startsWith("/") || /^[A-Za-z]:/.test(f) || f.split("/").includes("..")) problems.push(`${at}.files: "${f}" must be relative to the repo root`);
-    return { key, title, brief, files };
+    const out: TeamTask = { key, title, brief, files };
+    if (t.verify && typeof t.verify === "object") {
+      const cmd = String(t.verify.cmd ?? "").trim();
+      const expect = String(t.verify.expect ?? "").trim();
+      if (!cmd || cmd.length > 500 || expect.length > 300) problems.push(`${at}.verify: a focused command (under 500 characters) and what it prints when done (under 300)`);
+      else out.verify = { cmd, expect };
+    }
+    const strings = (v: unknown, max: number) => (Array.isArray(v) ? v.map((s) => String(s).trim()).filter(Boolean).slice(0, max) : []);
+    if (strings(t.caseIds, 50).length) out.caseIds = strings(t.caseIds, 50);
+    if (strings(t.uses, 20).length) out.uses = strings(t.uses, 20);
+    return out;
   });
   if (problems.length) throw new Error(problems.join("\n"));
   return out;
@@ -83,8 +104,11 @@ export function patternsOverlap(a: string, b: string): boolean {
   return pa.startsWith(pb) || pb.startsWith(pa);
 }
 
-/** Merge tasks that share files into one lane (one worker), so parallel lanes never edit the same file. */
-export function planLanes(tasks: TeamTask[]): Lane[] {
+/**
+ * Merge tasks that share files into one lane (one worker), so parallel lanes never edit the same file. More lanes
+ * than maxLanes would only queue, and each lane costs a worker and a verifier: the smallest are merged until it fits.
+ */
+export function planLanes(tasks: TeamTask[], maxLanes = Infinity): Lane[] {
   const parent = tasks.map((_, i) => i);
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
   for (let i = 0; i < tasks.length; i++)
@@ -95,7 +119,15 @@ export function planLanes(tasks: TeamTask[]): Lane[] {
     const root = find(i);
     groups.set(root, [...(groups.get(root) ?? []), t]);
   });
-  return [...groups.values()].map((group) => ({
+  const list = [...groups.values()];
+  while (list.length > Math.max(1, maxLanes)) {
+    // The two smallest lanes become one; the later one joins the earlier, so task order is kept.
+    const order = list.map((g, i) => i).sort((a, b) => list[a].length - list[b].length || a - b);
+    const [a, b] = order.slice(0, 2).sort((x, y) => x - y);
+    list[a] = [...list[a], ...list[b]];
+    list.splice(b, 1);
+  }
+  return list.map((group) => ({
     key: group.length === 1 ? group[0].key : `${group[0].key}-plus${group.length - 1}`,
     tasks: group,
     files: [...new Set(group.flatMap((t) => t.files))],
@@ -132,10 +164,15 @@ export const PLAN_SCHEMA = {
           title: { type: "string" },
           brief: { type: "string" },
           files: { type: "array", items: { type: "string" } },
+          verify: { type: "object", properties: { cmd: { type: "string" }, expect: { type: "string" } }, required: ["cmd", "expect"] },
+          caseIds: { type: "array", items: { type: "string" } },
+          uses: { type: "array", items: { type: "string" } },
         },
-        required: ["key", "title", "brief", "files"],
+        // verify is required: optional, the planner skipped it (seen in a real run)
+        required: ["key", "title", "brief", "files", "verify"],
       },
     },
+    constraints: { type: "array", items: { type: "string" } },
     questions: { type: "array", items: { type: "string" } },
     notes: { type: "string" },
   },
@@ -151,7 +188,12 @@ export const VERDICT_SCHEMA = {
       type: "array",
       items: {
         type: "object",
-        properties: { file: { type: "string" }, issue: { type: "string" }, fix: { type: "string" } },
+        properties: {
+          file: { type: "string", description: "path:line" },
+          issue: { type: "string" },
+          fix: { type: "string" },
+          severity: { type: "string", enum: ["important", "minor"], description: "important: the task cannot be trusted until fixed (sent back); minor: noted for the lead only" },
+        },
         required: ["issue"],
       },
     },
@@ -162,7 +204,35 @@ export const VERDICT_SCHEMA = {
 // Plain functions and promise chains only: pi-subagents rejects async functions inside workflow scripts.
 const WORKFLOW_BODY = String.raw`
 function clip(text, n) { text = String(text || ""); return text.length > n ? text.slice(0, n) + " ...[cut]" : text; }
-function taskList(lane) { return lane.tasks.map(function (t, i) { return (i + 1) + ". " + t.title + "\n" + t.brief; }).join("\n\n"); }
+function taskList(lane) {
+  return lane.tasks.map(function (t, i) {
+    return (i + 1) + ". " + t.title + "\n" + t.brief +
+      (t.caseIds && t.caseIds.length ? "\nCases: " + t.caseIds.join(", ") : "") +
+      (t.uses && t.uses.length ? "\nBuilds on: " + t.uses.join(", ") : "") +
+      (t.verify ? "\nDone when: " + JSON.stringify(t.verify.cmd) + (t.verify.expect ? " prints " + JSON.stringify(t.verify.expect) : " passes") : "");
+  }).join("\n\n");
+}
+// Rules for every task, word for word from the plan (the lead's or the planner's), for workers and verifiers alike.
+function rules() {
+  var c = PLAN.constraints || [];
+  return c.length ? "\n\nRules for every task:\n" + c.map(function (r) { return "- " + r; }).join("\n") : "";
+}
+// A failure without what changes on every run (times, counts, addresses): equal text means the same failure.
+function failSig(text) {
+  var lines = String(text || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split(/\r?\n/).map(function (l) {
+    // pi-subagents names the run in its error ("Run 'login-gatefix-2' failed"): not part of the failure
+    return l.replace(/Run '[^']*'/g, "Run").replace(/0x[0-9a-f]+/gi, "#").replace(/\d+(\.\d+)?/g, "#").replace(/\s+/g, " ").trim();
+  }).filter(Boolean);
+  var key = lines.filter(function (l) { return /fail|error|exception|assert|traceback|panic|cannot|not found|denied/i.test(l); });
+  return (key.length ? key : lines.slice(-40)).slice(0, 200).join("\n").slice(0, 4000);
+}
+function findingsSig(fs) {
+  return (fs || []).map(function (f) { return String(f.file || "").replace(/:.*$/, "") + "|" + failSig(f.issue); }).sort().join("\n");
+}
+function numbered(fs) { return (fs || []).map(function (f, i) { return (i + 1) + ". " + (f.file ? f.file + ": " : "") + f.issue + (f.fix ? " -> " + f.fix : ""); }).join("\n"); }
+// The worker's evidence is for the verifier; the lead gets status, files and concerns.
+function forLead(output) { return String(output || "").replace(/(^|\n)Evidence:[\s\S]*?(?=\nConcerns:|$)/i, "\n").trim(); }
+function blockedReport(w) { return /(^|\n)\s*Status:\s*BLOCKED\b/i.test(String((w && w.output) || "")); }
 function owned(lane) { return lane.files.map(function (f) { return "- " + f; }).join("\n"); }
 function runDir(r) { return (r && r.artifactPaths && r.artifactPaths[0]) || ""; }
 
@@ -240,6 +310,12 @@ function lanesFor(tasks) {
     if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); })) parent[find(j)] = find(i);
   var groups = [], index = {};
   tasks.forEach(function (t, i) { var r = find(i); if (!(r in index)) { index[r] = groups.length; groups.push([]); } groups[index[r]].push(t); });
+  while (groups.length > Math.max(1, PLAN.maxLanes || Infinity)) {
+    var order = groups.map(function (g, i) { return i; }).sort(function (a, b) { return groups[a].length - groups[b].length || a - b; });
+    var pair = order.slice(0, 2).sort(function (x, y) { return x - y; });
+    groups[pair[0]] = groups[pair[0]].concat(groups[pair[1]]);
+    groups.splice(pair[1], 1);
+  }
   return groups.map(function (g) {
     var files = []; g.forEach(function (t) { t.files.forEach(function (f) { if (files.indexOf(f) < 0) files.push(f); }); });
     return { key: g.length === 1 ? g[0].key : g[0].key + "-plus" + (g.length - 1), tasks: g, files: files };
@@ -253,52 +329,78 @@ function cleanTasks(raw) {
     seen[key] = true;
     var files = (Array.isArray(t.files) ? t.files : []).map(norm).filter(function (f) { return f && f.charAt(0) !== "/" && f.split("/").indexOf("..") < 0; });
     // No ownership given: assume it may touch anything, so it shares a lane with everything.
-    return { key: key, title: String(t.title || key).slice(0, 120), brief: String(t.brief || t.title || ""), files: files.length ? files : ["**"] };
+    var task = { key: key, title: String(t.title || key).slice(0, 120), brief: String(t.brief || t.title || ""), files: files.length ? files : ["**"] };
+    if (t.verify && String(t.verify.cmd || "").trim()) task.verify = { cmd: String(t.verify.cmd).trim().slice(0, 500), expect: String(t.verify.expect || "").trim().slice(0, 300) };
+    var cases = strings(t.caseIds, 50), uses = strings(t.uses, 20);
+    if (cases.length) task.caseIds = cases;
+    if (uses.length) task.uses = uses;
+    return task;
   });
 }
+function strings(v, max) { return (Array.isArray(v) ? v : []).map(function (s) { return String(s).trim(); }).filter(Boolean).slice(0, max); }
 
 function planTask() {
   return "Split this goal into tasks for a team run. Goal: " + PLAN.goal + "\n\n" +
-    "At most " + PLAN.maxTasks + " tasks; up to 4 run in parallel, each in its own git worktree. " +
+    "At most " + PLAN.maxTasks + " tasks; up to " + (PLAN.maxLanes || 4) + " run in parallel, each in its own git worktree. " +
     (PLAN.gate ? "Every task's result must pass " + JSON.stringify(PLAN.gate) + ". " : "") +
-    "Return tasks, questions (only blocking ones; empty when you can proceed) and notes.";
+    "Give each task a verify command that proves it alone (one test file or test id) and what it prints when done. " +
+    "Return tasks, constraints (rules every task follows; empty if none), questions (only blocking ones; empty when you can proceed) and notes.";
 }
 
 function workTask(lane) {
   return "You are one worker in a team run. Overall goal: " + PLAN.goal + "\n\n" +
-    "Your tasks:\n" + taskList(lane) + "\n\n" +
+    "Your tasks:\n" + taskList(lane) + rules() + "\n\n" +
     "Files you own (edit only these; new files only inside them):\n" + owned(lane) + "\n\n" +
     "Rules: other workers are editing other files in parallel. If you must touch a file you do not own, or the brief is ambiguous, " +
     "call contact_supervisor with reason need_decision and wait for the answer. Do not commit, push, or switch branches. " +
-    "Keep the change minimal and match the existing style." +
-    (GATE ? " The command " + gateText(lane) + " must pass in your worktree; run it before you finish." : "") +
-    " Before you report, check your change the way the verifier will: " + CHECKLIST + "." +
-    "\nFinish with: changed files, commands you ran and their results, open risks.";
+    "Keep the change minimal and match the existing style.\n" +
+    "Checks: while you work, run each task's own Done-when command" + (GATE ? "; run " + gateText(lane) + " once before you finish, it must pass" : "") + ".\n" +
+    "When a check fails: read the whole failure, write down the cause you believe and the evidence for it, then change one thing and run again. " +
+    "Never re-run without a change and never retry a fix that already failed. A test that passes alone but fails with the others is leaking state: " +
+    "give it its own data and clean up in teardown; never add sleeps or retries. If you cannot get past a failure after three real attempts, stop and " +
+    "report BLOCKED with what you tried and the likely cause; the lead takes it to a person.\n" +
+    "Before you report, check your change the way the verifier will: " + CHECKLIST + ".\n" +
+    "Finish with exactly these parts:\nStatus: DONE, DONE_WITH_CONCERNS or BLOCKED\nChanged files: ...\n" +
+    "Evidence: for each task, the command you ran and the last lines of its output (read by the verifier only)\nConcerns: open risks; for BLOCKED, what you tried and the likely cause";
 }
 
 function verifyTask(lane, writer, round) {
+  var claims = "\n\nWorker's report (claims, not proof):\n" + clip(writer.output, 3000);
+  var worktree = "Read " + lane.origin + "/handoff.json and take groups[].cleanup.tasks[].path: that is the worker's worktree. ";
+  // A re-review checks the fixes it asked for, not the whole lane again: full reviews every round are what keeps rework going.
+  if (round > 1 && lane.lastFindings && lane.lastFindings.length)
+    return "Re-check one lane of a team run (round " + round + "). The previous review asked for these fixes:\n" + numbered(lane.lastFindings) + "\n\n" +
+      worktree + "For each fix, read the file there and decide whether it is done (tried is not done). " +
+      "Review nothing else again; a new problem counts only if a fix introduced it and it is important.\n" +
+      "Verdict: pass = every fix is done. rework = list only what is still not done, in the same words. blocked = needs a human decision." + claims;
   var where = round === 1
     ? "The complete change is a patch. Read " + lane.origin + "/handoff.json, take groups[].children[].patch.path, and read that file. " +
       "Read surrounding code only when the patch is not enough.\n"
-    : "This is a rework round. Read " + lane.origin + "/handoff.json and take groups[].cleanup.tasks[].path: that is the worker's worktree. " +
+    : "This is a rework round. " + worktree +
       "Read the owned files there (their current state includes every round) and compare them with the same files in the main checkout, which still holds the original version. " +
       "The patch file in handoff.json shows round 1 only.\n";
   return "Verify one lane of a team run (round " + round + "). Overall goal: " + PLAN.goal + "\n\n" +
-    "The lane's tasks:\n" + taskList(lane) + "\n\nFiles the lane owns:\n" + owned(lane) + "\n\n" + where +
-    "Check: " + CHECKLIST + ".\n" +
-    "Verdict: pass = correct and in scope. rework = list each concrete fix. blocked = only when the task itself is wrong or needs a human decision.\n\n" +
-    "Writer's report:\n" + clip(writer.output, 3000);
+    "The lane's tasks:\n" + taskList(lane) + rules() + "\n\nFiles the lane owns:\n" + owned(lane) + "\n\n" + where +
+    "Check in this order: 1. does it do each task (each case when listed): anything missing, extra or misunderstood? " +
+    "2. then: " + CHECKLIST + ". For test code also: no sleeps, assertions that can fail, no dependence on test order or on data other tests leave, " +
+    "no shared or hard-coded test data, not only checking mocks.\n" +
+    "Read the change, not the whole codebase. The worker's Evidence must match the change (the right tests, the expected output). " +
+    "Cite path:line for each finding and mark it important (the task cannot be trusted until fixed) or minor (worth noting, not worth a round).\n" +
+    "Verdict: pass = every task done and no important finding. rework = at least one important finding. blocked = only when the task itself is wrong or needs a human decision." + claims;
 }
 
-function fixTask(lane, review, round) {
-  var items = (review.findings || []).map(function (f, i) { return (i + 1) + ". " + (f.file ? f.file + ": " : "") + f.issue + (f.fix ? " -> " + f.fix : ""); }).join("\n");
-  return "Round " + round + " review asked for changes. Fix exactly these, stay inside your files" +
-    (GATE ? ", re-run " + gateText(lane) : "") + ", then report again:\n" + (items || clip(review.summary, 2000));
+function fixTask(lane, review, round, same) {
+  return "Round " + round + " review asked for these fixes:\n" + (numbered(review.findings) || clip(review.summary, 2000)) + "\n\n" +
+    (same ? "The review asked for the same fixes last round: the last change did not reach the cause. Find it first, with evidence; if it cannot be fixed inside your files, report BLOCKED with what you tried.\n" : "") +
+    "Fix exactly these, stay inside your files" + (GATE ? ", re-run " + gateText(lane) : "") + ". Report again in the same parts; under Evidence, for each fix: what changed and the command that shows it.";
 }
 
-function gateFixTask(lane, writer) {
-  return "Your run did not pass its checks" + (GATE ? " (gate " + gateText(lane) + ")" : "") +
-    ". Details:\n" + clip(writer.error || writer.output, 3000) + "\nFix the cause, stay inside your files, run the check again, then report.";
+function gateFixTask(lane, writer, same) {
+  return "Your run did not pass its checks" + (GATE ? " (gate " + gateText(lane) + ")" : "") + ". Details:\n" + clip(writer.error || writer.output, 3000) + "\n" +
+    (same
+      ? "This is the same failure as last round: the last change did not reach the cause, so do not try it again. Read the failure and the code path, " +
+        "write down the cause and the evidence, then fix that. If it cannot be avoided inside your files, report BLOCKED with what you tried; the lead takes it to a person."
+      : "Find the cause before changing anything, fix it inside your files, run the check again and report.");
 }
 
 function finish(lane, writer, review, rounds, state) {
@@ -311,11 +413,11 @@ function finish(lane, writer, review, rounds, state) {
     // The first writer run owns the worktree and handoff.json; resumed rounds work in that same worktree.
     runDir: lane.origin || null,
     error: (writer && writer.error) || null,
-    summary: clip((review && review.summary) || (writer && writer.output), 800),
+    summary: clip((review && review.summary) || forLead(writer && writer.output), 800),
     findings: (review && review.findings) || [],
     // Why earlier rounds were sent back: the lessons a playbook is made of (/harvest reads them).
     history: lane.history || [],
-    report: clip(writer && writer.output, 1200)
+    report: clip(forLead(writer && writer.output), 1200)
   };
 }
 
@@ -328,12 +430,22 @@ function resumeItem(lane, writer, label, task) {
 }
 
 function afterWrite(lane, writer, round) {
+  // The worker found it cannot get past something inside its files: the lead decides (with a person), no review round.
+  if (blockedReport(writer)) {
+    noteRound(lane, { round: round, blocked: clip(forLead(writer.output), 300) });
+    return finish(lane, writer, { summary: "Worker blocked: " + clip(forLead(writer.output), 700), findings: [] }, round, "needs-human");
+  }
   if (writer.ok) return review(lane, writer, round);
-  noteRound(lane, { round: round, gate: clip(writer.error || writer.output, 300) });
+  var sig = failSig(writer.error || writer.output);
+  var same = lane.lastGateSig === sig;
+  lane.lastGateSig = sig;
+  var entry = { round: round, gate: clip(writer.error || writer.output, 300) };
+  if (same) entry.same = true;
+  noteRound(lane, entry);
   if (missingNamedFile(lane, (writer.error || "") + "\n" + (writer.output || ""))) lane.fullGate = true;
   if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, null, round, "failed");
   var key = lane.key + "-gatefix-" + round;
-  return settle(key, runs.run(key, resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer))))
+  return settle(key, runs.run(key, resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer, same))))
     .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
 }
 
@@ -344,12 +456,21 @@ function review(lane, writer, round) {
       if (!v.ok && !v.structuredOutput) return finish(lane, writer, { summary: "Verifier failed: " + v.error, findings: [] }, round, "needs-human");
       var out = v.structuredOutput || {};
       var verdict = out.verdict || "rework";
+      // Only important findings are sent back; minor ones go to the lead with the result.
+      var important = (out.findings || []).filter(function (f) { return f.severity !== "minor"; });
+      if (verdict === "rework" && !important.length && (out.findings || []).length) verdict = "pass";
       if (verdict === "pass") return finish(lane, writer, out, round, "passed");
       if (verdict === "blocked") return finish(lane, writer, out, round, "needs-human");
-      noteRound(lane, { round: round, findings: (out.findings || []).slice(0, 5).map(function (f) { return { file: f.file, issue: clip(f.issue, 200), fix: clip(f.fix, 200) }; }) });
+      var sig = findingsSig(important);
+      var same = lane.lastFindingsSig === sig;
+      lane.lastFindingsSig = sig;
+      lane.lastFindings = important;
+      var entry = { round: round, findings: important.slice(0, 5).map(function (f) { return { file: f.file, issue: clip(f.issue, 200), fix: clip(f.fix, 200) }; }) };
+      if (same) entry.same = true;
+      noteRound(lane, entry);
       if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, out, round, "needs-human");
       var fixKey = lane.key + "-fix-" + round;
-      return settle(fixKey, runs.run(fixKey, resumeItem(lane, writer, "Rework " + lane.key + " #" + round, fixTask(lane, out, round))))
+      return settle(fixKey, runs.run(fixKey, resumeItem(lane, writer, "Rework " + lane.key + " #" + round, fixTask(lane, { findings: important, summary: out.summary }, round, same))))
         .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
     });
 }
@@ -371,6 +492,7 @@ if (!lanes.length) {
   var p = await settle("plan", runs.run("plan", withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
   var out = p.structuredOutput || {};
   var tasks = cleanTasks(out.tasks);
+  PLAN.constraints = (PLAN.constraints || []).concat(strings(out.constraints, 10));
   if (!tasks.length) {
     return { goal: PLAN.goal, state: "needs-input", questions: out.questions || [], notes: out.notes || p.error || "planner returned no tasks", lanes: [] };
   }

@@ -334,3 +334,87 @@ test("lane gates that only fail because fewer tests ran go back to the full gate
   assert.equal(await keep("npx playwright test", ["e2e/login.spec.ts"]), "npx playwright test e2e/login.spec.ts", "playwright's own test subcommand is not a path");
   assert.equal(await keep("uv run python -m pytest -q", ["tests/test_a.py"]), "uv run python -m pytest -q tests/test_a.py");
 });
+
+test("tasks carry a verify command, case ids and what they build on; rules reach every worker and verifier", async () => {
+  const [t] = validateTasks([{ ...task("login", ["tests/test_login.py"]), verify: { cmd: "pytest tests/test_login.py -q", expect: "3 passed" }, caseIds: ["TC-101", " ", "TC-102"], uses: ["auth fixture"] }]);
+  assert.deepEqual([t.verify, t.caseIds, t.uses], [{ cmd: "pytest tests/test_login.py -q", expect: "3 passed" }, ["TC-101", "TC-102"], ["auth fixture"]]);
+  assert.throws(() => validateTasks([{ ...task("x", ["a.py"]), verify: { cmd: "", expect: "" } }]), /verify/);
+  const { calls } = await simulate(
+    { lanes: planLanes([t]), constraints: ["each test creates its own uniquely named user and deletes it in teardown"] },
+    (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : {}),
+  );
+  for (const key of ["login-work", "login-verify-1"]) {
+    const text = calls.find((c) => c.key === key)!.item.task;
+    assert.match(text, /Done when: "pytest tests\/test_login\.py -q" prints "3 passed"/, key);
+    assert.match(text, /Cases: TC-101, TC-102/, key);
+    assert.match(text, /Builds on: auth fixture/, key);
+    assert.match(text, /- each test creates its own uniquely named user/, key);
+  }
+  assert.match(calls[0].item.task, /Status: DONE, DONE_WITH_CONCERNS or BLOCKED[\s\S]*Evidence:/);
+});
+
+test("the planner's rules and verify commands travel to the workers; more lanes than run at once are merged", async () => {
+  const six = ["a", "b", "c", "d", "e", "f"].map((k) => ({ key: k, title: k, brief: `do ${k} and test it`, files: [`${k}.py`], verify: { cmd: `pytest test_${k}.py`, expect: "1 passed" } }));
+  const { calls, result } = await simulate({ lanes: [], maxLanes: 4 }, (key) =>
+    key === "plan"
+      ? { structuredOutput: { tasks: six, constraints: ["no sleeps"], questions: [], notes: "" } }
+      : key.includes("verify")
+        ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } }
+        : {},
+  );
+  const works = calls.filter((c) => c.key.endsWith("-work"));
+  assert.equal(works.length, 4, "six independent tasks, four lanes");
+  assert.equal(result.lanes.length, 4);
+  assert.equal(works.reduce((n, w) => n + (w.item.task.match(/Done when:/g) ?? []).length, 0), 6, "every task keeps its verify command");
+  assert.ok(works.every((w) => /- no sleeps/.test(w.item.task)));
+  const lanes = planLanes(six.map((t) => ({ ...t, files: t.files })), 4);
+  assert.deepEqual(lanes.map((l) => l.tasks.map((t) => t.key)), [["a", "b"], ["c", "d"], ["e"], ["f"]], "the smallest lanes are merged, order kept");
+  assert.equal(planLanes(six, 1).length, 1);
+});
+
+test("a worker that reports BLOCKED goes to the lead without a review; its evidence stays with the verifier", async () => {
+  const blocked = "Status: BLOCKED\nChanged files: tests/test_login.py\nEvidence: pytest -> 1 failed (account locked)\nConcerns: the shared test account is locked by another suite; tried a new user, still locked";
+  const { calls, result } = await simulate({}, (key) => (key === "one-work" ? { output: blocked } : {}));
+  assert.deepEqual(calls.map((c) => c.key), ["one-work"], "no verifier run");
+  const lane = result.lanes[0];
+  assert.equal(lane.state, "needs-human");
+  assert.match(lane.summary, /shared test account is locked/);
+  assert.doesNotMatch(lane.summary + lane.report, /1 failed \(account locked\)/, "the evidence is not passed to the lead");
+  const done = await simulate({}, (key) =>
+    key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : { output: "Status: DONE\nChanged files: a.py\nEvidence: pytest -> 5 passed\nConcerns: none" },
+  );
+  assert.match(done.calls[1].item.task, /Evidence: pytest -> 5 passed/, "the verifier reads it");
+  assert.doesNotMatch(done.result.lanes[0].report, /5 passed/);
+  assert.match(done.result.lanes[0].report, /Concerns: none/);
+});
+
+test("the same failure again: the rework says so and asks for the cause; a different one does not", async () => {
+  const same = await simulate({ maxRounds: 3 }, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : "fail"));
+  const fixes = same.calls.filter((c) => c.key.includes("gatefix"));
+  assert.equal(fixes.length, 2, "retries are kept");
+  assert.doesNotMatch(fixes[0].item.task, /same failure as last round/);
+  assert.match(fixes[1].item.task, /same failure as last round[\s\S]*report BLOCKED/);
+  assert.deepEqual(same.result.lanes[0].history.map((h: { same?: boolean }) => Boolean(h.same)), [false, true, true]);
+  let n = 0;
+  const other = await simulate({ maxRounds: 3 }, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "ok", findings: [] } } : { ok: false, error: ["FAILED test_a - KeyError", "FAILED test_b - TimeoutError", "x"][n++] }));
+  assert.ok(other.calls.filter((c) => c.key.includes("gatefix")).every((c) => !/same failure/.test(c.item.task)));
+});
+
+test("minor findings do not cost a round; a re-review checks only the fixes it asked for", async () => {
+  const minor = await simulate({}, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "rework", summary: "nits", findings: [{ file: "a.py:3", issue: "name could be clearer", severity: "minor" }] } } : {}));
+  assert.deepEqual(minor.calls.map((c) => c.key), ["one-work", "one-verify-1"]);
+  assert.equal(minor.result.lanes[0].state, "passed");
+  assert.equal(minor.result.lanes[0].findings.length, 1, "the lead still sees it");
+  let reviews = 0;
+  const two = await simulate({}, (key) =>
+    key.includes("verify")
+      ? { structuredOutput: ++reviews === 1 ? { verdict: "rework", summary: "bug", findings: [{ file: "a.py:9", issue: "off by one", fix: "use <=", severity: "important" }, { file: "a.py:1", issue: "nit", severity: "minor" }] } : { verdict: "pass", summary: "ok", findings: [] } }
+      : {},
+  );
+  const fix = two.calls.find((c) => c.key === "one-fix-1")!.item.task;
+  assert.match(fix, /1\. a\.py:9: off by one -> use <=/);
+  assert.doesNotMatch(fix, /\bnit\b/, "minor findings are not sent back");
+  const recheck = two.calls.find((c) => c.key === "one-verify-2")!.item.task;
+  assert.match(recheck, /^Re-check one lane[\s\S]*1\. a\.py:9: off by one[\s\S]*Review nothing else again/);
+  assert.doesNotMatch(recheck, /Check in this order/, "not a full review again");
+});

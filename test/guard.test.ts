@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, trimPassingTest, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -215,4 +215,16 @@ test("test commands get CI=1 unless CI is already set", () => {
 test("longRunnerReason explains itself", () => {
   const [seg] = splitSegments("npm run dev");
   assert.match(longRunnerReason(seg) ?? "", /server or watcher/);
+});
+
+test("a passing test run keeps only its summary; failures and listings are never cut", () => {
+  const log = Array.from({ length: 200 }, (_, i) => `tests/test_${i}.py::test_x PASSED`).concat(["===== 200 passed in 3.2s ====="]).join("\n");
+  const t = trimPassingTest("python -m pytest -v", log, false)!;
+  assert.match(t, /^\[ptk\] passed; the last 15 of 201 lines/);
+  assert.match(t, /200 passed in 3\.2s/);
+  assert.ok(t.length < log.length / 5);
+  assert.equal(trimPassingTest("python -m pytest -v", log, true), undefined, "a failure keeps everything");
+  assert.equal(trimPassingTest("pytest --collect-only -q", log, false), undefined, "a listing is the point");
+  assert.equal(trimPassingTest("cat big.log", log, false), undefined, "only test commands");
+  assert.equal(trimPassingTest("npx playwright test", "ok\n1 passed", false), undefined, "short output stays");
 });
