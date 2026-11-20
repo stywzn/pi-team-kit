@@ -30,6 +30,7 @@ import {
   recordFile,
   removeCard,
   sendMessage,
+  sendSummary,
   shouldWake,
   slugName,
   STALE_MS,
@@ -109,7 +110,12 @@ test("send: to one lead or all, offline leads keep mail, bad input is refused wi
   assert.deepEqual(one, { delivered: ["web"], offline: [] });
   const all = sendMessage(dir, { from: "api", to: "all", text: "API docs moved to docs/api.md", update: false, hops: 0 }, T0 + 1);
   assert.deepEqual(all.delivered, ["docs", "web"], "everyone running except the sender");
-  assert.deepEqual(sendMessage(dir, { from: "api", to: "gone", text: "for later", update: false, hops: 0 }, T0 + 2), { delivered: ["gone"], offline: ["gone"] });
+  const later = sendMessage(dir, { from: "api", to: "gone", text: "for later", update: false, hops: 0 }, T0 + 2);
+  assert.deepEqual(later, { delivered: [], offline: ["gone"] }, "a lead that is not running has not got it");
+  assert.match(sendSummary(later), /^NOT read yet: gone is not running\. The message waits in the inbox/);
+  assert.doesNotMatch(sendSummary(later), /Delivered|Sent/);
+  assert.match(sendSummary(one), /^Delivered to web \(running/);
+  assert.match(sendSummary({ delivered: ["web"], offline: ["a", "b"] }), /Delivered to web[\s\S]*NOT read yet: a, b are not running/);
   const web = takeInbox(dir, "web");
   assert.deepEqual(web.map((m) => [m.text, m.update, m.to]), [["POST /v2/login is live", true, "web"], ["API docs moved to docs/api.md", false, "all"]]);
   assert.deepEqual(takeInbox(dir, "web"), [], "delivered once");
@@ -131,7 +137,8 @@ test("inbox: oldest first, half-written and broken files never reach the model",
   writeFileSync(join(dir, "web.inbox", "0000000000001-1-x.json"), "{half");
   writeFileSync(join(dir, "web.inbox", "9999999999999-1-y.json.123.tmp"), "{}");
   assert.deepEqual(takeInbox(dir, "web").map((m) => m.text), ["first", "second"]);
-  assert.deepEqual(readdirSync(join(dir, "web.inbox")), ["9999999999999-1-y.json.123.tmp"], "a file still being written is left alone");
+  assert.deepEqual(readdirSync(join(dir, "web.inbox")).sort(), ["9999999999999-1-y.json.123.tmp", "broken"], "a file still being written is left alone");
+  assert.deepEqual(readdirSync(join(dir, "web.inbox", "broken")), ["0000000000001-1-x.json"], "the broken one is kept aside");
 });
 
 test("wake: an update request wakes an idle lead; a reply chain stops after A -> B -> A", () => {
@@ -227,7 +234,15 @@ test("inbox: messages stay until acknowledged, so a failed delivery is retried",
   assert.deepEqual(first.messages.map((m) => m.text), ["v2 is live"]);
   assert.deepEqual(readInbox(dir, "web").messages.map((m) => m.text), ["v2 is live"], "not acknowledged: still there");
   ackInbox(first.files);
-  assert.deepEqual(readInbox(dir, "web"), { messages: [], files: [] });
+  assert.deepEqual(readInbox(dir, "web"), { messages: [], files: [], broken: [] });
+  // An unreadable message is kept aside and reported, never silently dropped.
+  writeFileSync(join(dir, "web.inbox", "0001-bad.json"), "{ not json");
+  sendMessage(dir, { from: "api", to: "web", text: "after the broken one", update: false, hops: 0 }, T0 + 5);
+  const box = readInbox(dir, "web");
+  assert.deepEqual(box.messages.map((m) => m.text), ["after the broken one"]);
+  assert.equal(box.broken.length, 1);
+  assert.ok(existsSync(join(dir, "web.inbox", "broken", "0001-bad.json")), "kept in broken/");
+  assert.equal(box.files.length, 1, "only readable messages are acknowledged");
 });
 
 test("performance: the 2-second inbox poll and the per-turn board read stay cheap", () => {

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.4] - 2026-11-20
+
+Fixes from real use.
+
+- An edit or write that leaves a .json, .yaml/.yml or .py file unparsable (a `\1` that became a control character, a lost indent, a `\n` that became a real newline in a string) is put back exactly as it was, and the result tells the agent why. YAML is checked with pi's own `yaml` package, Python with the machine's python (no code run). JSON with comments (tsconfig, VS Code settings) is left alone.
+- `leads send` no longer says "Sent" to a lead that is not running: it says who has it now and who will only see it when a session takes that name. An unreadable message is kept in the inbox's `broken/` folder and reported, instead of being dropped. Deleting delivered messages retries on Windows (a file briefly held made it fail).
+- `ssh -V`, `ssh -G`, `ssh -Q` are no longer stopped as interactive; ssh with a remote command never was, and the message now shows the form.
+- A command with its own `timeout N` gets a tool timeout of N+60 seconds (up to `guard.maxTimeoutSec`), so the tool does not kill it first.
+- `bg start` takes several `--wait-for` patterns: ready when any shows up (a "done" line or an "error" line), no quoting of `|`.
+
 ## [0.8.3] - 2026-11-20
 
 Team mode by default, from real use: a lead did hours of work alone (48 files) that workers could have done in parallel.

@@ -120,8 +120,10 @@ export function longRunnerReason(seg: Segment): string | undefined {
       return `\`${prog}\` without a command opens an interactive prompt`;
   }
   if (prog === "ssh") {
+    // -V prints the version, -G the resolved config, -Q queries supported algorithms: none opens a session.
+    if (rest.some((a) => a === "-V" || a === "-G" || a === "-Q" || /^-[a-zA-Z]*V$/.test(a))) return undefined;
     const positional = rest.filter((a, i) => !a.startsWith("-") && !(i > 0 && /^-[bcDEeFIiJLlmOopQRSWw]$/.test(rest[i - 1])));
-    if (positional.length <= 1) return "`ssh` without a remote command opens an interactive shell";
+    if (positional.length <= 1) return "`ssh` without a remote command opens an interactive shell (give the command to run: ssh host \"cmd\")";
   }
   if (["vim", "vi", "nvim", "nano", "emacs", "micro", "helix", "hx", "less", "more", "most", "top", "htop", "btop", "nload", "iftop", "lazygit", "tig", "mc", "ranger"].includes(prog))
     return `\`${prog}\` is a full-screen interactive program`;
@@ -395,3 +397,14 @@ export const NON_INTERACTIVE_ENV: Record<string, string> = {
   DOTNET_CLI_TELEMETRY_OPTOUT: "1",
   DO_NOT_TRACK: "1",
 };
+
+/**
+ * Seconds a command limits itself to with a leading `timeout N` (GNU coreutils: N, Ns, Nm, Nh), or undefined.
+ * The tool's own timeout must be longer, or the tool kills it first and the command's own limit never applies.
+ */
+export function commandTimeoutSec(command: string): number | undefined {
+  const m = /^\s*(?:(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)(?:g?timeout)\s+(?:-{1,2}[a-zA-Z-]+(?:[= ](?:\d+[smhd]?|[A-Z]+))?\s+)*(\d+(?:\.\d+)?)([smhd]?)\s+\S/.exec(command);
+  if (!m) return undefined;
+  const n = Number(m[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 }[m[2] as "s"] ?? 1);
+  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : undefined;
+}

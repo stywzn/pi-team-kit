@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Background processes for agents: start a server/watcher without blocking, wait until it is ready, read logs, stop it.
-//   bg start <name> [--cwd dir] [--wait-for <regex | :port | http(s)://url>] [--timeout 60] -- <command...>
+//   bg start <name> [--cwd dir] [--wait-for <regex | :port | http(s)://url>]... [--timeout 60] -- <command...>
+//   (several --wait-for regexes: ready when any of them shows up in the log)
 //   bg status [name] | bg logs <name> [--lines 60] | bg stop <name> | bg list
 
 import { spawn } from "node:child_process";
@@ -143,7 +144,14 @@ if (action === "status") {
     process.exit(1);
   }
   const cwd = path.resolve(opt("--cwd", process.cwd()));
-  const waitFor = opt("--wait-for", "");
+  // Several --wait-for patterns: ready when any matches (a "done" line or an "error" line), no quoting of | needed.
+  const waits = head.flatMap((a, i) => (a === "--wait-for" && head[i + 1] !== undefined ? [head[i + 1]] : []));
+  const special = waits.find((w) => /^:\d+$/.test(w) || /^https?:\/\//.test(w));
+  if (special && waits.length > 1) {
+    console.error("--wait-for: a :port or URL works alone; give several patterns only as regexes");
+    process.exit(2);
+  }
+  const waitFor = special ?? waits.map((w) => `(?:${w})`).join("|");
   const timeout = Number(opt("--timeout", "60"));
   // Validate everything before starting a process we would then have to clean up.
   if (!Number.isFinite(timeout) || timeout <= 0) {

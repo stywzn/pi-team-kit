@@ -24,6 +24,7 @@ import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorkt
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
 import { SoloWork } from "../lib/solo.ts";
+import { checkedKind, PY_CHECK, restoredNote, syntaxError } from "../lib/filecheck.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
 import {
   appendRetired,
@@ -63,6 +64,7 @@ import {
   recordFile,
   removeCard,
   sendMessage,
+  sendSummary,
   shouldWake,
   statusSnapshot,
   slugName,
@@ -73,7 +75,7 @@ import {
 } from "../lib/board.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
+import { classifyCommand, commandTimeoutSec, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
@@ -412,8 +414,14 @@ export default function piTeamKit(pi: ExtensionAPI) {
     event.input.command = cls === "test" && g.ciForTests ? withCi(decision.command, process.env) : decision.command;
     const classDefault = cls === "test" ? g.testTimeoutSec : cls === "build" ? g.buildTimeoutSec : g.defaultTimeoutSec;
     const t = resolveTimeout(event.input.timeout, classDefault, g.maxTimeoutSec);
-    event.input.timeout = t.timeout;
     const notes = [...decision.notes];
+    // `timeout 700 cmd` limits itself: the tool must wait longer, or it kills the command first.
+    const own = commandTimeoutSec(decision.command);
+    if (own !== undefined && t.timeout < own + 30) {
+      t.timeout = Math.min(g.maxTimeoutSec, own + 60);
+      notes.push(`The command limits itself to ${own}s, so the tool timeout was raised to ${t.timeout}s${t.timeout < own + 30 ? ` (the ceiling, guard.maxTimeoutSec; for longer jobs use toolbox bg)` : ""}.`);
+    }
+    event.input.timeout = t.timeout;
     if (t.capped) notes.push(`Timeout capped at ${g.maxTimeoutSec}s. For longer jobs use toolbox bg and poll its logs.`);
     state.notes.set(event.toolCallId, { notes, timeout: t.timeout });
   });
@@ -552,6 +560,56 @@ export default function piTeamKit(pi: ExtensionAPI) {
     } catch {
       return; // a report is a convenience; never block the turn
     }
+  });
+
+  // ---------- an edit that breaks a .json/.yaml/.py file is put back (lib/filecheck.ts) ----------
+  const beforeEdit = new Map<string, { file: string; content: Buffer }>();
+  const fileSyntax = async (kind: "json" | "yaml" | "python", file: string, content: Buffer): Promise<string | undefined> => {
+    if (kind !== "python") return syntaxError(kind, content.toString("utf8"));
+    const py = state.env?.python?.split(" ");
+    if (!py) return undefined;
+    const r = await pi.exec(py[0], [...py.slice(1), "-c", PY_CHECK, file], { cwd: state.cwd, timeout: 15_000 }).catch(() => undefined);
+    if (!r) return undefined;
+    return r.code === 0 ? "" : (r.stderr || r.stdout).trim().split("\n").slice(-2).join(" ").slice(0, 300) || "SyntaxError";
+  };
+  pi.on("tool_call", async (event) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const p = (event.input as { path?: unknown }).path;
+    if (typeof p !== "string") return;
+    const file = resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir()));
+    const kind = checkedKind(file);
+    if (!kind) return;
+    try {
+      const st = statSync(file);
+      if (!st.isFile() || st.size > 2_000_000) return;
+      const content = readFileSync(file);
+      if ((await fileSyntax(kind, file, content)) === "") beforeEdit.set(event.toolCallId, { file, content });
+    } catch {
+      beforeEdit.set(event.toolCallId, { file, content: Buffer.alloc(0) }); // a new file: checked, not restorable
+    }
+    if (beforeEdit.size > 50) beforeEdit.delete(beforeEdit.keys().next().value!);
+  });
+  pi.on("tool_result", async (event) => {
+    const before = beforeEdit.get(event.toolCallId);
+    if (!before) return;
+    beforeEdit.delete(event.toolCallId);
+    if (event.isError) return;
+    const kind = checkedKind(before.file)!;
+    let now: Buffer;
+    try {
+      now = readFileSync(before.file);
+    } catch {
+      return;
+    }
+    const error = await fileSyntax(kind, before.file, now);
+    if (!error) return;
+    const restorable = before.content.length > 0;
+    if (restorable) writeFileSync(before.file, before.content);
+    return {
+      content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${restoredNote(relative(state.cwd, before.file) || before.file, error, restorable)}` }],
+      isError: true,
+      structuredContent: event.structuredContent,
+    };
   });
 
   // ---------- team mode by default: a big task goes to workers, not one session (lib/solo.ts) ----------
@@ -1629,9 +1687,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
       if (!ensureSeat()) return;
       // Read without removing: the files go only after pi accepted the message, so a failure is retried.
       const box = readInbox(lb.dir, lb.name);
+      if (box.broken.length) {
+        try {
+          lb.ctx?.ui.notify(`${box.broken.length} lead message(s) could not be read and were kept in ${dirname(box.broken[0])}.`, "warning");
+        } catch {
+          /* stale context */
+        }
+      }
       if (!box.files.length) return;
       const mail = box.messages;
-      if (!mail.length) return ackInbox(box.files); // only broken files
       const idle = isIdle() && !lb.busy;
       const wakers = mail.filter((m) => shouldWake(m, idle, state.config.leads.wake));
       if (wakers.length) {
@@ -1916,12 +1980,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
         if (!params.to?.trim()) throw new Error('to is required: a lead name from leads list, or "all"');
         const update = params.update === true;
         const r = sendMessage(lb.dir, { from: lb.name, to: params.to.trim(), text: params.text ?? "", update, hops: lb.turnHops }, now);
-        for (const n of r.delivered) lb.told.set(n, now);
-        const notes = [
-          r.offline.length ? `Not running now: ${r.offline.join(", ")}; they get it when a session takes that name.` : "",
-          update && lb.turnHops >= MAX_WAKE_HOPS ? "This reply chain is long enough, so idle leads are not woken; they see it on their next turn." : "",
-        ].filter(Boolean);
-        return text(`Sent to ${r.delivered.join(", ")}.${notes.length ? ` ${notes.join(" ")}` : ""}`);
+        for (const n of [...r.delivered, ...r.offline]) lb.told.set(n, now);
+        const chain = update && r.delivered.length && lb.turnHops >= MAX_WAKE_HOPS ? " This reply chain is long enough, so idle leads are not woken; they see it on their next turn." : "";
+        return text(`${sendSummary(r)}${chain}`);
       },
     });
 

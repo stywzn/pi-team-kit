@@ -214,33 +214,59 @@ export function sendMessage(
   }
   appendLog(dir, { id: `${now}-${rand()}`, ...base });
   const liveNames = new Set(live.map((c) => c.name));
-  return { delivered: targets, offline: targets.filter((t) => !liveNames.has(t)) };
+  return { delivered: targets.filter((t) => liveNames.has(t)), offline: targets.filter((t) => !liveNames.has(t)) };
+}
+
+/** What the sender is told: who has it now, and who will only see it later. Never "sent" to a lead that is not running. */
+export function sendSummary(r: SendResult): string {
+  const parts: string[] = [];
+  if (r.delivered.length) parts.push(`Delivered to ${r.delivered.join(", ")} (running: they see it before their next step).`);
+  if (r.offline.length)
+    parts.push(
+      `NOT read yet: ${r.offline.join(", ")} ${r.offline.length > 1 ? "are" : "is"} not running. The message waits in the inbox and is shown when a session takes that name (usually the next lead in that repo, or /continue there).`,
+    );
+  return parts.join(" ");
 }
 
 /**
  * Unread messages for `name`, oldest first, without removing them: call ackInbox(files) once they are
  * delivered, so a failed delivery leaves them for the next try. `files` includes broken ones (to drop them).
  */
-export function readInbox(dir: string, name: string): { messages: LeadMessage[]; files: string[] } {
+export function readInbox(dir: string, name: string): { messages: LeadMessage[]; files: string[]; broken: string[] } {
   const inbox = inboxDir(dir, name);
-  if (!existsSync(inbox)) return { messages: [], files: [] };
+  if (!existsSync(inbox)) return { messages: [], files: [], broken: [] };
   const messages: LeadMessage[] = [];
   const files: string[] = [];
+  const broken: string[] = [];
   for (const f of readdirSync(inbox).filter((x) => x.endsWith(".json")).sort()) {
     const file = join(inbox, f);
-    files.push(file);
+    let m: LeadMessage | undefined;
     try {
-      const m = JSON.parse(readFileSync(file, "utf8")) as LeadMessage;
-      if (m && str(m.from) && str(m.text) && str(m.at)) messages.push({ ...m, update: m.update === true, hops: Number.isFinite(m.hops) ? m.hops : 0, text: m.text.slice(0, MAX_TEXT) });
+      m = JSON.parse(readFileSync(file, "utf8")) as LeadMessage;
     } catch {
-      /* broken: acknowledged with the rest, never delivered */
+      m = undefined;
+    }
+    if (m && str(m.from) && str(m.text) && str(m.at)) {
+      files.push(file);
+      messages.push({ ...m, update: m.update === true, hops: Number.isFinite(m.hops) ? m.hops : 0, text: m.text.slice(0, MAX_TEXT) });
+      continue;
+    }
+    // Unreadable: kept aside, not dropped, so the receiver is told and a person can look at it.
+    try {
+      const aside = join(inbox, "broken");
+      ensureDir(aside);
+      renameSync(file, join(aside, f));
+      broken.push(join(aside, f));
+    } catch {
+      /* another reader moved it first */
     }
   }
-  return { messages, files };
+  return { messages, files, broken };
 }
 
 export function ackInbox(files: string[]): void {
-  for (const f of files) rmSync(f, { force: true });
+  // Windows can hold a file briefly (antivirus, indexer): retry instead of failing the delivery.
+  for (const f of files) rmSync(f, { force: true, maxRetries: 5, retryDelay: 40 });
 }
 
 /** Read and remove in one go. */

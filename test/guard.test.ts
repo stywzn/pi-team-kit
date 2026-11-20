@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, commandTimeoutSec, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -215,4 +215,19 @@ test("test commands get CI=1 unless CI is already set", () => {
 test("longRunnerReason explains itself", () => {
   const [seg] = splitSegments("npm run dev");
   assert.match(longRunnerReason(seg) ?? "", /server or watcher/);
+});
+
+test("ssh: version, config and query flags run; only a session without a command is stopped", () => {
+  const reason = (cmd: string) => inspectBash(cmd, base).kind === "block";
+  for (const ok of ["ssh -V", "ssh -G myhost", "ssh -Q cipher", "ssh -i ~/.ssh/key bench \"echo ok\"", "ssh -p 2222 -i key user@host 'ls /tmp'", "ssh host -- uptime"]) assert.equal(reason(ok), false, ok);
+  for (const bad of ["ssh host", "ssh -i key user@host", "ssh -t host"]) assert.equal(reason(bad), true, bad);
+});
+
+test("a command with its own timeout gets a tool timeout longer than that", () => {
+  assert.equal(commandTimeoutSec("timeout 700 python tools/remote_bench.py --expr KH15"), 700);
+  assert.equal(commandTimeoutSec("timeout 10m pytest -q"), 600);
+  assert.equal(commandTimeoutSec("CI=1 timeout --kill-after=5 -s KILL 90 npm test"), 90);
+  assert.equal(commandTimeoutSec("gtimeout 1.5h make e2e"), 5400);
+  assert.equal(commandTimeoutSec("python timeout_test.py"), undefined);
+  assert.equal(commandTimeoutSec("echo timeout 700 x"), undefined, "only a leading timeout");
 });

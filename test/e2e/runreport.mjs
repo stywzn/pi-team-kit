@@ -4,13 +4,16 @@
 // A subagent call the lead makes gets the deadline and the hand-off before it; a run that ended without finishing
 // makes the next turn start with what it changed (and not what was dirty before it), once.
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-const { createAgentSession, SessionManager } = await import(pathToFileURL(join(npmRoot, "@earendil-works", "pi-coding-agent", "dist", "index.js")).href);
+const piRoot = join(npmRoot, "@earendil-works", "pi-coding-agent");
+const { createAgentSession, SessionManager } = await import(pathToFileURL(join(piRoot, "dist", "index.js")).href);
+// As when pi runs: its entry file is argv[1], from which its own packages (yaml) are found.
+process.argv[1] = join(piRoot, "dist", "bundle", "cli.js");
 const repo = mkdtempSync(join(tmpdir(), "ptk-rr-"));
 spawnSync("git", ["init", "-q", repo]);
 writeFileSync(join(repo, "a.py"), "x = 1\n");
@@ -73,6 +76,38 @@ check(/7th file[\s\S]*team_run/.test(blocked ?? ""), "the 7th file of a request 
 check((await edit(join(repo, "f1.py"))) === undefined, "a file it already changed may be finished");
 await r.emitToolResult({ type: "tool_result", toolName: "team_run", toolCallId: "t1", input: {}, content: [{ type: "text", text: "started" }], details: undefined, isError: false });
 check((await edit(join(repo, "f8.py"))) === undefined, "after team_run the lead may fix up anything");
+
+// An edit that breaks a .json/.yaml/.py file is put back as it was, and the result says why.
+const breakWith = async (name, good, bad) => {
+  const file = join(repo, name);
+  writeFileSync(file, good);
+  const id = `b${++n}`;
+  await r.emitToolCall({ type: "tool_call", toolName: "write", toolCallId: id, input: { path: file, content: bad } });
+  writeFileSync(file, bad); // what the write tool does
+  const res = await r.emitToolResult({ type: "tool_result", toolName: "write", toolCallId: id, input: { path: file, content: bad }, content: [{ type: "text", text: "written" }], details: undefined, isError: false });
+  return { now: readFileSync(file, "utf8"), res: JSON.stringify(res ?? {}) };
+};
+const json = await breakWith("S1.json", '{"验证时间": "2026-11-19"}\n', '{"验证时间": 2026-11-19}\n');
+check(json.now === '{"验证时间": "2026-11-19"}\n' && /put back exactly as it was/.test(json.res) && /"isError":true/.test(json.res), "a JSON file an edit broke is put back, and the result is an error");
+const yaml = await breakWith("cases.yaml", "cases:\n  - id: KH1\n    依据: a\n", "cases:\n  - id: KH1\n    依据: \u0001\n");
+check(yaml.now.includes("依据: a") && /control character U\+0001/.test(yaml.res), "a YAML file with a control character is put back (pi's own yaml package found)");
+const yamlIndent = await breakWith("c2.yaml", "a:\n  b: 1\n", "a:\n  b: 1\n c: [\n");
+check(yamlIndent.now === "a:\n  b: 1\n" && /put back/.test(yamlIndent.res), "a YAML file with broken indentation is put back");
+const py = await breakWith("test_70.py", 'MSG = "line one\\nline two"\n', 'MSG = "line one\nline two"\n');
+check(py.now.includes("\\n") && /put back/.test(py.res), "a Python file whose \\n became a real newline is put back (checked with the real python)");
+const fine = await breakWith("ok.json", "{}\n", '{"a": 1}\n');
+check(fine.now === '{"a": 1}\n' && !/put back/.test(fine.res), "a valid edit is left alone");
+
+// Guard: ssh that runs a command or prints something is allowed; a command's own timeout raises the tool's.
+const bash = async (command) => {
+  const input = { command };
+  const res = await r.emitToolCall({ type: "tool_call", toolName: "bash", toolCallId: `g${++n}`, input });
+  return { blocked: Boolean(res?.block), input };
+};
+check(!(await bash("ssh -V")).blocked && !(await bash('ssh -i ~/.ssh/k bench "echo ok"')).blocked, "ssh -V and ssh with a remote command run");
+check((await bash("ssh bench")).blocked, "ssh without a command is still stopped");
+const slow = await bash("timeout 700 python tools/remote_bench.py --expr KH15");
+check(slow.input.timeout === 760, `timeout 700 in the command: the tool waits 760s (${slow.input.timeout})`);
 session.dispose();
 console.log(ok ? "\x1b[1;32mPASS\x1b[0m e2e runreport" : "\x1b[1;31mFAIL\x1b[0m e2e runreport");
 process.exit(ok ? 0 : 1);
