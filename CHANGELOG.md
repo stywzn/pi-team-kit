@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0] - 2026-11-20
+
+Nested workers, two levels at most.
+
+- A team worker whose lane has 2-3 independent pieces in different files hands them to sub-workers that work at the same time in its own worktree, then checks the combined result itself; the lane's verifier reviews it as usual. `subtasks` checks the parts in code (2 to `team.nested.max`, default 3; none sharing a file; only the worker's own files) and gives each an id; the worker starts them with `subagent` (agent `team-subworker`, task = the id) and waits with `bg_wait`. Any other subagent call from a worker is refused, and each approved call gets the part's task, the worker's folder, the 2-hour deadline and the hand-off 10 minutes before it set in code.
+- Sub-workers (`agents/team-subworker.md`) have no subtasks or subagent tool, so nesting stops there. A team run is itself a level (lead, run, worker, sub-worker), so the lead sets pi-subagents' depth limit to 3 (`PI_SUBAGENT_MAX_DEPTH`, unless already set) while nesting is on. `team.nested.enabled: false` turns it off.
+
 ## [0.8.4] - 2026-11-20
 
 Fixes from real use.

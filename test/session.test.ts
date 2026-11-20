@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { DEFAULTS } from "../lib/config.ts";
-import { buildNotification, compactThreshold, detectRole, modelCaps, sessionNameFrom, terminalTitle } from "../lib/session.ts";
+import { buildNotification, compactThreshold, detectRole, modelCaps, sessionNameFrom, SUBWORKER_MARKER, terminalTitle } from "../lib/session.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const body = (agent: string) => readFileSync(join(ROOT, "agents", `${agent}.md`), "utf8").split(/^---$/m)[2];
@@ -12,6 +12,9 @@ test("roles are detected from this package's agent prompts, so each gets its own
   assert.equal(detectRole({}, body("team-planner")), "planner");
   assert.equal(detectRole({ PI_SUBAGENT_CHILD: "1" }, body("team-worker")), "worker");
   assert.equal(detectRole({ PI_SUBAGENT_CHILD: "1" }, body("team-verifier")), "verifier");
+  assert.equal(detectRole({ PI_SUBAGENT_CHILD: "1" }, body("team-subworker")), "worker", "a sub-worker works like a worker");
+  assert.ok(body("team-subworker").includes(SUBWORKER_MARKER), "and is recognised as one, so it cannot split again");
+  assert.ok(!body("team-worker").includes(SUBWORKER_MARKER));
   assert.equal(detectRole({ PI_SUBAGENT_CHILD: "1" }, "You are scout."), "child");
   assert.equal(detectRole({}, "You are pi, a coding agent."), "lead");
 });

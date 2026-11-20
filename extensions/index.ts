@@ -25,6 +25,7 @@ import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.
 import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
 import { SoloWork } from "../lib/solo.ts";
 import { checkedKind, PY_CHECK, restoredNote, syntaxError } from "../lib/filecheck.ts";
+import { approvePartCall, partTask, validateParts, type Part } from "../lib/nested.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
 import {
   appendRetired,
@@ -79,7 +80,7 @@ import { classifyCommand, commandTimeoutSec, gatePreflight, inspectBash, looksLi
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
-import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
+import { buildNotification, compactThreshold, detectRole, sessionNameFrom, SUBWORKER_MARKER, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -610,6 +611,84 @@ export default function piTeamKit(pi: ExtensionAPI) {
       isError: true,
       structuredContent: event.structuredContent,
     };
+  });
+
+  // ---------- nested workers, two levels at most (lib/nested.ts) ----------
+  // A team worker hands independent parts of its own task to sub-workers that work at the same time in its
+  // worktree, and waits for them. Sub-workers have no subtasks tool (agents/team-subworker.md) and are refused here.
+  let subworker = false;
+  pi.on("before_agent_start", async (event) => {
+    subworker = (event.systemPrompt ?? "").includes(SUBWORKER_MARKER);
+  });
+  // A team run is itself a level (lead -> run -> worker), so a worker's sub-workers sit at depth 3. pi-subagents
+  // reads the top-level limit from PI_SUBAGENT_MAX_DEPTH (default 2) in the lead's process; a value the user set wins.
+  pi.on("session_start", async () => {
+    if (!process.env.PI_SUBAGENT_CHILD && state.config.team.nested.enabled && !process.env.PI_SUBAGENT_MAX_DEPTH) process.env.PI_SUBAGENT_MAX_DEPTH = "3";
+  });
+  /** The first user message of this session: a worker's task text. */
+  const firstTask = (ctx: ExtensionContext): string => {
+    try {
+      for (const e of ctx.sessionManager.getEntries() as Array<{ type?: string; message?: { role?: string; content?: unknown } }>) {
+        if (e.type !== "message" || e.message?.role !== "user") continue;
+        const c = e.message.content;
+        return typeof c === "string" ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p?.text ?? "").join("\n") : "";
+      }
+    } catch {
+      /* no history */
+    }
+    return "";
+  };
+  if (process.env.PI_SUBAGENT_CHILD)
+    pi.registerTool({
+      name: "subtasks",
+      label: "Sub-workers",
+      description:
+        "Team workers only: approve 2-3 independent parts of your own task for sub-workers that work at the same time in your worktree, each on different files of yours. It checks the parts and gives each an id; then start them all in one message with subagent (agent team-subworker, task = the id) and wait with bg_wait {all: true}. Same 2-hour deadline and hand-off as you. Sub-workers cannot split further.",
+      promptSnippet: "Split your own task into sub-workers that run at the same time",
+      parameters: Type.Object({
+        parts: Type.Array(
+          Type.Object({
+            title: Type.String(),
+            brief: Type.String({ description: "What to change, where, and how to tell it is done; the sub-worker sees nothing else" }),
+            files: Type.Array(Type.String(), { description: "Files (or globs) of yours this part may change; parts must not share files" }),
+            verify: Type.Optional(Type.Object({ cmd: Type.String(), expect: Type.Optional(Type.String()) })),
+          }),
+          { minItems: 2, maxItems: 4 },
+        ),
+      }),
+      async execute(_id, params, signal, _onUpdate, ctx) {
+        if (role !== "worker" || subworker) throw new Error("only a team worker can start sub-workers (two levels at most)");
+        const t = state.config.team;
+        if (!t.nested.enabled) throw new Error("nested workers are off (team.nested.enabled in ptk.json)");
+        const task = firstTask(ctx);
+        const owned = /Files you own \(edit only these; new files only inside them\):\n((?:- .*(?:\n|$))+)/.exec(task)?.[1].split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim());
+        const parts = validateParts(params.parts as Part[], t.nested.max, owned);
+        const goal = /Overall goal: ([^\n]*)/.exec(task)?.[1] ?? "";
+        const items = parts.map((p, i) => ({ key: `part-${i + 1}`, label: `Part ${i + 1}: ${p.title}`.slice(0, 80), task: partTask(goal, p, parts.filter((_, j) => j !== i)) }));
+        const model = roleModels(t.models, t.thinking, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined).worker;
+        // pi-subagents' subagent tool is for the model only (an extension cannot call it), so the parts are approved
+        // here and the worker starts them; the hook below swaps each id for its task and sets deadline and folder.
+        approvedParts.clear();
+        const ids = items.map((it) => {
+          const id = `ptk-${it.key}`;
+          approvedParts.set(id, { task: it.task, model });
+          return id;
+        });
+        return text(
+          `Approved ${ids.length} parts. Start them now, all in one message, one subagent call each:\n` +
+            ids.map((id, i) => `- subagent({"agent": "team-subworker", "task": "${id}"})   (${parts[i].title})`).join("\n") +
+            `\nThen call bg_wait with {"all": true} and wait until every part is done. Read each report, then check the combined result yourself: run your checks, fix what a part left, and finish your own report.`,
+        );
+      },
+    });
+  // Sub-workers start only as approved parts: the worker's subagent call names a part id, and here it becomes that
+  // part's task with the sub-worker agent, the 2-hour deadline, the hand-off before it, in the worker's own folder.
+  const approvedParts = new Map<string, { task: string; model?: string }>();
+  pi.on("tool_call", async (event) => {
+    if (event.toolName !== "subagent" || !process.env.PI_SUBAGENT_CHILD || role !== "worker") return;
+    const t = state.config.team;
+    const why = approvePartCall(event.input as Record<string, unknown>, approvedParts, { cwd: state.cwd, timeoutMs: t.childTimeoutMin * 60_000, checkpointMs: t.checkpointMin * 60_000, subworker });
+    if (why) return { block: true, reason: why };
   });
 
   // ---------- team mode by default: a big task goes to workers, not one session (lib/solo.ts) ----------

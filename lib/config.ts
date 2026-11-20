@@ -97,6 +97,9 @@ export interface PtkConfig {
     /** Team mode by default: past `files` distinct files changed by the lead in one request, further edits go to
      *  workers (team_run). `nudgeCalls`: one note after that many tool calls. /team-auto off for one session. */
     auto: { enabled: boolean; files: number; nudgeCalls: number };
+    /** Nested workers, two levels at most: a team worker may hand up to `max` independent parts of its own task to
+     *  sub-workers working at the same time in its worktree (subtasks tool). Same deadline and hand-off. */
+    nested: { enabled: boolean; max: number };
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -174,6 +177,7 @@ export const DEFAULTS: PtkConfig = {
     childTimeoutMin: 120,
     checkpointMin: 10,
     auto: { enabled: true, files: 6, nudgeCalls: 40 },
+    nested: { enabled: true, max: 3 },
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -315,6 +319,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.auto.files = clamp(Math.round(Number(config.team.auto.files) || 0), 0, 1000);
   config.team.auto.nudgeCalls = clamp(Math.round(Number(config.team.auto.nudgeCalls) || 0), 0, 10_000);
   config.team.auto.enabled = config.team.auto.enabled !== false;
+  config.team.nested.enabled = config.team.nested.enabled !== false;
+  config.team.nested.max = clamp(Math.round(Number(config.team.nested.max) || 0), 2, 4);
   return { config, files, warnings };
 }
 

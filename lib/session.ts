@@ -7,8 +7,12 @@ export type SessionRole = "lead" | "planner" | "worker" | "verifier" | "child";
 const ROLE_MARKERS: [SessionRole, string][] = [
   ["planner", "You plan a team run."],
   ["worker", "You are a worker in a team run."],
+  ["worker", "You are a sub-worker in a team run."],
   ["verifier", "You verify one lane of a team run."],
 ];
+
+/** A sub-worker (second level): works like a worker but may not start sub-workers itself. */
+export const SUBWORKER_MARKER = "You are a sub-worker in a team run.";
 
 /** Which kind of session is running, from the subagent environment flag and the system prompt. */
 export function detectRole(env: NodeJS.ProcessEnv, systemPrompt: string): SessionRole {

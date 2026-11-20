@@ -21,6 +21,7 @@ cd ~/code/ptk-demo && pi
 你 ──只和──> 主会话（lead）
                ├─> 规划员 planner：读代码，拆任务，给每个任务划定能改的文件
                ├─> worker ×≤4：各自在独立的 git worktree（仓库的独立副本）里改代码
+               │      ├─ 自己这一路有几块互不相干的文件 → 用 subtasks 分给 ≤3 个子 worker 同时做（只到这一层）
                │      └─ 有疑问 → 问主会话（不是问你）
                └─> 审查员 verifier：全新上下文、只读，看 patch，不过关就打回同一个 worker
 ```
@@ -55,7 +56,7 @@ cd ~/code/ptk-demo && pi
 | 两边各自发明同一个接口 | 规划员必须把接口约定原文写进双方的 brief（先定接口，再并行） |
 | worker 和审查员来回扯皮 | 返工最多 3 轮（`team.maxRounds`），超过就交给主会话/你决定 |
 | 命令或测试卡住 | 命令默认 180 秒、测试 900 秒、安装构建 600 秒超时；服务和 watch 必须走后台 `bg` |
-| worker 等回复等到天荒地老 | 团队运行总是后台异步跑，主会话随时能回答；整次运行有 120 分钟上限（`team.runTimeoutMin`） |
+| worker 等回复等到天荒地老 | 团队运行总是后台异步跑，主会话随时能回答；每个子 agent 2 小时、整次运行 4 小时上限（`team.childTimeoutMin`、`team.runTimeoutMin`） |
 | 合并时冲突 | 按文件归属分工后基本不会；万一冲突，`team_integrate` 停在那一路并说明原因，已合并的保留 |
 
 ## 5. 模型怎么搭（DeepSeek + GLM）
