@@ -88,9 +88,12 @@ export interface PtkConfig {
     gateTimeoutSec: number;
     /** Deadline for one whole team run (planning, every lane and its rework rounds). */
     runTimeoutMin: number;
-    /** Deadline for each planner, worker and verifier run. pi-subagents stops a child after 30 minutes by default,
-     *  too short for a worker running a slow suite (UI tests). */
+    /** Deadline for each planner, worker and verifier run, and the default for subagent runs the lead starts
+     *  itself. pi-subagents stops a child after 30 minutes by default, too short for real work (UI suites). */
     childTimeoutMin: number;
+    /** Minutes before that deadline a running child is told to finish its current step and hand off: changed
+     *  files, test state, what is left. 0 = no checkpoint (the deadline kills it mid-work). */
+    checkpointMin: number;
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -164,8 +167,9 @@ export const DEFAULTS: PtkConfig = {
     maxRounds: 3,
     gate: "",
     gateTimeoutSec: 900,
-    runTimeoutMin: 120,
-    childTimeoutMin: 44,
+    runTimeoutMin: 240,
+    childTimeoutMin: 120,
+    checkpointMin: 10,
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -303,6 +307,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.maxRounds = clamp(Math.round(config.team.maxRounds), 1, 10);
   config.team.childTimeoutMin = clamp(Math.round(config.team.childTimeoutMin), 5, 1440);
   config.team.runTimeoutMin = clamp(Math.round(config.team.runTimeoutMin), config.team.childTimeoutMin, 2880);
+  config.team.checkpointMin = clamp(Math.round(Number(config.team.checkpointMin) || 0), 0, config.team.childTimeoutMin - 1);
   return { config, files, warnings };
 }
 

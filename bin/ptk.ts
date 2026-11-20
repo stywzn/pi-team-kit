@@ -215,6 +215,7 @@ switch (cmd) {
           maxTasks: t.maxTasks,
           models: roleModels(t.models, t.thinking),
           childTimeoutMs: t.childTimeoutMin * 60_000,
+          checkpointMs: t.checkpointMin * 60_000,
           laneTests: t.laneTests,
         }),
       );

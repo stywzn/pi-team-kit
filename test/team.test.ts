@@ -218,16 +218,21 @@ test("lanes run in parallel and are reported in plan order", async () => {
 
 test("every child run gets the configured deadline (pi-subagents would stop it after 30 minutes), and a lane keeps why it was sent back", async () => {
   let reviews = 0;
-  const { result, calls } = await simulate({ childTimeoutMs: 44 * 60_000 }, (key) =>
+  const { result, calls } = await simulate({ childTimeoutMs: 120 * 60_000, checkpointMs: 10 * 60_000 }, (key) =>
     key.includes("verify")
       ? { structuredOutput: ++reviews === 1 ? { verdict: "rework", summary: "bug", findings: [{ file: "a.py", issue: "off by one", fix: "use <=" }] } : { verdict: "pass", summary: "ok", findings: [] } }
       : {},
   );
   assert.deepEqual(calls.map((c) => c.key), ["one-work", "one-verify-1", "one-fix-1", "one-verify-2"]);
-  for (const c of calls) assert.equal((c.item as { timeoutMs?: number }).timeoutMs, 2_640_000, `${c.key} has the deadline`);
+  for (const c of calls) {
+    assert.equal((c.item as { timeoutMs?: number }).timeoutMs, 7_200_000, `${c.key} has the deadline`);
+    assert.equal((c.item as { checkpointBeforeDeadlineMs?: number }).checkpointBeforeDeadlineMs, 600_000, `${c.key} hands off 10 minutes before it`);
+  }
   assert.deepEqual(result.lanes[0].history, [{ round: 1, findings: [{ file: "a.py", issue: "off by one", fix: "use <=" }] }]);
+  assert.deepEqual(result.lanes[0].files, ["a.py"], "the result says what the lane was allowed to change");
   const plain = await simulate({}, (key) => (key.includes("verify") ? { structuredOutput: { verdict: "pass", summary: "fine", findings: [] } } : {}));
   assert.equal((plain.calls[0].item as { timeoutMs?: number }).timeoutMs, undefined, "no setting: pi-subagents decides");
+  assert.equal((plain.calls[0].item as { checkpointBeforeDeadlineMs?: number }).checkpointBeforeDeadlineMs, undefined);
 });
 
 test("models per role: a thinking level rides on the role's model, or on the lead's when the role has none", () => {

@@ -31,6 +31,8 @@ export interface TeamPlan {
   models?: { planner?: string; worker?: string; verifier?: string };
   /** Deadline for each planner, worker and verifier run; pi-subagents' own default is 30 minutes. */
   childTimeoutMs?: number;
+  /** How long before that deadline a child is told to stop after its current step and hand off. */
+  checkpointMs?: number;
   /** Each lane's gate runs only the test files the lane owns (see narrowGate in the script). */
   laneTests?: boolean;
 }
@@ -220,8 +222,14 @@ function gateText(lane) { var g = laneGate(lane); return g ? JSON.stringify(g.co
 var CHECKLIST = "it does what the tasks ask; no obvious bug or missing edge case; tests changed when behaviour changed; " +
   "no file changed outside the owned list";
 function withModel(item, role) { var m = PLAN.models && PLAN.models[role]; if (m) item.model = m; return bounded(item); }
-// Each child gets the configured deadline (pi-subagents would stop it after 30 minutes otherwise).
-function bounded(item) { if (PLAN.childTimeoutMs) item.timeoutMs = PLAN.childTimeoutMs; return item; }
+// Each child gets the configured deadline (pi-subagents would stop it after 30 minutes otherwise), and shortly
+// before it a request to finish the current step and hand off (changed files, test state, what is left) instead
+// of being killed mid-work.
+function bounded(item) {
+  if (PLAN.childTimeoutMs) item.timeoutMs = PLAN.childTimeoutMs;
+  if (PLAN.checkpointMs && (!PLAN.childTimeoutMs || PLAN.checkpointMs < PLAN.childTimeoutMs)) item.checkpointBeforeDeadlineMs = PLAN.checkpointMs;
+  return item;
+}
 
 // Lane planning, same rules as planLanes() in lib/team.ts (tests check they agree).
 function norm(p) { return String(p || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""); }
@@ -305,6 +313,8 @@ function finish(lane, writer, review, rounds, state) {
   return {
     lane: lane.key,
     tasks: lane.tasks.map(function (t) { return t.key; }),
+    // what the lane was allowed to change: a lane that did not pass is checked against it
+    files: lane.files,
     state: state,
     rounds: rounds,
     runId: (writer && writer.runId) || null,

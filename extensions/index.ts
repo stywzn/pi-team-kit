@@ -22,6 +22,7 @@ import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions
 import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
+import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
 import {
   appendRetired,
@@ -73,7 +74,7 @@ import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } fro
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -429,6 +430,127 @@ export default function piTeamKit(pi: ExtensionAPI) {
       content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${extra.join("\n[ptk] ")}` }],
       structuredContent: event.structuredContent,
     };
+  });
+
+  // ---------- subagent runs: deadline, hand-off before it, and what a run left behind when it did not finish ----------
+  // Subagent runs the lead starts itself get the same deadline and checkpoint as team children (pi-subagents would
+  // kill them after 30 minutes, mid-work). When a run, or a lane of a team run, ends without passing, the next turn
+  // starts with what it changed and whether that stayed inside what it was allowed to touch (lib/runreport.ts).
+  const runBaselines: { at: number; root: string; snap: Map<string, string> }[] = [];
+  const reportedRuns = new Set<string>();
+  const openedAt = Date.now();
+  const repoSnapshot = async (root: string): Promise<Map<string, string> | undefined> => {
+    const r = await pi.exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain", "-z", "--untracked-files=all"], { cwd: root, timeout: 10_000 }).catch(() => undefined);
+    return r?.code === 0 ? statusSnapshot(root, r.stdout) : undefined;
+  };
+  pi.on("tool_call", async (event) => {
+    if (event.toolName !== "subagent" || process.env.PI_SUBAGENT_CHILD) return;
+    const input = event.input as Record<string, unknown>;
+    if (!input.task && !input.tasks && !input.chain && !input.workflow) return; // list, status and other actions
+    const t = state.config.team;
+    if (input.timeoutMs === undefined && input.maxRuntimeMs === undefined) input.timeoutMs = t.childTimeoutMin * 60_000;
+    const deadline = Number(input.timeoutMs ?? input.maxRuntimeMs);
+    if (input.checkpointBeforeDeadlineMs === undefined && t.checkpointMin > 0 && t.checkpointMin * 60_000 < deadline) input.checkpointBeforeDeadlineMs = t.checkpointMin * 60_000;
+    // What the repo looked like before the run, so its own changes can be told apart afterwards.
+    const root = findRepoRoot(typeof input.cwd === "string" ? resolve(state.cwd, input.cwd) : state.cwd);
+    const snap = root ? await repoSnapshot(root) : undefined;
+    if (root && snap) {
+      runBaselines.push({ at: Date.now(), root, snap });
+      if (runBaselines.length > 20) runBaselines.shift();
+    }
+  });
+  const changesIn = async (root: string, before?: Map<string, string>): Promise<Changed[] | undefined> => {
+    const now = await repoSnapshot(root);
+    if (!now) return undefined;
+    const files = (before ? changedBetween(before, now, (rel) => fileState(root, rel)) : [...now.keys()]).slice(0, 60);
+    if (!files.length) return [];
+    const ns = await pi.exec("git", ["--no-optional-locks", "diff", "--numstat", "HEAD", "--", ...files], { cwd: root, timeout: 10_000 }).catch(() => undefined);
+    const stats = parseNumstat(ns?.code === 0 ? ns.stdout : "");
+    return files.map((path) => {
+      const s = stats.get(path);
+      if (s) return { path, ...s };
+      try {
+        const st = statSync(join(root, path));
+        if (st.isFile() && st.size <= 2_000_000) return { path, newLines: readFileSync(join(root, path), "utf8").split("\n").length };
+      } catch {
+        /* deleted */
+      }
+      return { path };
+    });
+  };
+  const laneWorktree = (runDir?: string): string | undefined => {
+    if (!runDir) return undefined;
+    try {
+      const wt = worktreeFromHandoff(readFileSync(join(runDir, "handoff.json"), "utf8"))?.path;
+      if (wt && existsSync(wt)) return wt;
+    } catch {
+      /* no handoff: a run that did not finish */
+    }
+    try {
+      const wt = runFacts(JSON.parse(readFileSync(join(runDir, "status.json"), "utf8"))).worktree;
+      return wt && existsSync(wt) ? wt : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const reportRun = async (run: NoticeRun): Promise<ReportItem[]> => {
+    if (!run.asyncDir) return [];
+    let status: unknown;
+    try {
+      status = JSON.parse(readFileSync(join(run.asyncDir, "status.json"), "utf8"));
+    } catch {
+      return [];
+    }
+    if (run.agent === "workflow") {
+      const items: ReportItem[] = [];
+      for (const lane of lanesNotPassed((status as { workflow?: { value?: unknown } }).workflow?.value)) {
+        const wt = laneWorktree(lane.runDir);
+        const changed = (wt && (await changesIn(wt))) || [];
+        const outside = lane.files.length ? changed.map((c) => c.path).filter((p) => !lane.files.some((f) => f === "**" || patternsOverlap(f, p))) : [];
+        items.push({ title: `team lane ${lane.lane}: ${lane.state}`, where: wt, changed, outside, lastTools: [], note: wt ? undefined : "its worktree is gone or was never made" });
+      }
+      if (!items.length && run.status !== "completed") items.push({ title: `team run ${run.status}`, changed: [], outside: [], lastTools: [], error: runFacts(status).error });
+      return items;
+    }
+    if (run.status === "completed") return [];
+    const f = runFacts(status);
+    const root = f.worktree ?? (f.cwd ? findRepoRoot(f.cwd) : undefined);
+    if (!root) return [{ title: `subagent ${run.agent} ${run.status}`, changed: [], outside: [], lastTools: f.lastTools, error: f.error }];
+    const before = f.worktree ? undefined : [...runBaselines].reverse().find((b) => pathKey(b.root) === pathKey(root) && b.at <= (f.startedAt ?? Date.now()) + 5_000)?.snap;
+    const changed = (await changesIn(root, before)) ?? [];
+    const minutes = run.durationMs ? ` after ${Math.round(run.durationMs / 60_000)} min` : "";
+    return [
+      {
+        title: `subagent ${run.agent} ${run.status}${minutes}`,
+        where: root,
+        changed,
+        outside: [],
+        lastTools: f.lastTools,
+        error: f.error,
+        note: f.worktree || before ? undefined : "no snapshot from before the run: this lists every uncommitted change in the repo, yours included",
+      },
+    ];
+  };
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD) return;
+    try {
+      const runs: NoticeRun[] = [];
+      const ev = event as { messageType?: string; message?: { customType?: string; details?: unknown } };
+      if (ev.messageType === "custom" && ev.message?.customType === "subagent-notify") runs.push(...noticeRuns(ev.message.details));
+      // A notice that arrived during a turn joined that turn; it is picked up from the session at the next one.
+      for (const e of ctx.sessionManager.getEntries().slice(-40) as Array<{ type?: string; customType?: string; details?: unknown; timestamp?: string }>)
+        if (e.type === "custom_message" && e.customType === "subagent-notify" && Date.parse(e.timestamp ?? "") >= openedAt) runs.push(...noticeRuns(e.details));
+      const items: ReportItem[] = [];
+      for (const run of runs) {
+        if (reportedRuns.has(run.runId)) continue;
+        reportedRuns.add(run.runId);
+        items.push(...(await reportRun(run)));
+      }
+      if (!items.length) return;
+      return { message: { customType: "ptk-run-report", content: formatRunReport(items), display: true } };
+    } catch {
+      return; // a report is a convenience; never block the turn
+    }
   });
 
   // ---------- facts ----------
@@ -808,6 +930,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         maxTasks: t.maxTasks,
         models,
         childTimeoutMs: t.childTimeoutMin * 60_000,
+        checkpointMs: t.checkpointMin * 60_000,
         laneTests: t.laneTests,
       };
       const data = await rpc("spawn", {

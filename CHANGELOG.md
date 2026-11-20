@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.2] - 2026-11-20
+
+From real use: a worker timed out after 30 minutes and left 250 lines nobody had looked at.
+
+- Every child run gets 2 hours (`team.childTimeoutMin`, was 44 minutes); a whole team run 4 hours (`team.runTimeoutMin`). Subagent runs the lead starts itself get the same deadline instead of pi-subagents' 30 minutes, unless the call sets one.
+- Ten minutes before the deadline (`team.checkpointMin`, 0 = off) a running child is asked to finish its current tool call and hand off: changed files, test state, what is left (pi-subagents' `checkpointBeforeDeadlineMs`).
+- When a subagent run ends without finishing (timed out, failed, stopped), or a team lane does not pass, the lead's next turn starts with what it left behind: changed files with +/- lines (only the run's own changes when the repo was snapshotted before it), files outside what the lane was allowed to change, the error and the last tool calls.
+
 ## [0.8.1] - 2026-11-18
 
 Fixes found by checking 0.8.0 with real documents and odd inputs.
