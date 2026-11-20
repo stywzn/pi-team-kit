@@ -23,6 +23,7 @@ import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../l
 import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
+import { SoloWork } from "../lib/solo.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
 import {
   appendRetired,
@@ -553,6 +554,41 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   });
 
+  // ---------- team mode by default: a big task goes to workers, not one session (lib/solo.ts) ----------
+  const solo = new SoloWork({ enabled: true, files: 6, nudgeCalls: 40 });
+  let soloOff = false; // /team-auto off, for this session
+  const soloFile = (p: unknown) => (typeof p === "string" && p.trim() ? resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir())) : undefined);
+  pi.on("input", async (event) => {
+    if (event.source !== "extension") solo.userInput();
+  });
+  pi.on("tool_call", async (event) => {
+    if (process.env.PI_SUBAGENT_CHILD) return;
+    const a = state.config.team.auto;
+    solo.opts = { enabled: a.enabled && !soloOff, files: a.files, nudgeCalls: a.nudgeCalls };
+    const why = solo.before(event.toolName, soloFile((event.input as { path?: unknown }).path));
+    if (why) return { block: true, reason: why };
+  });
+  pi.on("tool_result", async (event) => {
+    if (process.env.PI_SUBAGENT_CHILD) return;
+    const note = solo.after(event.toolName, soloFile((event.input as { path?: unknown }).path), event.isError);
+    if (!note) return;
+    return { content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${note}` }], structuredContent: event.structuredContent };
+  });
+  pi.registerCommand("team-auto", {
+    description: "Team mode for this session: on (default) hands a big task to workers past a few files; off lets the lead do it alone",
+    handler: async (args, ctx) => {
+      const v = (args ?? "").trim().toLowerCase();
+      if (v === "off" || v === "on") soloOff = v === "off";
+      const a = state.config.team.auto;
+      ctx.ui.notify(
+        soloOff || !a.enabled
+          ? `Team mode is off${soloOff ? " for this session (/team-auto on)" : " (team.auto.enabled in ptk.json)"}: the lead may change any number of files itself.`
+          : `Team mode is on: past ${a.files} files in one request the lead hands the rest to workers (team_run). /team-auto off to turn it off for this session.`,
+        "info",
+      );
+    },
+  });
+
   // ---------- facts ----------
 
   let factWrites: Promise<unknown> = Promise.resolve();
@@ -833,7 +869,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
     name: "team_run",
     label: "Team run",
     description:
-      "Start a team run: each lane gets a worker in its own git worktree, the gate command must pass, a fresh read-only verifier checks the patch, and failed checks go back to the same worker (bounded rounds). Tasks that share files are merged into one lane so lanes never conflict. Runs in the background; you are notified when it finishes, then call team_integrate.",
+      "Start a team run: each lane gets a worker in its own git worktree, the gate command must pass, a fresh read-only verifier checks the patch, and failed checks go back to the same worker (bounded rounds). Tasks that share files are merged into one lane so lanes never conflict. Runs in the background; you are notified when it finishes, then call team_integrate. " +
+      "Use it whenever the work has independent parts, not only for big features: N cases to write, N questions to check in the source (each lane writes its findings to its own file), N files to fix. A running worker can be redirected with subagent action steer.",
     promptSnippet: "Run a goal with a planner, parallel workers, a verifier and automatic rework",
     promptGuidelines: [
       "Before team_run, settle the brief with the user: goal, doneWhen (the checks that prove it), outOfScope and your assumptions. Ask about anything unclear and wait; team_run shows the brief to the user for confirmation.",

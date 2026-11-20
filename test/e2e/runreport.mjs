@@ -56,6 +56,23 @@ const again = await r.emitBeforeAgentStart({ messageType: "custom", message }, {
 check(!JSON.stringify(again ?? {}).includes("ptk-run-report"), "a run is reported once");
 const okRun = { ...message, details: { runs: [{ runId: "run-2", agent: "team-worker", status: "completed", asyncDir: dir }] } };
 check(!JSON.stringify((await r.emitBeforeAgentStart({ messageType: "custom", message: okRun }, {})) ?? {}).includes("ptk-run-report"), "a run that finished is not reported");
+
+// Team mode by default: the lead's 7th file in one request goes to workers.
+let n = 0;
+const edit = async (path) => {
+  const id = `e${++n}`;
+  const call = await r.emitToolCall({ type: "tool_call", toolName: "edit", toolCallId: id, input: { path } });
+  if (call?.block) return call.reason;
+  await r.emitToolResult({ type: "tool_result", toolName: "edit", toolCallId: id, input: { path }, content: [{ type: "text", text: "ok" }], details: undefined, isError: false });
+  return undefined;
+};
+await r.emitInput?.({ type: "input", text: "do the big thing", source: "interactive" });
+for (let i = 1; i <= 6; i++) await edit(join(repo, `f${i}.py`));
+const blocked = await edit(join(repo, "f7.py"));
+check(/7th file[\s\S]*team_run/.test(blocked ?? ""), "the 7th file of a request is handed to workers");
+check((await edit(join(repo, "f1.py"))) === undefined, "a file it already changed may be finished");
+await r.emitToolResult({ type: "tool_result", toolName: "team_run", toolCallId: "t1", input: {}, content: [{ type: "text", text: "started" }], details: undefined, isError: false });
+check((await edit(join(repo, "f8.py"))) === undefined, "after team_run the lead may fix up anything");
 session.dispose();
 console.log(ok ? "\x1b[1;32mPASS\x1b[0m e2e runreport" : "\x1b[1;31mFAIL\x1b[0m e2e runreport");
 process.exit(ok ? 0 : 1);

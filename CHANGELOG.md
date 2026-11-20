@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.3] - 2026-11-20
+
+Team mode by default, from real use: a lead did hours of work alone (48 files) that workers could have done in parallel.
+
+- In one request, the lead may change 6 files itself (`team.auto.files`); a 7th is refused with: commit the finished part, hand the rest to workers with team_run. Finishing files it already changed is fine, and after a team run it may fix up anything. A reply from the user starts a new count; `/team-auto off` turns it off for the session, `team.auto.enabled: false` for good.
+- After 40 tool calls in a request (`team.auto.nudgeCalls`) the lead gets one note that team_run can run independent parts in parallel.
+- team_run's description says when to use it beyond features (N cases to write, N questions to check, N files to fix) and that a running worker can be redirected with subagent's steer.
+
 ## [0.8.2] - 2026-11-20
 
 From real use: a worker timed out after 30 minutes and left 250 lines nobody had looked at.

@@ -94,6 +94,9 @@ export interface PtkConfig {
     /** Minutes before that deadline a running child is told to finish its current step and hand off: changed
      *  files, test state, what is left. 0 = no checkpoint (the deadline kills it mid-work). */
     checkpointMin: number;
+    /** Team mode by default: past `files` distinct files changed by the lead in one request, further edits go to
+     *  workers (team_run). `nudgeCalls`: one note after that many tool calls. /team-auto off for one session. */
+    auto: { enabled: boolean; files: number; nudgeCalls: number };
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -170,6 +173,7 @@ export const DEFAULTS: PtkConfig = {
     runTimeoutMin: 240,
     childTimeoutMin: 120,
     checkpointMin: 10,
+    auto: { enabled: true, files: 6, nudgeCalls: 40 },
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -308,6 +312,9 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.childTimeoutMin = clamp(Math.round(config.team.childTimeoutMin), 5, 1440);
   config.team.runTimeoutMin = clamp(Math.round(config.team.runTimeoutMin), config.team.childTimeoutMin, 2880);
   config.team.checkpointMin = clamp(Math.round(Number(config.team.checkpointMin) || 0), 0, config.team.childTimeoutMin - 1);
+  config.team.auto.files = clamp(Math.round(Number(config.team.auto.files) || 0), 0, 1000);
+  config.team.auto.nudgeCalls = clamp(Math.round(Number(config.team.auto.nudgeCalls) || 0), 0, 10_000);
+  config.team.auto.enabled = config.team.auto.enabled !== false;
   return { config, files, warnings };
 }
 
