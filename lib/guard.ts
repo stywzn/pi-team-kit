@@ -422,3 +422,14 @@ export function sleepSeconds(command: string): number {
   for (const m of command.matchAll(/(?:^|[\s;&|(])timeout\s+\/t\s+(\d+)/gi)) total += Number(m[1]);
   return Math.ceil(total);
 }
+
+/**
+ * A passing test run's full log adds tokens, not information: keep its last lines (the summary). Failures and
+ * listings (--collect-only, --list) are never cut. Undefined = keep the output as it is.
+ */
+export function trimPassingTest(command: string, output: string, failed: boolean, keep = 15): string | undefined {
+  if (failed || classifyCommand(command) !== "test" || /--collect-only|--co\b|--list|--help/.test(command)) return undefined;
+  const lines = output.replace(/\n+$/, "").split("\n");
+  if (lines.length <= keep * 2 + 10) return undefined;
+  return `[ptk] passed; the last ${keep} of ${lines.length} lines (the rest of a passing run's log is not kept):\n${lines.slice(-keep).join("\n")}`;
+}

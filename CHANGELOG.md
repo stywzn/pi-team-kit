@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+Precise tasks, cheaper reviews, checkable results. Ideas taken from obra/superpowers (plan granularity, evidence before claims, re-review only the open findings) and phakeandy/dotfiles (keep failures whole, trim the rest).
+
+- Tasks carry `verify` (a focused command and what it prints when done), `caseIds` and `uses` (shared fixtures or helpers they build on); a run carries `constraints`, rules every worker and verifier gets word for word. The planner is told the task size (the smallest piece with its own check), to put shared setup in one task, and that vague briefs ("handle edge cases") are not briefs.
+- Workers iterate with their task's own check and run the gate once at the end. On a failure they write down the cause and evidence before changing anything and never retry a fix that failed; a test that passes alone but fails with others is treated as leaking state. After three real attempts they report BLOCKED, and the lane goes to the lead (and a person) without a review round.
+- The worker's evidence (commands and output) goes to the verifier only; the lead gets status, files and concerns.
+- The verifier checks "does it do each task" before quality, treats the worker's report as claims, has a test-code checklist (sleeps, assertions that cannot fail, order dependence, shared data), and marks findings important or minor: minor ones go to the lead and cost no round. A re-review checks only the fixes it asked for.
+- The same gate failure, or the same findings, twice in a row: the rework says so and asks for the cause first (retries are kept).
+- Passing test runs keep only their summary in the context (`guard.trimPassingTests`); failures are never cut.
+- More lanes than run at once are merged into the smallest ones (`team.maxParallel`): they would only queue, and each lane costs a worker and a verifier.
+- `team.models.lead` puts lead sessions on a model (the lead's long context is usually most of the cost); without it, a lead on a pricier model than the team gets one notice.
+
 ## [0.9.0] - 2026-11-20
 
 Nested workers, two levels at most.

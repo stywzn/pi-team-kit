@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, commandTimeoutSec, inspectBash, sleepSeconds, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, commandTimeoutSec, inspectBash, sleepSeconds, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, trimPassingTest, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -239,4 +239,16 @@ test("sleeps in a command count toward its tool timeout (sleep 178 under 180 s w
   assert.equal(sleepSeconds("Start-Sleep -Milliseconds 1500"), 2);
   assert.equal(sleepSeconds("timeout /t 60 /nobreak"), 60);
   assert.equal(sleepSeconds("python sleep_test.py && echo sleeping"), 0);
+});
+
+test("a passing test run keeps only its summary; failures and listings are never cut", () => {
+  const log = Array.from({ length: 200 }, (_, i) => `tests/test_${i}.py::test_x PASSED`).concat(["===== 200 passed in 3.2s ====="]).join("\n");
+  const t = trimPassingTest("python -m pytest -v", log, false)!;
+  assert.match(t, /^\[ptk\] passed; the last 15 of 201 lines/);
+  assert.match(t, /200 passed in 3\.2s/);
+  assert.ok(t.length < log.length / 5);
+  assert.equal(trimPassingTest("python -m pytest -v", log, true), undefined, "a failure keeps everything");
+  assert.equal(trimPassingTest("pytest --collect-only -q", log, false), undefined, "a listing is the point");
+  assert.equal(trimPassingTest("cat big.log", log, false), undefined, "only test commands");
+  assert.equal(trimPassingTest("npx playwright test", "ok\n1 passed", false), undefined, "short output stays");
 });

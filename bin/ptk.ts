@@ -195,8 +195,9 @@ switch (cmd) {
       console.error("usage: ptk plan <tasks.json> [--script]");
       process.exit(2);
     }
-    const input = JSON.parse(readFileSync(file, "utf8")) as { goal?: string; tasks: TeamTask[]; gate?: string };
-    const lanes = planLanes(validateTasks(input.tasks, loadConfig(cwd).config.team.maxTasks));
+    const input = JSON.parse(readFileSync(file, "utf8")) as { goal?: string; tasks: TeamTask[]; gate?: string; constraints?: string[] };
+    const cfg = loadConfig(cwd).config.team;
+    const lanes = planLanes(validateTasks(input.tasks, cfg.maxTasks), cfg.maxParallel);
     for (const l of lanes) console.log(`${l.key}: ${l.tasks.map((t) => t.key).join(" + ")}  [${l.files.join(", ")}]`);
     if (rest.includes("--script")) {
       // Same plan fields team_run builds, so the printed script matches what would really run.
@@ -217,6 +218,8 @@ switch (cmd) {
           childTimeoutMs: t.childTimeoutMin * 60_000,
           checkpointMs: t.checkpointMin * 60_000,
           laneTests: t.laneTests,
+          maxLanes: t.maxParallel,
+          constraints: (input.constraints ?? []).map(String).filter(Boolean).slice(0, 10),
         }),
       );
     }
