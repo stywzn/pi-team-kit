@@ -78,7 +78,7 @@ import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } fro
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
 import { classifyCommand, commandTimeoutSec, sleepSeconds, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, trimPassingTest, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, splitStatus, stashCommand, taskWarnings, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, splitStatus, stashCommand, taskProblems, taskWarnings, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, SUBWORKER_MARKER, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -873,6 +873,24 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (r.code !== 0) throw new Error(`git status failed: ${r.stderr}`);
     return splitStatus(r.stdout);
   }
+  /**
+   * Why a command cannot even start here (python3 being a Store alias, a missing tool, a script that is not
+   * there), or undefined. Only the program is checked: `<program> --version`, or for a script that it exists
+   * (a script would run the whole suite even with --version). A timeout or a failing test suite is fine.
+   */
+  async function programProblem(command: string, root: string): Promise<string | undefined> {
+    const pre = gatePreflight(command);
+    if (pre.kind === "file") {
+      const base = resolve(root, pre.path);
+      const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat", ".sh", ".ps1"] : [""];
+      return exts.some((e) => existsSync(base + e)) ? undefined : `${pre.path} does not exist (relative to ${root}).`;
+    }
+    if (pre.kind !== "command") return undefined;
+    // Quote the name: it came out of the command with its quotes removed, so `a;b` must not become two commands.
+    const r = await runShell(`'${pre.program.replace(/'/g, `'\\''`)}' --version`, root, 20, undefined, gateEnv(root));
+    if (r.missingShell) return "no bash found to run it. On Windows install Git for Windows (pi's bash tool needs it too).";
+    return !r.timedOut && looksUnrunnable(r.code, r.output) ? `\`${pre.program} --version\` said:\n${r.output.trim().slice(0, 500)}` : undefined;
+  }
   /** Top-level folders of the repo, for spotting owned paths that only exist one level down (monorepos). */
   const topDirs = (root: string): string[] => {
     try {
@@ -899,7 +917,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     verify: Type.Optional(
       Type.Object(
         { cmd: Type.String({ description: "focused command, e.g. pytest tests/test_login.py::test_lock -q" }), expect: Type.String({ description: 'what it prints when done, e.g. "1 passed"' }) },
-        { description: "How this task alone is proven done; the worker iterates with it, the verifier checks its output" },
+        { description: "Required. How this task alone is proven done; the worker iterates with it, the verifier checks its output" },
       ),
     ),
     caseIds: Type.Optional(Type.Array(Type.String(), { description: "Test case ids this task automates" })),
@@ -1065,7 +1083,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     promptGuidelines: [
       "Before team_run, settle the brief with the user: goal, doneWhen (the checks that prove it), outOfScope and your assumptions. Ask about anything unclear and wait; team_run shows the brief to the user for confirmation.",
       "The user often names a project by a keyword, not a path: find its folder yourself, pass it as repo, and say which folder you picked in the brief.",
-      "For a small, clear goal (one to three tasks whose files you already know), pass tasks yourself: it skips the planner run. Give each a verify command and what it prints when done (for test automation also caseIds), and rules every task follows in constraints. Leave tasks out for anything larger or unclear.",
+      "For a small, clear goal (one to three tasks whose files you already know), pass tasks yourself: it skips the planner run. Each task needs a verify command and what it prints when done (team_run refuses tasks without one), a brief that names the file and function to change, and paths relative to the repo root; for test automation also caseIds, and rules every task follows in constraints. Leave tasks out for anything larger or unclear.",
       "Leave gate out unless the detected test command is wrong. Do not work around the environment in it: workers' worktrees already have the project's virtualenv active and its ignored local files (.env) copied, and each lane runs only its own test files with a plain test command (a compound command runs whole in every lane).",
       "Once a team run is confirmed it runs unattended: the user may be away. Never wait for the user during it. Answer workers' supervisor questions yourself from the brief and the code; when a product decision is truly needed, take the conservative option and record it for the final report.",
       "When a team_run finishes, call team_integrate with the runDir of every passed lane right away, then write the final report. If it returned state needs-input, answer the planner's questions from the brief where you can (otherwise take the conservative option and say so) and run again with tasks.",
@@ -1094,7 +1112,23 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
       const lanes = planLanes(tasks, t.maxParallel);
-      const warnings = tasks.length ? taskWarnings(tasks, (params.tasks ?? []).map((x) => (Array.isArray(x.files) ? x.files.map(String) : [])), (rel) => existsSync(join(root, rel)), topDirs(root)) : [];
+      // Checked by code, not asked for in prose: a task without a check, a brief that does not say where, a
+      // placeholder, a path that is not in the repo, or a check that cannot run here goes back to the lead now,
+      // before any worker spends an hour on it.
+      const rawFiles = (params.tasks ?? []).map((x) => (Array.isArray(x.files) ? x.files.map(String) : []));
+      const problems = tasks.length ? taskProblems(tasks, rawFiles, (rel) => existsSync(join(root, rel)), topDirs(root)) : [];
+      const programs = new Map<string, Promise<string | undefined>>();
+      for (const task of tasks) {
+        if (!task.verify) continue;
+        const pre = gatePreflight(task.verify.cmd);
+        const key = pre.kind === "command" ? pre.program : pre.kind === "file" ? pre.path : "";
+        if (!key) continue;
+        if (!programs.has(key)) programs.set(key, programProblem(task.verify.cmd, root));
+        const why = await programs.get(key);
+        if (why) problems.push(`${task.key}: verify \`${task.verify.cmd}\` cannot run here: ${why}`);
+      }
+      if (problems.length) throw new Error(`Fix these in tasks, then call team_run again:\n${problems.map((p) => `- ${p}`).join("\n")}`);
+      const warnings = taskWarnings(tasks);
       if (dirty.untracked.length) {
         const owned = lanes.flatMap((l) => l.files);
         const clash = dirty.untracked.filter((f) => owned.some((o) => patternsOverlap(o, f)));
@@ -1106,20 +1140,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
       if (gate) {
-        const pre = gatePreflight(gate);
-        if (pre.kind === "file") {
-          // A script would run the whole suite even with --version: only check that it is there.
-          const base = resolve(root, pre.path);
-          const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat", ".sh", ".ps1"] : [""];
-          if (!exts.some((e) => existsSync(base + e))) throw new Error(`The gate \`${gate}\` cannot run here: ${pre.path} does not exist (relative to ${root}).`);
-        } else if (pre.kind === "command") {
-          const prog = pre.program;
-          // Quote the name: it came out of the gate with its quotes removed, so `a;b` must not become two commands.
-          const r = await runShell(`'${prog.replace(/'/g, `'\\''`)}' --version`, root, 20, undefined, gateEnv(root));
-          if (r.missingShell) throw new Error("No bash found to run the gate. On Windows install Git for Windows (pi's bash tool needs it too).");
-          if (!r.timedOut && looksUnrunnable(r.code, r.output))
-            throw new Error(`The gate \`${gate}\` cannot run here: \`${prog} --version\` said:\n${r.output.trim().slice(0, 500)}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
-        }
+        const why = await programProblem(gate, root);
+        if (why) throw new Error(`The gate \`${gate}\` cannot run here: ${why}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
       }
       const brief = {
         goal: params.goal.trim(),

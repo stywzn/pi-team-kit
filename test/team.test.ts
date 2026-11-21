@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, splitStatus, stashCommand, taskWarnings, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, splitStatus, stashCommand, taskProblems, taskWarnings, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
 
 const task = (key: string, files: string[]): TeamTask => ({ key, title: `Task ${key}`, brief: `Do the ${key} change and add a test for it.`, files });
 
@@ -373,21 +373,44 @@ test("a monorepo gate (cd app && runner) is narrowed to the lane's files inside 
   assert.equal(await gateFor("cd a; pytest -q", ["a/test_x.py"]), "cd a; pytest -q");
 });
 
-test("taskWarnings: long briefs and paths that only exist one folder down", () => {
-  const tree = new Set(["virtual-instrument", "virtual-instrument/docs", "virtual-instrument/docs/api.md", "src", "src/a.py", "docs"]);
+test("taskProblems: a check per task, a brief that says where, no placeholders, paths anchored in the repo", () => {
+  const tree = new Set(["virtual-instrument", "virtual-instrument/docs", "virtual-instrument/docs/api.md", "virtual-instrument/manual", "src", "src/a.py", "docs", "tests"]);
   const exists = (rel: string) => tree.has(rel);
-  const t = (files: string[], brief = "Change the thing and test it.") => ({ key: "k", title: "K", brief, files });
-  const w = (files: string[], raw = files, brief?: string) => taskWarnings([t(files, brief)], [raw], exists, ["virtual-instrument", "src", "docs"]);
-  assert.deepEqual(w(["src/a.py", "src/new.py", "tests/**"]), [], "existing paths, new files in existing folders and globs are fine");
-  assert.match(taskWarnings([t(["api.md"])], [["api.md"]], (r) => r === "virtual-instrument/api.md", ["virtual-instrument"]).join(), /"api.md" is not at the repo root, but virtual-instrument\/ exists.*write virtual-instrument\/api.md/);
-  const wrong = w(["guide/intro.md"], ["guide/intro.md"]);
-  assert.deepEqual(wrong, []);
-  const amb = taskWarnings([t(["docs/api.md"])], [["docs/api.md"]], exists, ["virtual-instrument", "src"]);
-  assert.deepEqual(amb, [], "docs/ exists at the root, so docs/api.md is a new file there");
-  const missingTop = taskWarnings([t(["manual/api.md"])], [["manual/api.md"]], (r) => r === "virtual-instrument/manual" || tree.has(r), ["virtual-instrument", "src"]);
-  assert.match(missingTop[0], /"manual\/api.md" is not at the repo root, but virtual-instrument\/manual\/ exists.*write virtual-instrument\/manual\/api.md/);
-  assert.deepEqual(taskWarnings([t(["manual/api.md"])], [["./manual/api.md"]], (r) => r === "virtual-instrument/manual", ["virtual-instrument"]), [], "./ means it");
-  assert.match(w(["src/a.py"], ["src/a.py"], "x".repeat(3500)).join(), /the brief is 3500 characters/);
+  const verify = { cmd: "pytest tests/test_a.py -q", expect: "1 passed" };
+  const t = (files: string[], brief = "Change parse() in src/a.py and test it.", v: TeamTask["verify"] | null = verify): TeamTask => ({ key: "k", title: "K", brief, files, ...(v ? { verify: v } : {}) });
+  const probs = (task: TeamTask, raw = task.files, dirs = ["virtual-instrument", "src", "docs"]) => taskProblems([task], [raw], exists, dirs);
+  assert.deepEqual(probs(t(["src/a.py", "src/new.py", "tests/**"])), [], "existing paths, new files in existing folders and globs in existing folders are fine");
+  assert.match(probs(t(["src/a.py"], undefined, null)).join(), /k: no verify\. Give the focused command/);
+  assert.deepEqual(taskProblems([t(["src/a.py"], undefined, null)], [["src/a.py"]], exists, [], false), [], "the planner's tasks are checked for verify by its schema");
+  assert.match(probs(t(["src/a.py"], "Fix the parser so that bad input is rejected.")).join(), /does not say where the change goes\. Name the file .* src\/a\.py/);
+  assert.deepEqual(probs(t(["src/a.py"], "Fix it in a.py and add a test.")), [], "the file name is enough");
+  assert.deepEqual(probs(t(["tests/**"], "Add the cases under tests/ for the parser.")), [], "a glob's folder is enough");
+  assert.match(probs(t(["src/a.py"], "Change src/a.py and handle edge cases.")).join(), /"handle edge cases" leaves the worker guessing/);
+  assert.match(probs(t(["src/a.py"], "Change src/a.py, details TBD.")).join(), /"TBD" leaves the worker guessing/);
+  // monorepo paths
+  assert.match(probs(t(["docs/api.md"], "Fill docs/api.md.")).join(), /^$/, "docs/ exists at the root: a new file there");
+  assert.match(probs(t(["manual/api.md"], "Write manual/api.md.")).join(), /"manual\/api.md" is not in the repo, but virtual-instrument\/manual is\. .*write virtual-instrument\/manual\/api.md/);
+  assert.match(probs(t(["api.md"], "Write api.md."), ["api.md"], ["virtual-instrument/docs"]).join(), /^$/, "a new file at the root is fine");
+  assert.match(probs(t(["guide/intro.md"], "Write guide/intro.md.")).join(), /neither "guide\/intro.md" nor its folder "guide" exists.*write \.\/guide\/intro.md/);
+  assert.deepEqual(probs(t(["guide/intro.md"], "Write guide/intro.md."), ["./guide/intro.md"]), [], "./ marks a new folder on purpose");
+  assert.match(probs(t(["manual/**"], "Write the pages under manual/.")).join(), /"manual\/\*\*" is not in the repo, but virtual-instrument\/manual is/);
+  assert.match(taskWarnings([t(["src/a.py"], "src/a.py " + "x".repeat(3500))]).join(), /the brief is 3509 characters/);
+});
+
+test("the planner's tasks get the same checks: one round to fix them, the rest reported", async () => {
+  const pass = { structuredOutput: { verdict: "pass", summary: "", findings: [] } };
+  const bad = [{ key: "a", title: "A", brief: "Make the parser stricter, details TBD.", files: ["src/a.py"] }];
+  const good = [{ key: "a", title: "A", brief: "In src/a.py make parse() reject empty input.", files: ["src/a.py"], verify: { cmd: "pytest tests/test_a.py -q", expect: "1 passed" } }];
+  const fixed = await simulate({ lanes: [] }, (key) => (key === "plan" ? { structuredOutput: { tasks: bad, questions: [], notes: "" } } : key === "plan-fix" ? { structuredOutput: { tasks: good, questions: [], notes: "" } } : key.includes("verify") ? pass : {}));
+  assert.deepEqual(fixed.calls.map((c) => c.key).slice(0, 2), ["plan", "plan-fix"]);
+  assert.match(fixed.calls[1].item.task, /Fix these problems[\s\S]*a: no verify[\s\S]*does not say where[\s\S]*"TBD" leaves the worker guessing/);
+  assert.equal(fixed.result.plan.unfixed, undefined);
+  assert.match(fixed.calls.find((c) => c.key === "a-work")!.item.task, /make parse\(\) reject empty input/);
+  const stubborn = await simulate({ lanes: [] }, (key) => (key.startsWith("plan") ? { structuredOutput: { tasks: bad, questions: [], notes: "" } } : key.includes("verify") ? pass : {}));
+  assert.equal(stubborn.calls.filter((c) => c.key.startsWith("plan")).length, 2, "one fix round, not a loop");
+  assert.match(stubborn.result.plan.unfixed.join(), /no verify/);
+  const clean = await simulate({ lanes: [] }, (key) => (key === "plan" ? { structuredOutput: { tasks: good, questions: [], notes: "" } } : key.includes("verify") ? pass : {}));
+  assert.ok(!clean.calls.some((c) => c.key === "plan-fix"), "a clean plan goes straight on");
 });
 
 test("splitStatus / stashCommand: only tracked changes block a run, with a command to set them aside", () => {

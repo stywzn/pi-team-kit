@@ -139,26 +139,60 @@ function dependencyOrder(group: TeamTask[]): TeamTask[] {
   return out;
 }
 
+/** Words that leave a worker guessing what to do. */
+export const VAGUE_BRIEF = /\b(TBD|TODO|FIXME)\b|handle (all )?(the )?edge cases|add more tests|as (needed|appropriate)|and so on|待定|视情况|酌情/i;
+
+/** Names in a brief that show where a task's change goes: an owned path, its file name, or a glob's folder. */
+function anchorNames(files: string[]): string[] {
+  return files
+    .flatMap((f) => {
+      const lit = literalPrefix(f).replace(/\/+$/, "");
+      return [f, lit, f.split("/").pop() ?? "", lit.split("/").pop() ?? ""];
+    })
+    .filter((n) => n.length >= 3 && !/[*?[{]/.test(n));
+}
+
 /**
- * Warnings that do not stop a run: briefs long enough to read like a design document (the worker reads all of
- * it before starting), and owned paths that only exist under a subfolder (docs/ meaning app/docs/).
- * Paths written with a leading ./ are taken as meant.
+ * Problems that stop team_run until the lead fixes them, checked by code rather than asked for in prose:
+ * every task has a check that proves it alone, its brief says where the change goes and has no placeholder,
+ * and every owned path is anchored in the repo (it exists, or its folder does). A path that only exists one
+ * folder down is named (docs/ meaning app/docs/); a leading ./ marks a new folder on purpose.
  */
-export function taskWarnings(tasks: TeamTask[], rawFiles: string[][], exists: (rel: string) => boolean, subdirs: string[]): string[] {
+export function taskProblems(tasks: TeamTask[], rawFiles: string[][], exists: (rel: string) => boolean, subdirs: string[], requireVerify = true): string[] {
   const out: string[] = [];
   tasks.forEach((t, i) => {
-    if (t.brief.length > 3000)
-      out.push(`${t.key}: the brief is ${t.brief.length} characters. A worker reads all of it before starting; keep what to change, where, and the check that proves it, and point to files for background.`);
+    if (requireVerify && !t.verify)
+      out.push(`${t.key}: no verify. Give the focused command that proves this task alone and what it prints when done, e.g. {"cmd": "pytest tests/test_login.py -q", "expect": "3 passed"}; for docs or data any checking command works (grep -c "## Usage" docs/x.md -> 1).`);
+    const names = anchorNames(t.files);
+    const brief = t.brief.toLowerCase();
+    if (names.length && !names.some((n) => brief.includes(n.toLowerCase())))
+      out.push(`${t.key}: the brief does not say where the change goes. Name the file (and the function or section) from its files: ${t.files.slice(0, 3).join(", ")}.`);
+    const vague = VAGUE_BRIEF.exec(t.brief);
+    if (vague) out.push(`${t.key}: "${vague[0]}" leaves the worker guessing. Say exactly what to do, or leave it out.`);
     (rawFiles[i] ?? []).forEach((raw, j) => {
       const f = t.files[j];
-      if (!f || /^\.[\\/]/.test(String(raw).trim()) || /[*?[{]/.test(f) || exists(f)) return;
-      const top = f.split("/")[0];
-      if (f.includes("/") && exists(top)) return;
-      const hits = subdirs.filter((d) => exists(`${d}/${f}`) || (f.includes("/") && exists(`${d}/${top}`)));
-      if (hits.length) out.push(`${t.key}: "${f}" is not at the repo root, but ${hits.map((d) => `${d}/${f.includes("/") ? top + "/" : ""}`).join(" and ")} exists. Paths are relative to the repo root: write ${hits[0]}/${f} (or ./${f} if you mean a new path at the root).`);
+      if (!f || /^\.[\\/]/.test(String(raw).trim())) return;
+      const lit = literalPrefix(f).replace(/\/+$/, "");
+      const glob = lit !== f;
+      if (glob ? !lit || exists(lit) : exists(f)) return;
+      const folder = glob ? lit : f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
+      if (!glob && (!folder || exists(folder))) return; // a new file in a folder that exists
+      const hits = subdirs.filter((d) => exists(`${d}/${glob ? lit : f}`) || (folder && exists(`${d}/${folder}`)));
+      out.push(
+        hits.length
+          ? `${t.key}: "${f}" is not in the repo, but ${hits[0]}/${folder || f} is. Paths are relative to the repo root: write ${hits[0]}/${f}.`
+          : `${t.key}: neither "${f}" nor its folder "${folder}" exists. Paths are relative to the repo root; write ./${f} if it is a new folder on purpose.`,
+      );
     });
   });
   return out;
+}
+
+/** Warnings that do not stop a run: a brief long enough to read like a design document. */
+export function taskWarnings(tasks: TeamTask[]): string[] {
+  return tasks
+    .filter((t) => t.brief.length > 3000)
+    .map((t) => `${t.key}: the brief is ${t.brief.length} characters. A worker reads all of it before starting; keep what to change, where, and the check that proves it, and point to files for background.`);
 }
 
 /** `git status --porcelain -z` split into tracked changes (workers would not see them) and untracked files. */
@@ -474,6 +508,23 @@ function cleanTasks(raw) {
   });
 }
 function strings(v, max) { return (Array.isArray(v) ? v : []).map(function (s) { return String(s).trim(); }).filter(Boolean).slice(0, max); }
+// taskProblems() in lib/team.ts without the file system (the workflow has none): a check per task, a brief that
+// says where, no placeholders.
+var VAGUE = ${VAGUE_BRIEF.toString()};
+function planProblems(tasks) {
+  var out = [];
+  tasks.forEach(function (t) {
+    if (!t.verify) out.push(t.key + ": no verify. Give the focused command that proves this task alone and what it prints when done.");
+    var names = [];
+    t.files.forEach(function (f) { var lit = litPrefix(f).replace(/\/+$/, ""); [f, lit, f.split("/").pop(), lit.split("/").pop()].forEach(function (n) { if (n && n.length >= 3 && !/[*?[{]/.test(n)) names.push(n); }); });
+    var brief = t.brief.toLowerCase();
+    if (names.length && !names.some(function (n) { return brief.indexOf(n.toLowerCase()) >= 0; }))
+      out.push(t.key + ": the brief does not say where the change goes. Name the file (and the function or section) from its files: " + t.files.slice(0, 3).join(", ") + ".");
+    var v = VAGUE.exec(t.brief);
+    if (v) out.push(t.key + ': "' + v[0] + '" leaves the worker guessing. Say exactly what to do, or leave it out.');
+  });
+  return out;
+}
 
 function planTask() {
   return "Split this goal into tasks for a team run. Goal: " + PLAN.goal + "\n\n" +
@@ -630,6 +681,14 @@ if (!lanes.length) {
   var p = await settle("plan", runs.run("plan", withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
   var out = p.structuredOutput || {};
   var tasks = cleanTasks(out.tasks);
+  // The same checks team_run makes on the lead's tasks: one round to fix them, then the plan goes ahead as it is.
+  var issues = tasks.length ? planProblems(tasks) : [];
+  if (issues.length) {
+    var p2 = await settle("plan-fix", runs.run("plan-fix", withModel({ agent: PLAN.plannerAgent, label: "Fix the plan", task: planTask() +
+      "\n\nYour previous plan:\n" + clip(JSON.stringify(out), 12000) + "\n\nFix these problems and return the whole plan again:\n- " + issues.join("\n- "), outputSchema: PLAN_SCHEMA }, "planner")));
+    var fixed = p2.structuredOutput && cleanTasks(p2.structuredOutput.tasks);
+    if (fixed && fixed.length) { out = p2.structuredOutput; tasks = fixed; issues = planProblems(tasks); }
+  }
   PLAN.constraints = (PLAN.constraints || []).concat(strings(out.constraints, 10));
   if (!tasks.length) {
     return { goal: PLAN.goal, state: "needs-input", questions: out.questions || [], notes: out.notes || p.error || "planner returned no tasks", lanes: [] };
@@ -640,6 +699,7 @@ if (!lanes.length) {
   }
   lanes = lanesFor(tasks);
   planned = { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }), questions: out.questions || [], notes: out.notes || "" };
+  if (issues.length) planned.unfixed = issues;
 }
 
 const results = await Promise.all(lanes.map(startLane));
