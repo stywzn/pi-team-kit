@@ -86,7 +86,7 @@ test("with the merge queue a dependent task gets its own lane that waits for the
 
 // ---- the generated workflow with the merge queue, against a fake pi-subagents `runs` object ----
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<any>;
-type Call = { key: string; item: { agent?: string; cwd?: string; baseRef?: string; gate?: { command: string }; task: string } };
+type Call = { key: string; item: { agent?: string; cwd?: string; baseRef?: string; gate?: { command: string }; acceptance?: { level: string; evidence?: string[]; verify?: { command: string }[] }; task: string } };
 
 async function run(plan: Partial<TeamPlan>, respond: (key: string) => Record<string, unknown> | "fail" = () => ({})) {
   const full: TeamPlan = {
@@ -126,7 +126,9 @@ test("merge queue: passed lanes are merged one at a time in the integration work
   for (const m of merges) {
     assert.equal(m.item.cwd, "/tmp/ptk-integration/demo-abc");
     assert.equal(m.item.agent, "team-merger");
-    assert.match(m.item.gate!.command, /^node "\/pkg\/bin\/merge-lane\.mjs" "\/runs\/\d+\/handoff\.json" [ab] && python3 -m pytest -q && git -c user\.name=pi-team-kit .* commit -q --no-verify --allow-empty -m "ptk: [ab]"$/);
+    assert.equal(m.item.gate, undefined, "no gate shorthand: the merge is the acceptance check");
+    assert.deepEqual([m.item.acceptance!.level, m.item.acceptance!.evidence], ["verified", ["manual-notes"]]);
+    assert.match(m.item.acceptance!.verify![0].command, /^node "\/pkg\/bin\/merge-lane\.mjs" "\/runs\/\d+\/handoff\.json" [ab] && python3 -m pytest -q && git -c user\.name=pi-team-kit .* commit -q --no-verify --allow-empty -m "ptk: [ab]"$/);
   }
   assert.ok(result.lanes.every((l: { merged: boolean }) => l.merged));
   assert.deepEqual(result.integration.merged.sort(), ["a", "b"]);

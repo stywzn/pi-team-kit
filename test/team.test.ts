@@ -417,6 +417,7 @@ test("splitStatus / stashCommand: only tracked changes block a run, with a comma
   const z = [" M src/a.py", "M  README.md", "R  new name.py", "old name.py", "?? build/", "?? out.log", "?? .pi/subagents/x.json", ""].join("\0");
   assert.deepEqual(splitStatus(z), { tracked: ["src/a.py", "README.md", "new name.py"], untracked: ["build/", "out.log"] });
   assert.equal(stashCommand(["src/a.py", "new name.py"]), "git stash push -m ptk-team-run -- src/a.py 'new name.py'");
+  assert.equal(stashCommand(["src/a.py", "build/"], true), "git stash push --include-untracked -m ptk-team-run -- src/a.py build/");
 });
 
 test("tasks carry a verify command, case ids and what they build on; rules reach every worker and verifier", async () => {

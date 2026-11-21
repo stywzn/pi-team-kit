@@ -223,9 +223,9 @@ export function splitStatus(porcelainZ: string): { tracked: string[]; untracked:
 }
 
 /** A command that sets tracked changes aside and brings them back, for paths that need no quoting in sh and PowerShell. */
-export function stashCommand(files: string[]): string {
+export function stashCommand(files: string[], untracked = false): string {
   const q = (f: string) => (/^[\w@+=:,./-]+$/.test(f) ? f : `'${f.replace(/'/g, "'\\''")}'`);
-  return `git stash push -m ptk-team-run -- ${files.map(q).join(" ")}`;
+  return `git stash push${untracked ? " --include-untracked" : ""} -m ptk-team-run -- ${files.map(q).join(" ")}`;
 }
 
 function literalPrefix(pattern: string): string {
@@ -822,8 +822,9 @@ function mergeLane(lane, r) {
   var command = "node " + q(INT.script) + " " + q(r.runDir + "/handoff.json") + " " + lane.key + (gate ? " && " + gate : "") +
     " && git -c user.name=pi-team-kit -c user.email=pi-team-kit@localhost commit -q --no-verify --allow-empty -m " + q("ptk: " + lane.key);
   var key = lane.key + "-merge";
-  var item = withModel({ agent: PLAN.mergerAgent || "team-merger", label: "Merge " + lane.key, task: "Reply with exactly: ok", cwd: INT.dir,
-    gate: { command: command, timeoutMs: (GATE ? GATE.timeoutMs : 0) + 300000 } }, "worker");
+  // The merge, the full gate and the commit are one host-run check of this child; it only answers with its report.
+  var item = withModel({ agent: PLAN.mergerAgent || "team-merger", label: "Merge " + lane.key, task: "Merge step for lane " + lane.key + ": do nothing, answer with the acceptance report.", cwd: INT.dir,
+    acceptance: { level: "verified", criteria: [], evidence: ["manual-notes"], verify: [{ id: "merge", command: command, timeoutMs: (GATE ? GATE.timeoutMs : 0) + 300000 }] } }, "worker");
   return settle(key, runs.run(key, item)).then(function (m) {
     r.merged = Boolean(m.ok);
     if (m.ok) mergeOrder.push(lane.key);

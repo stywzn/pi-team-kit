@@ -954,10 +954,21 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   };
   /** Workers branch from HEAD: uncommitted edits to tracked files would be missing from every worktree. */
+  const listFiles = (files: string[]) => `${files.slice(0, 20).map((f) => `  ${f}`).join("\n")}${files.length > 20 ? `\n  ... ${files.length - 20} more` : ""}`;
   const trackedError = (tracked: string[], why: string) =>
-    `${why}\n${tracked.slice(0, 20).join("\n")}${tracked.length > 20 ? `\n... ${tracked.length - 20} more` : ""}\n` +
-    `Commit them, or set them aside now and bring them back after team_integrate:\n  ${stashCommand(tracked.slice(0, 50))}\n  git stash pop\n` +
-    "Untracked files (build output, logs, scratch files) do not need this.";
+    `${why}\n${listFiles(tracked)}\nCommit them, or set them aside now and bring them back after team_integrate:\n  ${stashCommand(tracked.slice(0, 50))}\n  git stash pop`;
+  /** Why the checkout cannot start a team run, with what to do for each kind of file. */
+  const dirtyError = (d: { tracked: string[]; untracked: string[] }) => {
+    const parts = ["pi-subagents makes the workers' worktrees only from a clean checkout (untracked files count)."];
+    if (d.tracked.length) parts.push(`Changed tracked files (workers branch from HEAD and would not see them):\n${listFiles(d.tracked)}`);
+    if (d.untracked.length)
+      parts.push(
+        `Untracked files:\n${listFiles(d.untracked)}\nBuild output, logs and scratch files: add them to .gitignore (then they never get in the way again). Files the work needs: commit them.` +
+          (d.untracked.some((f) => f.startsWith(".pi/ptk")) ? "\n.pi/ptk holds team-shared facts and tools: commit it." : ""),
+      );
+    parts.push(`To set everything aside for this run instead:\n  ${stashCommand([...d.tracked, ...d.untracked].slice(0, 50), d.untracked.length > 0)}\nand after team_integrate:\n  git stash pop`);
+    return parts.join("\n");
+  };
 
   const TaskSchema = Type.Object({
     key: Type.String({ description: "short id, e.g. api-auth" }),
@@ -1158,7 +1169,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const pb = pbName ? findPlaybook(playbookDirs(state.config), pbName) : undefined;
       if (pbName && !pb) throw new Error(`No playbook named "${pbName}". Available: ${listPlaybooks(playbookDirs(state.config)).map((p) => p.name).join(", ") || "none"}.`);
       const dirty = await dirtyFiles(root);
-      if (dirty.tracked.length) throw new Error(trackedError(dirty.tracked, "These tracked files have uncommitted changes, and workers branch from HEAD, so no worker would see them:"));
+      if (dirty.tracked.length || dirty.untracked.length) throw new Error(dirtyError(dirty));
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
@@ -1180,13 +1191,6 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
       if (problems.length) throw new Error(`Fix these in tasks, then call team_run again:\n${problems.map((p) => `- ${p}`).join("\n")}`);
       const warnings = taskWarnings(tasks);
-      if (dirty.untracked.length) {
-        const owned = lanes.flatMap((l) => l.files);
-        const clash = dirty.untracked.filter((f) => owned.some((o) => patternsOverlap(o, f)));
-        const shared = dirty.untracked.filter((f) => f.startsWith(".pi/ptk"));
-        if (clash.length) warnings.push(`Untracked files inside the lanes' paths: ${clash.slice(0, 10).join(", ")}. Workers do not see them, and team_integrate stops if a lane creates the same file; commit or move them if they matter.`);
-        if (shared.length) warnings.push(".pi/ptk (team-shared facts and tools) is not committed, so workers run without it.");
-      }
       const gate = (params.gate ?? t.gate ?? "").trim() || envFor(root)?.testCommand || "";
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.

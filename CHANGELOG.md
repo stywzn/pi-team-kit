@@ -1,8 +1,30 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] - 2026-11-21
 
-Precise tasks, cheaper reviews, checkable results. Ideas taken from obra/superpowers (plan granularity, evidence before claims, re-review only the open findings) and phakeandy/dotfiles (keep failures whole, trim the rest).
+From real enterprise runs: 5 lanes, 68 minutes, none done and 2 failed; 4 lanes, 53 minutes, one done. Workers read code instead of executing, briefs had no anchors or checks, dependent tasks ran in parallel, nobody noticed a worker circling, and the run waited for its slowest lane. Ideas taken from GSD (task fields, analysis-paralysis guard), obra/superpowers (plan granularity, evidence before claims), poteto (a correction becomes a check, error text written as an instruction), DeepSeek Harness (stop and ask instead of guessing) and merge queues (bors, Zuul).
+
+Merge queue and dependency scheduling:
+- Each lane that passes review is merged at once into a run branch whose worktree lives outside the repo, one lane at a time: `bin/merge-lane.mjs` applies the worker's worktree, the full gate runs on the combined code, then the commit. A lane that does not apply or fails the gate there is not merged (`mergeError` says why) and the other lanes go on. No lane waits for the slowest one to be merged.
+- `dependsOn` between tasks: a task that needs another's change gets its own lane that starts once that lane is merged, from the run branch, so it sees the change. If what it needs did not pass, it is `skipped` instead of spending a worker. Lanes that would wait on each other in a circle become one lane. `team.mergeQueue: false` keeps the old behaviour (dependent tasks share a lane).
+- team_integrate takes the merged lanes in merge order and removes the run branch after a passing integration.
+
+Tasks checked by code at team_run (fix and call again):
+- every task needs `verify` (command and what it prints when done), its brief must name the file it changes, no placeholders ("TBD", "handle edge cases"), owned paths must exist in the repo or be new files in folders that do (`docs/` meant as `app/docs/` is named; `./x` marks a new folder on purpose), and each verify program must run here.
+- The planner's tasks get the same checks inside the run, with one round to fix them.
+
+Worker watch (lib/progress.ts), decided by code in the worker's own session:
+- 12 read-only calls in a row without a change: a note. 25 (or 40 minutes without changing a file): more reading is refused until the worker changes a file, runs a check, or asks the lead with contact_supervisor.
+- A command that just failed is refused while nothing changed since; the third identical failure after changes asks for the cause or BLOCKED. Retries after a real change are never limited.
+- An edit outside the task's own files is refused, with how to ask. `team.watch` in ptk.json.
+
+Fixes from the same reports:
+- A checkout that is not clean stops team_run before any worker starts (pi-subagents needs it clean, untracked files included), now with what to do for each kind of file: .gitignore for build output and logs, commit what the work needs, or one stash command (with --include-untracked) and `git stash pop` after team_integrate. Warnings for briefs that read like design documents.
+- Test commands of sub-projects one folder down are detected (monorepos); a lane gate `cd app && runner` is narrowed to the lane's files inside app/.
+- Write large files in parts (a huge write can hit the output token limit and is thrown away); the lead is told where the `ptk` CLI is; bash timeouts make room for the command's own sleeps; friction stats group by the main command and say whether a tool error came from limits or arguments; leads messages up to 6000 characters, shown in full to their sender and receiver.
+- Toolbox `winui`: drive a Windows desktop app by control name or automation id (UI Automation through Windows PowerShell 5.1), from Windows or WSL, instead of guessing screen coordinates.
+
+Precise tasks, cheaper reviews, checkable results (branch feat/precise-tasks, merged):
 
 - Tasks carry `verify` (a focused command and what it prints when done), `caseIds` and `uses` (shared fixtures or helpers they build on); a run carries `constraints`, rules every worker and verifier gets word for word. The planner is told the task size (the smallest piece with its own check), to put shared setup in one task, and that vague briefs ("handle edge cases") are not briefs.
 - Workers iterate with their task's own check and run the gate once at the end. On a failure they write down the cause and evidence before changing anything and never retry a fix that failed; a test that passes alone but fails with others is treated as leaking state. After three real attempts they report BLOCKED, and the lane goes to the lead (and a person) without a review round.
