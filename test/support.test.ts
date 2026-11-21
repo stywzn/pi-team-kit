@@ -123,6 +123,25 @@ test("environment: detected from the machine and repo, Windows PATH ignored insi
   assert.match(text, /Not installed: fd/);
 });
 
+test("environment: a monorepo's test commands are found one folder down and run from the root", () => {
+  const files: Record<string, string> = {
+    "/repo/README.md": "",
+    "/repo/virtual-instrument/pyproject.toml": "[tool.pytest.ini_options]\n",
+    "/repo/web/package.json": JSON.stringify({ scripts: { test: "vitest run" } }),
+    "/repo/docs/index.md": "",
+    "/repo/node_modules/x/package.json": JSON.stringify({ scripts: { test: "never" } }),
+  };
+  const probe = { ...fakeProbe(files, ["/usr/bin/python3", "/usr/bin/node"]) };
+  probe.list = (dir: string) => [...new Set(Object.keys(files).filter((f) => f.startsWith(dir + "/")).map((f) => f.slice(dir.length + 1).split("/")[0]))];
+  const facts = detectEnv(probe);
+  assert.equal(facts.testCommand, "cd virtual-instrument && python3 -m pytest -q && cd .. && cd web && npm test");
+  assert.match(formatEnv(facts), /Sub-projects: virtual-instrument\/ \(Python project \(pip\)\); web\/ \(Node project/);
+  assert.doesNotMatch(formatEnv(facts), /node_modules/);
+  // A root with its own test command is left alone.
+  files["/repo/package.json"] = JSON.stringify({ scripts: { test: "jest" } });
+  assert.equal(detectEnv(probe).testCommand, "npm test");
+});
+
 function winProbe(bins: string[], files: Record<string, string> = {}): Probe {
   return {
     platform: "win32",

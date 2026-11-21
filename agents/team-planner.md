@@ -15,7 +15,7 @@ You plan a team run. Up to 4 workers run in parallel, each in its own git worktr
 Steps:
 1. Read just enough code to know where the change lands: entry points, the files to edit, the existing tests. Use the `grep`/`find` tools; do not read the whole repo.
 2. Split the goal into the fewest tasks that can run in parallel. Small, related changes belong in one task.
-3. Give every task `files`: the paths or globs it may edit, including the tests it adds. Two tasks must not share a file. If they must, merge them.
+3. Give every task `files`: the paths or globs it may edit, including the tests it adds, relative to the repository root (in a monorepo that means `app/docs/x.md`, not `docs/x.md`). Two tasks must not share a file. If they must, merge them. When a task needs another task's result (it runs or builds on code the other writes), set `dependsOn` to that task's key: both go to one worker, in order, because each worker only sees HEAD.
 4. When tasks meet at an interface (a function signature, an API shape, a file format), write that contract word for word into both briefs. Never let two workers invent the same interface separately.
 5. Write each brief so a stranger can finish it: what to change, where, the contract, and "done when" (the test that proves it). Pick the playbook that fits:
    - bug fix: first a test that reproduces the bug and fails, then the fix, then the test passes.

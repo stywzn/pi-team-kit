@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { formatBoard, formatLog, readCards, readLog } from "../lib/board.ts";
 import { checkPlaybook, listPlaybooks } from "../lib/playbook.ts";
-import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
+import { formatFriction, frictionFromFiles, runLanes, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { readRunValue } from "../lib/harvest.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { agentDir, backslashSources, findRepoRoot, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir } from "../lib/config.ts";
@@ -247,7 +247,7 @@ switch (cmd) {
     const days = Math.max(1, Math.min(365, Number(rest.find((a) => /^\d+$/.test(a)) ?? 30)));
     const r = rest.indexOf("--repo");
     const repo = r >= 0 ? rest[r + 1] : undefined;
-    const { signals, sessions } = frictionFromFiles(sessionFiles(join(agentDir(), "sessions"), days), repo, readRunValue, runPhases);
+    const { signals, sessions } = frictionFromFiles(sessionFiles(join(agentDir(), "sessions"), days), repo, readRunValue, runPhases, runLanes);
     console.log(formatFriction(signals, { days, sessions }));
     break;
   }

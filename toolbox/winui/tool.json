@@ -1,0 +1,6 @@
+{
+  "name": "winui",
+  "description": "Drive a Windows desktop app by its controls (UI Automation): list windows and controls, click, type, read, wait. Finds controls by name or automation id instead of guessing screen coordinates. Windows or WSL.",
+  "usage": "winui windows | tree <window> | click <window> <control> | type <window> <control> <text> | read <window> <control> | wait <window> [control] | focus <window>",
+  "run": ["node", "run.mjs"]
+}

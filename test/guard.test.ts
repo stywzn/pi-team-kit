@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyCommand, commandTimeoutSec, inspectBash, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
+import { classifyCommand, commandTimeoutSec, inspectBash, sleepSeconds, longRunnerReason, looksLikeTimeout, resolveTimeout, stripPyVersion, unsafeRegex, withCi, type GuardOptions } from "../lib/guard.ts";
 import { splitSegments } from "../lib/shell.ts";
 
 const base: GuardOptions = {
@@ -230,4 +230,13 @@ test("a command with its own timeout gets a tool timeout longer than that", () =
   assert.equal(commandTimeoutSec("gtimeout 1.5h make e2e"), 5400);
   assert.equal(commandTimeoutSec("python timeout_test.py"), undefined);
   assert.equal(commandTimeoutSec("echo timeout 700 x"), undefined, "only a leading timeout");
+});
+
+test("sleeps in a command count toward its tool timeout (sleep 178 under 180 s was killed in real use)", () => {
+  assert.equal(sleepSeconds("sleep 178"), 178);
+  assert.equal(sleepSeconds("cd x && sleep 30; curl -s :8080/health; sleep 1m"), 90);
+  assert.equal(sleepSeconds("Start-Sleep -Seconds 45; Start-Sleep 5"), 50);
+  assert.equal(sleepSeconds("Start-Sleep -Milliseconds 1500"), 2);
+  assert.equal(sleepSeconds("timeout /t 60 /nobreak"), 60);
+  assert.equal(sleepSeconds("python sleep_test.py && echo sleeping"), 0);
 });

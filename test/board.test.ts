@@ -123,7 +123,7 @@ test("send: to one lead or all, offline leads keep mail, bad input is refused wi
   assert.throws(() => sendMessage(dir, { from: "api", to: "../web", text: "x", update: false, hops: 0 }, T0), /not a lead name/);
   assert.throws(() => sendMessage(dir, { from: "api", to: "api", text: "x", update: false, hops: 0 }, T0), /your own name/);
   assert.throws(() => sendMessage(dir, { from: "api", to: "web", text: "   ", update: false, hops: 0 }, T0), /empty/);
-  assert.throws(() => sendMessage(dir, { from: "api", to: "web", text: "x".repeat(MAX_TEXT + 1), update: false, hops: 0 }, T0), /under 2000/);
+  assert.throws(() => sendMessage(dir, { from: "api", to: "web", text: "x".repeat(MAX_TEXT + 1), update: false, hops: 0 }, T0), /under 6000/);
   assert.throws(() => sendMessage(board(), { from: "api", to: "all", text: "x", update: false, hops: 0 }, T0), /no other lead/);
   assert.deepEqual(readLog(dir, 10).map((m) => m.to), ["web", "all", "gone"]);
   assert.match(formatLog(readLog(dir)), /api → web \(update\): POST \/v2\/login is live/);
@@ -313,4 +313,16 @@ test("where a shell command may change files: paths and cd targets", () => {
   assert.deepEqual(pathsInCommand(String.raw`Set-Location D:\dev\app; (Get-Content "C:/x/y.txt") | Set-Content ..\z.txt`).sort(), [String.raw`..\z.txt`, "C:/x/y.txt", String.raw`D:\dev\app`].sort());
   assert.deepEqual(pathsInCommand("npm test"), []);
   assert.ok(pathsInCommand(Array.from({ length: 50 }, (_, i) => `/p${i}`).join(" ")).length <= 20, "capped");
+});
+
+test("leads list: messages to or from this lead are shown whole, others in short", () => {
+  const long = "KH79 root cause: " + "x".repeat(400);
+  const msgs = [
+    { id: "1", from: "lead-3", to: "lead-2", text: long, update: false, hops: 0, at: "2026-11-20T10:00:00Z" },
+    { id: "2", from: "lead-4", to: "lead-5", text: long, update: false, hops: 0, at: "2026-11-20T10:01:00Z" },
+  ];
+  const view = formatLog(msgs, "lead-2").split("\n");
+  assert.ok(view[0].endsWith("x".repeat(400)), "to me: whole");
+  assert.ok(view[1].length < 260 && view[1].endsWith("…"), "between others: short");
+  assert.ok(formatLog(msgs).split("\n").every((l) => l.length < 260), "no reader given: all short");
 });

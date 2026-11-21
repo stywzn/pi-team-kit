@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { formatFriction, frictionFromFiles, frictionItems, sessionFiles, sessionSignals } from "../lib/feedback.ts";
+import { errorSource, formatFriction, frictionFromFiles, frictionItems, mainCommand, runLanes, sessionFiles, sessionSignals } from "../lib/feedback.ts";
 
 const at = (min: number) => new Date(Date.parse("2026-11-18T09:00:00Z") + min * 60_000).toISOString();
 const value = {
@@ -51,7 +51,7 @@ test("signals: a session's run, integration, guard, tool, model and user events"
   assert.deepEqual([timeout.key, timeout.minutes], ["npx playwright test --project=chromium", 15]);
   assert.equal(s.find((x) => x.kind === "block")?.key, "a command that never ends (server, watcher)");
   assert.equal(s.filter((x) => x.kind === "tool-error").length, 1, "a failing test is not tool friction");
-  assert.equal(s.find((x) => x.kind === "tool-error")?.key, "toolbox: md2pdf: no browser found");
+  assert.equal(s.find((x) => x.kind === "tool-error")?.key, "toolbox (failed): md2pdf: no browser found");
   assert.equal(s.find((x) => x.kind === "model-error")?.key, "429 rate limit exceeded");
   assert.equal(s.find((x) => x.kind === "status.json" as never), undefined);
   // the receipt path with a space reaches readRunValue intact
@@ -103,4 +103,26 @@ test("files: lead sessions of every project within the window; filtered by proje
   assert.ok(shop.signals.every((s) => s.project === "shop-e2e"));
   assert.deepEqual(frictionFromFiles(files, "nope"), { signals: [], sessions: 0 });
   assert.deepEqual(sessionFiles(join(root, "missing"), 30), []);
+});
+
+test("from real use: a timeout is named by the command doing the work, failures say whose they are, stopped runs count their lanes", () => {
+  assert.equal(mainCommand("cd /d/dev/hostapp-test && python tools/remote_bench.py --expr KH15"), "python tools/remote_bench.py --expr KH15");
+  assert.equal(mainCommand("set -e; export X=1; sleep 178"), "sleep 178");
+  assert.equal(mainCommand("cd /tmp"), "cd /tmp", "nothing else: the cd itself");
+  assert.equal(errorSource('Tool call "write" was not executed: the response hit the output token limit'), "limit");
+  assert.equal(errorSource("keep a message under 2000 characters: say what changed and where"), "limit");
+  assert.equal(errorSource("workflow 'parallel' args.tasks must be a non-empty array of { agent, task }"), "arguments");
+  assert.equal(errorSource("ENOENT: no such file or directory, open 'x'"), "failed");
+  const dir = mkdtempSync(join(tmpdir(), "ptk-fb-lanes-"));
+  writeFileSync(join(dir, "workflow-children.jsonl"), ['{"type":"launch","key":"weak-73-work"}', '{"type":"settle","key":"weak-73-work"}', '{"type":"launch","key":"mutation-work"}', '{"type":"launch","key":"mutation-verify-1"}', "{broken"].join("\n"));
+  assert.equal(runLanes(dir), 2);
+  assert.equal(runLanes(join(dir, "missing")), undefined);
+  // A run that never returned a value: its lanes come from the children it started.
+  const lines = [
+    JSON.stringify({ type: "session", cwd: "/d/dev/hostapp-test" }),
+    JSON.stringify({ type: "message", timestamp: "2026-11-20T10:00:00Z", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "team_run", arguments: {} }] } }),
+    JSON.stringify({ type: "custom_message", customType: "subagent-notify", timestamp: "2026-11-20T11:00:00Z", content: `Run stopped. Workflow receipt: ${dir}/workflow-receipt.json` }),
+  ].join("\n");
+  const run = sessionSignals(lines, () => undefined, () => undefined, runLanes).find((s) => s.kind === "run");
+  assert.equal(run?.lanes, 2);
 });

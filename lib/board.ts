@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { ageText } from "./lead.ts";
 
 export const STALE_MS = 120_000;
-export const MAX_TEXT = 2000;
+export const MAX_TEXT = 6000;
 export const MAX_STATUS = 300;
 export const MAX_FILES = 50;
 /** Unread messages one inbox may hold; past that the recipient is surely gone and senders get an error. */
@@ -398,9 +398,13 @@ export function formatBoard(cards: LeadCard[], me: string, now = Date.now(), hom
   return cards.length ? cards.map((c) => cardLine(c, me, now, home)).join("\n") : "(no lead sessions running)";
 }
 
-export function formatLog(messages: LeadMessage[]): string {
+/** Recent messages. Those to or from `me` (and to everyone) are shown whole; the rest of the board's traffic in short. */
+export function formatLog(messages: LeadMessage[], me?: string): string {
+  const mine = (m: LeadMessage) => me !== undefined && (m.to === me || m.to === "all" || m.from === me);
   return messages.length
-    ? messages.map((m) => `- ${m.at.slice(11, 16)} ${m.from} → ${m.to}${m.update ? " (update)" : ""}: ${short(m.text.replace(/\s+/g, " "), 160)}`).join("\n")
+    ? messages
+        .map((m) => `- ${m.at.slice(11, 16)} ${m.from} → ${m.to}${m.update ? " (update)" : ""}: ${mine(m) ? m.text.trim() : short(m.text.replace(/\s+/g, " "), 160)}`)
+        .join("\n")
     : "(no messages yet)";
 }
 

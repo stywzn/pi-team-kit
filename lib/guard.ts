@@ -408,3 +408,17 @@ export function commandTimeoutSec(command: string): number | undefined {
   const n = Number(m[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 }[m[2] as "s"] ?? 1);
   return Number.isFinite(n) && n > 0 ? Math.ceil(n) : undefined;
 }
+
+/**
+ * Seconds a command spends sleeping in total (`sleep 178`, `sleep 2m`, PowerShell `Start-Sleep -Seconds 30`,
+ * cmd `timeout /t 60`), or 0. A wait loop of sleeps longer than the tool timeout is killed half way otherwise.
+ */
+export function sleepSeconds(command: string): number {
+  const unit = { s: 1, m: 60, h: 3600, d: 86400 } as Record<string, number>;
+  let total = 0;
+  for (const m of command.matchAll(/(?:^|[\s;&|(])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?=$|[\s;&|)])/g)) total += Number(m[1]) * (unit[m[2]] ?? 1);
+  for (const m of command.matchAll(/Start-Sleep\s+(?:-(?:s|Seconds)\s+)?(\d+(?:\.\d+)?)(?!\s*-?(?:m|ms|Milliseconds))/gi)) total += Number(m[1]);
+  for (const m of command.matchAll(/Start-Sleep\s+-(?:m|ms|Milliseconds)\s+(\d+)/gi)) total += Number(m[1]) / 1000;
+  for (const m of command.matchAll(/(?:^|[\s;&|(])timeout\s+\/t\s+(\d+)/gi)) total += Number(m[1]);
+  return Math.ceil(total);
+}

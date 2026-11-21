@@ -9,6 +9,11 @@ export interface TeamTask {
   brief: string;
   /** Paths or globs this task owns. Two tasks that share any path end up in the same lane. */
   files: string[];
+  /**
+   * Keys of tasks that must be done first. Every worker branches from HEAD and cannot see another lane's
+   * changes, so a task and what it depends on run in one lane, in dependency order.
+   */
+  dependsOn?: string[];
 }
 
 export interface Lane {
@@ -44,14 +49,17 @@ export function normalizePath(p: string): string {
 }
 
 /** Validate the lead's tasks. Throws one message listing every problem, so the model can fix all at once. */
+const taskKey = (raw: unknown) => String(raw ?? "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 31);
+
 export function validateTasks(tasks: TeamTask[], maxTasks = 12): TeamTask[] {
   const problems: string[] = [];
   if (!Array.isArray(tasks) || tasks.length === 0) throw new Error("tasks: give at least one task");
   if (tasks.length > maxTasks) problems.push(`tasks: at most ${maxTasks}; merge small ones`);
   const seen = new Set<string>();
+  const keys = new Set(tasks.map((t) => taskKey(t.key)));
   const out = tasks.map((t, i) => {
     const at = `tasks[${i}]`;
-    const key = String(t.key ?? "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 31);
+    const key = taskKey(t.key);
     if (!KEY.test(key)) problems.push(`${at}.key: use letters, digits, dashes`);
     if (seen.has(key)) problems.push(`${at}.key "${key}" is used twice`);
     seen.add(key);
@@ -63,10 +71,95 @@ export function validateTasks(tasks: TeamTask[], maxTasks = 12): TeamTask[] {
     const files = (Array.isArray(t.files) ? t.files : []).map((f) => normalizePath(String(f))).filter(Boolean);
     if (files.length === 0) problems.push(`${at}.files: list the paths or globs this task owns`);
     for (const f of files) if (f.startsWith("/") || /^[A-Za-z]:/.test(f) || f.split("/").includes("..")) problems.push(`${at}.files: "${f}" must be relative to the repo root`);
-    return { key, title, brief, files };
+    const deps = [...new Set((Array.isArray(t.dependsOn) ? t.dependsOn : []).map(taskKey).filter(Boolean))];
+    for (const d of deps) {
+      if (d === key) problems.push(`${at}.dependsOn: a task cannot depend on itself`);
+      else if (!keys.has(d)) problems.push(`${at}.dependsOn: no task with key "${d}"`);
+    }
+    return deps.length ? { key, title, brief, files, dependsOn: deps } : { key, title, brief, files };
   });
+  const cycle = dependencyCycle(out);
+  if (cycle) problems.push(`dependsOn: ${cycle.join(" -> ")} is a cycle`);
   if (problems.length) throw new Error(problems.join("\n"));
   return out;
+}
+
+function dependencyCycle(tasks: TeamTask[]): string[] | undefined {
+  const deps = new Map(tasks.map((t) => [t.key, t.dependsOn ?? []]));
+  const state = new Map<string, 1 | 2>();
+  const walk = (k: string, path: string[]): string[] | undefined => {
+    if (state.get(k) === 2 || !deps.has(k)) return undefined;
+    if (state.get(k) === 1) return [...path.slice(path.indexOf(k)), k];
+    state.set(k, 1);
+    for (const d of deps.get(k)!) {
+      const c = walk(d, [...path, k]);
+      if (c) return c;
+    }
+    state.set(k, 2);
+    return undefined;
+  };
+  for (const t of tasks) {
+    const c = walk(t.key, []);
+    if (c) return c;
+  }
+  return undefined;
+}
+
+/** Dependencies first, otherwise the given order. A cycle (only possible from the planner) keeps the given order. */
+function dependencyOrder(group: TeamTask[]): TeamTask[] {
+  const out: TeamTask[] = [];
+  const left = [...group];
+  while (left.length) {
+    const placed = new Set(out.map((t) => t.key));
+    const i = left.findIndex((t) => (t.dependsOn ?? []).every((d) => placed.has(d) || !left.some((x) => x.key === d)));
+    out.push(...left.splice(i < 0 ? 0 : i, 1));
+  }
+  return out;
+}
+
+/**
+ * Warnings that do not stop a run: briefs long enough to read like a design document (the worker reads all of
+ * it before starting), and owned paths that only exist under a subfolder (docs/ meaning app/docs/).
+ * Paths written with a leading ./ are taken as meant.
+ */
+export function taskWarnings(tasks: TeamTask[], rawFiles: string[][], exists: (rel: string) => boolean, subdirs: string[]): string[] {
+  const out: string[] = [];
+  tasks.forEach((t, i) => {
+    if (t.brief.length > 3000)
+      out.push(`${t.key}: the brief is ${t.brief.length} characters. A worker reads all of it before starting; keep what to change, where, and the check that proves it, and point to files for background.`);
+    (rawFiles[i] ?? []).forEach((raw, j) => {
+      const f = t.files[j];
+      if (!f || /^\.[\\/]/.test(String(raw).trim()) || /[*?[{]/.test(f) || exists(f)) return;
+      const top = f.split("/")[0];
+      if (f.includes("/") && exists(top)) return;
+      const hits = subdirs.filter((d) => exists(`${d}/${f}`) || (f.includes("/") && exists(`${d}/${top}`)));
+      if (hits.length) out.push(`${t.key}: "${f}" is not at the repo root, but ${hits.map((d) => `${d}/${f.includes("/") ? top + "/" : ""}`).join(" and ")} exists. Paths are relative to the repo root: write ${hits[0]}/${f} (or ./${f} if you mean a new path at the root).`);
+    });
+  });
+  return out;
+}
+
+/** `git status --porcelain -z` split into tracked changes (workers would not see them) and untracked files. */
+export function splitStatus(porcelainZ: string): { tracked: string[]; untracked: string[] } {
+  const tracked: string[] = [];
+  const untracked: string[] = [];
+  const parts = porcelainZ.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (entry.length < 4) continue;
+    const xy = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (/[RC]/.test(xy)) i++; // a rename or copy is followed by its old path
+    if (path.startsWith(".pi/subagents")) continue;
+    (xy === "??" ? untracked : tracked).push(path);
+  }
+  return { tracked, untracked };
+}
+
+/** A command that sets tracked changes aside and brings them back, for paths that need no quoting in sh and PowerShell. */
+export function stashCommand(files: string[]): string {
+  const q = (f: string) => (/^[\w@+=:,./-]+$/.test(f) ? f : `'${f.replace(/'/g, "'\\''")}'`);
+  return `git stash push -m ptk-team-run -- ${files.map(q).join(" ")}`;
 }
 
 function literalPrefix(pattern: string): string {
@@ -91,17 +184,21 @@ export function planLanes(tasks: TeamTask[]): Lane[] {
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
   for (let i = 0; i < tasks.length; i++)
     for (let j = i + 1; j < tasks.length; j++)
-      if (tasks[i].files.some((a) => tasks[j].files.some((b) => patternsOverlap(a, b)))) parent[find(j)] = find(i);
+      if (tasks[i].files.some((a) => tasks[j].files.some((b) => patternsOverlap(a, b))) || tasks[i].dependsOn?.includes(tasks[j].key) || tasks[j].dependsOn?.includes(tasks[i].key))
+        parent[find(j)] = find(i);
   const groups = new Map<number, TeamTask[]>();
   tasks.forEach((t, i) => {
     const root = find(i);
     groups.set(root, [...(groups.get(root) ?? []), t]);
   });
-  return [...groups.values()].map((group) => ({
-    key: group.length === 1 ? group[0].key : `${group[0].key}-plus${group.length - 1}`,
-    tasks: group,
-    files: [...new Set(group.flatMap((t) => t.files))],
-  }));
+  return [...groups.values()].map((group) => {
+    const ordered = dependencyOrder(group);
+    return {
+      key: ordered.length === 1 ? ordered[0].key : `${ordered[0].key}-plus${ordered.length - 1}`,
+      tasks: ordered,
+      files: [...new Set(ordered.flatMap((t) => t.files))],
+    };
+  });
 }
 
 /** The pi-subagents workflow script for a plan. Data is embedded as JSON; logic is fixed. */
@@ -134,6 +231,7 @@ export const PLAN_SCHEMA = {
           title: { type: "string" },
           brief: { type: "string" },
           files: { type: "array", items: { type: "string" } },
+          dependsOn: { type: "array", items: { type: "string" } },
         },
         required: ["key", "title", "brief", "files"],
       },
@@ -183,7 +281,16 @@ function settle(key, promise) {
 // (pytest, unittest, jest, vitest, playwright test). The full gate still runs once on the combined code.
 // Compound commands, globs, npm scripts and unittest discover are left as written.
 function narrowGate(gate, files) {
-  if (!PLAN.laneTests || /[;&|<>\`$\n]/.test(gate) || /\bdiscover\b/.test(gate)) return gate;
+  if (!PLAN.laneTests) return gate;
+  // A monorepo gate such as "cd app && pytest -q": narrow the part after cd to the lane's files inside app/.
+  var cd = /^cd\s+([\w.@+-]+(?:\/[\w.@+-]+)*)\/?\s*&&\s*/.exec(gate);
+  if (cd) {
+    var rest = gate.slice(cd[0].length), prefix = cd[1] + "/";
+    var inner = (files || []).filter(function (f) { return f.indexOf(prefix) === 0; }).map(function (f) { return f.slice(prefix.length); });
+    var narrowed = narrowGate(rest, inner);
+    return narrowed === rest ? gate : cd[0] + narrowed;
+  }
+  if (/[;&|<>\`$\n]/.test(gate) || /\bdiscover\b/.test(gate)) return gate;
   var runner = /(^|\s)(pytest|py\.test)(\s|$)|-m\s+(pytest|unittest)(\s|$)|(^|\s)(npx\s+)?(jest|vitest|playwright\s+test)(\s|$)/;
   if (!runner.test(gate)) return gate;
   // A gate that already names paths (pytest tests/unit) chose what to run: adding files could run tests it left out.
@@ -244,24 +351,45 @@ function overlap(a, b) {
 function lanesFor(tasks) {
   var parent = tasks.map(function (_, i) { return i; });
   function find(i) { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; }
+  function dep(a, b) { return (a.dependsOn || []).indexOf(b.key) >= 0; }
   for (var i = 0; i < tasks.length; i++) for (var j = i + 1; j < tasks.length; j++)
-    if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); })) parent[find(j)] = find(i);
+    if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); }) || dep(tasks[i], tasks[j]) || dep(tasks[j], tasks[i])) parent[find(j)] = find(i);
   var groups = [], index = {};
   tasks.forEach(function (t, i) { var r = find(i); if (!(r in index)) { index[r] = groups.length; groups.push([]); } groups[index[r]].push(t); });
   return groups.map(function (g) {
+    g = depOrder(g);
     var files = []; g.forEach(function (t) { t.files.forEach(function (f) { if (files.indexOf(f) < 0) files.push(f); }); });
     return { key: g.length === 1 ? g[0].key : g[0].key + "-plus" + (g.length - 1), tasks: g, files: files };
   });
 }
+// Dependencies first, otherwise the planner's order; a cycle keeps the planner's order.
+function depOrder(group) {
+  var out = [], left = group.slice();
+  while (left.length) {
+    var i = left.findIndex(function (t) {
+      return (t.dependsOn || []).every(function (d) { return out.some(function (x) { return x.key === d; }) || !left.some(function (x) { return x.key === d; }); });
+    });
+    out.push(left.splice(i < 0 ? 0 : i, 1)[0]);
+  }
+  return out;
+}
+function rawKey(k) { return String(k || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28); }
 function cleanTasks(raw) {
-  var seen = {};
-  return (raw || []).map(function (t, i) {
-    var key = String(t.key || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "task-" + (i + 1);
+  var seen = {}, renamed = {};
+  var tasks = (raw || []).map(function (t, i) {
+    var key = rawKey(t.key) || "task-" + (i + 1);
     while (seen[key]) key = key + "-" + (i + 1);
     seen[key] = true;
+    if (rawKey(t.key) && !(rawKey(t.key) in renamed)) renamed[rawKey(t.key)] = key;
     var files = (Array.isArray(t.files) ? t.files : []).map(norm).filter(function (f) { return f && f.charAt(0) !== "/" && f.split("/").indexOf("..") < 0; });
     // No ownership given: assume it may touch anything, so it shares a lane with everything.
-    return { key: key, title: String(t.title || key).slice(0, 120), brief: String(t.brief || t.title || ""), files: files.length ? files : ["**"] };
+    return { key: key, title: String(t.title || key).slice(0, 120), brief: String(t.brief || t.title || ""), files: files.length ? files : ["**"], deps: Array.isArray(t.dependsOn) ? t.dependsOn : [] };
+  });
+  return tasks.map(function (t) {
+    var deps = t.deps.map(function (d) { return renamed[rawKey(d)]; }).filter(function (d, i, all) { return d && d !== t.key && all.indexOf(d) === i; });
+    var out = { key: t.key, title: t.title, brief: t.brief, files: t.files };
+    if (deps.length) out.dependsOn = deps;
+    return out;
   });
 }
 
@@ -274,7 +402,7 @@ function planTask() {
 
 function workTask(lane) {
   return "You are one worker in a team run. Overall goal: " + PLAN.goal + "\n\n" +
-    "Your tasks:\n" + taskList(lane) + "\n\n" +
+    "Your tasks" + (lane.tasks.some(function (t) { return t.dependsOn && t.dependsOn.length; }) ? " (in this order: later ones build on earlier ones)" : "") + ":\n" + taskList(lane) + "\n\n" +
     "Files you own (edit only these; new files only inside them):\n" + owned(lane) + "\n\n" +
     "Rules: other workers are editing other files in parallel. If you must touch a file you do not own, or the brief is ambiguous, " +
     "call contact_supervisor with reason need_decision and wait for the answer. Do not commit, push, or switch branches. " +

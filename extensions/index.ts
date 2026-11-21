@@ -8,7 +8,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ import { Type } from "typebox";
 
 import { agentDir, backslashSources, findRepoRoot, gitCommonDir, globalDataDir, loadConfig, localProjectDataDir, playbookDirs, projectDataDir, type PtkConfig } from "../lib/config.ts";
 import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions, sessionEvidence } from "../lib/harvest.ts";
-import { formatFriction, frictionFromFiles, runPhases, sessionFiles } from "../lib/feedback.ts";
+import { formatFriction, frictionFromFiles, runLanes, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
@@ -76,9 +76,9 @@ import {
 } from "../lib/board.ts";
 import { detectEnv, formatEnv, realProbe, which, type EnvFacts, type Probe } from "../lib/env.ts";
 import { applyRemember, factFilePath, factStatus, formatFacts, readFactFile, writeFactFile, type CheckedFact, type RememberInput, type Scope } from "../lib/facts.ts";
-import { classifyCommand, commandTimeoutSec, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
+import { classifyCommand, commandTimeoutSec, sleepSeconds, gatePreflight, inspectBash, looksLikeTimeout, looksUnrunnable, NON_INTERACTIVE_ENV, resolveTimeout, withCi, type Pitfall } from "../lib/guard.ts";
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
-import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, splitStatus, stashCommand, taskWarnings, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
 import { buildNotification, compactThreshold, detectRole, sessionNameFrom, SUBWORKER_MARKER, terminalTitle, type SessionRole } from "../lib/session.ts";
 import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
@@ -322,13 +322,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (c.facts.enabled)
       env.push("This is already known: do not spend tool calls rediscovering it. When something costs you several tool calls to find and will still be true next week, save it with the remember tool.");
     if (worktreeNote) env.push(worktreeNote);
+    if (role === "lead") env.push(`pi-team-kit's own CLI is not on PATH; run it as: node "${PACKAGE_ROOT}/bin/ptk.ts" feedback|doctor|plan|leads|facts`);
     sections["environment"] = env.join("\n");
     if (c.guard.enabled)
       sections["command-rules"] =
         `bash calls without "timeout" stop after ${c.guard.defaultTimeoutSec}s (tests ${c.guard.testTimeoutSec}s, installs/builds ${c.guard.buildTimeoutSec}s, max ${c.guard.maxTimeoutSec}s); ` +
         "run the narrowest test that proves the point (one file or one test name) before the full suite. Test commands run with CI=1. " +
         "Servers, watchers and anything that waits forever go through the toolbox bg tool, never the foreground. " +
-        "Search with the grep/find/ls tools or rg/fd, not grep -r or find -name. Prefer one command with && over several calls, and run independent tool calls in parallel.";
+        "Search with the grep/find/ls tools or rg/fd, not grep -r or find -name. Prefer one command with && over several calls, and run independent tool calls in parallel. " +
+        "Write a file longer than about 300 lines in parts (write the first part, then add the rest with edit): a single huge write can hit the output token limit and is then thrown away unexecuted.";
     if (c.toolbox.enabled && state.tools.length)
       sections["toolbox"] =
         "Ready-made helpers, run with the toolbox tool. Check here before writing a one-off script; save new reusable helpers with toolbox action add.\n" +
@@ -421,6 +423,12 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (own !== undefined && t.timeout < own + 30) {
       t.timeout = Math.min(g.maxTimeoutSec, own + 60);
       notes.push(`The command limits itself to ${own}s, so the tool timeout was raised to ${t.timeout}s${t.timeout < own + 30 ? ` (the ceiling, guard.maxTimeoutSec; for longer jobs use toolbox bg)` : ""}.`);
+    }
+    // `sleep 178` under a 180 s timeout was killed 17 times in real use: the sleeps must fit, with room for the rest.
+    const slept = own === undefined ? sleepSeconds(decision.command) : 0;
+    if (slept > 0 && t.timeout < slept + 30) {
+      t.timeout = Math.min(g.maxTimeoutSec, slept + 60);
+      notes.push(`The command sleeps ${slept}s, so the tool timeout was raised to ${t.timeout}s. To wait for something, a loop that checks for it (or toolbox bg --wait-for) returns as soon as it is ready.`);
     }
     event.input.timeout = t.timeout;
     if (t.capped) notes.push(`Timeout capped at ${g.maxTimeoutSec}s. For longer jobs use toolbox bg and poll its logs.`);
@@ -837,20 +845,34 @@ export default function piTeamKit(pi: ExtensionAPI) {
     });
   }
 
-  async function dirtyFiles(root: string): Promise<string[]> {
-    const r = await pi.exec("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd: root, timeout: 15_000 });
+  async function dirtyFiles(root: string): Promise<{ tracked: string[]; untracked: string[] }> {
+    const r = await pi.exec("git", ["status", "--porcelain", "-z", "--untracked-files=normal"], { cwd: root, timeout: 15_000 });
     if (r.code !== 0) throw new Error(`git status failed: ${r.stderr}`);
-    return r.stdout
-      .split("\n")
-      .map((l) => l.slice(3).trim())
-      .filter((f) => f && !f.startsWith(".pi/subagents"));
+    return splitStatus(r.stdout);
   }
+  /** Top-level folders of the repo, for spotting owned paths that only exist one level down (monorepos). */
+  const topDirs = (root: string): string[] => {
+    try {
+      return readdirSync(root, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && !/^(\.|node_modules$)/.test(d.name))
+        .map((d) => d.name)
+        .slice(0, 60);
+    } catch {
+      return [];
+    }
+  };
+  /** Workers branch from HEAD: uncommitted edits to tracked files would be missing from every worktree. */
+  const trackedError = (tracked: string[], why: string) =>
+    `${why}\n${tracked.slice(0, 20).join("\n")}${tracked.length > 20 ? `\n... ${tracked.length - 20} more` : ""}\n` +
+    `Commit them, or set them aside now and bring them back after team_integrate:\n  ${stashCommand(tracked.slice(0, 50))}\n  git stash pop\n` +
+    "Untracked files (build output, logs, scratch files) do not need this.";
 
   const TaskSchema = Type.Object({
     key: Type.String({ description: "short id, e.g. api-auth" }),
     title: Type.String(),
-    brief: Type.String({ description: "Self-contained: what to change, where, and how to tell it is done. The worker sees nothing else." }),
-    files: Type.Array(Type.String(), { description: "Paths or globs this task owns (relative to repo root). Tasks sharing a path run in one lane." }),
+    brief: Type.String({ description: "Self-contained instructions, not a design document: what to change, where, and the check that proves it is done. The worker sees nothing else." }),
+    files: Type.Array(Type.String(), { description: "Paths or globs this task owns, relative to the repo root (in a monorepo: app/docs/x.md, not docs/x.md). Tasks sharing a path run in one lane." }),
+    dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Keys of tasks whose result this one needs (it runs or builds on their code). They run in the same lane first: each worker only sees HEAD." })),
   });
 
   const leadFile = (cwd: string) => {
@@ -1035,14 +1057,19 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const pb = pbName ? findPlaybook(playbookDirs(state.config), pbName) : undefined;
       if (pbName && !pb) throw new Error(`No playbook named "${pbName}". Available: ${listPlaybooks(playbookDirs(state.config)).map((p) => p.name).join(", ") || "none"}.`);
       const dirty = await dirtyFiles(root);
-      if (dirty.length) {
-        const shared = dirty.some((f) => f.startsWith(".pi/ptk")) ? "\n.pi/ptk holds team-shared facts/tools: commit it (or move it away) first." : "";
-        throw new Error(`Commit or stash these first; workers branch from a clean HEAD:\n${dirty.slice(0, 20).join("\n")}${shared}`);
-      }
+      if (dirty.tracked.length) throw new Error(trackedError(dirty.tracked, "These tracked files have uncommitted changes, and workers branch from HEAD, so no worker would see them:"));
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
       const lanes = planLanes(tasks);
+      const warnings = tasks.length ? taskWarnings(tasks, (params.tasks ?? []).map((x) => (Array.isArray(x.files) ? x.files.map(String) : [])), (rel) => existsSync(join(root, rel)), topDirs(root)) : [];
+      if (dirty.untracked.length) {
+        const owned = lanes.flatMap((l) => l.files);
+        const clash = dirty.untracked.filter((f) => owned.some((o) => patternsOverlap(o, f)));
+        const shared = dirty.untracked.filter((f) => f.startsWith(".pi/ptk"));
+        if (clash.length) warnings.push(`Untracked files inside the lanes' paths: ${clash.slice(0, 10).join(", ")}. Workers do not see them, and team_integrate stops if a lane creates the same file; commit or move them if they matter.`);
+        if (shared.length) warnings.push(".pi/ptk (team-shared facts and tools) is not committed, so workers run without it.");
+      }
       const gate = (params.gate ?? t.gate ?? "").trim() || envFor(root)?.testCommand || "";
       // A gate that cannot even start here (python3 being a Store alias, a missing tool) would fail every lane
       // after a full round of work. Check its program once, now; a timeout or a failing test suite is fine.
@@ -1088,6 +1115,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
           `Models: ${modelText}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
           `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min (${t.childTimeoutMin} min per worker run). It runs unattended after you confirm.`,
+          ...warnings.map((w) => `Warning: ${w}`),
         ].join(piWebLiveness() ? "\n\n" : "\n"); // pi-web renders the dialog as markdown, where one newline is a space
         const ok = await ctx.ui.confirm("Start this team run?", summary);
         if (!ok) throw new Error("The user did not confirm the brief. Ask what to change, update the brief, then call team_run again.");
@@ -1127,7 +1155,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
             text:
               `Team run started in the background: ${lanes.length ? `${lanes.length} lane(s)` : "the team-planner splits the goal first"}, up to ${t.maxParallel} at once, gate ${gate ? `\`${gate}\`` : "(none: verifier only)"}, max ${plan.maxRounds} round(s)${roles ? `, models ${roles}` : ""}.\n` +
               (laneLines.length ? `${laneLines.join("\n")}\n` : "") +
-              (lanes.length && lanes.length < tasks.length ? "Tasks sharing files were merged into one lane.\n" : "") +
+              (lanes.length && lanes.length < tasks.length ? "Tasks sharing files or depending on each other were merged into one lane.\n" : "") +
+              (warnings.length ? `Warnings (the run has started; redirect a worker with subagent action steer if one matters):\n${warnings.map((w) => `- ${w}`).join("\n")}\n` : "") +
               elsewhere +
               "You will be woken when it finishes. Meanwhile the fleet view shows progress; workers may ask you questions through the supervisor channel.",
           },
@@ -1154,7 +1183,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       teamRunUntil = 0; // the run is back; a browser host may close this session when idle again
       const root = repoFor(ctx.cwd, params.repo);
       const dirty = await dirtyFiles(root);
-      if (dirty.length) throw new Error(`The checkout has uncommitted changes; commit or stash them first so patches apply cleanly:\n${dirty.slice(0, 20).join("\n")}`);
+      if (dirty.tracked.length) throw new Error(trackedError(dirty.tracked, "These tracked files have uncommitted changes; the lanes' patches apply onto a clean checkout:"));
       const lines: string[] = [];
       const handoffs: string[] = [];
       for (const dir of params.runDirs) {
@@ -1637,7 +1666,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
 
   const frictionReport = (cwd: string, days: number, all: boolean) => {
     const files = sessionFiles(join(agentDir(), "sessions"), days);
-    const { signals, sessions } = frictionFromFiles(files, all ? undefined : basename(findRepoRoot(cwd) ?? cwd), readRunValue, runPhases);
+    const { signals, sessions } = frictionFromFiles(files, all ? undefined : basename(findRepoRoot(cwd) ?? cwd), readRunValue, runPhases, runLanes);
     return formatFriction(signals, { days, sessions });
   };
 
@@ -2050,7 +2079,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         if (!boardOn() || !lb.name) throw new Error("the lead board is off here (leads.enabled in ptk.json, a subagent session, or the home directory is not writable)");
         const now = Date.now();
         if (params.action === "list")
-          return text(`${formatBoard(liveCards(), lb.name, now, homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 8))}`);
+          return text(`${formatBoard(liveCards(), lb.name, now, homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 8), lb.name)}`);
         if (params.action === "status") {
           if (!params.text?.trim()) throw new Error("text is required: one line on what you are doing or what is done");
           setLeadStatus(params.text);
@@ -2084,7 +2113,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         lb.name = got;
         return ctx.ui.notify(`This lead is now "${got}" on the board.`, "info");
       }
-      ctx.ui.notify(`Leads (you are "${lb.name}"):\n${formatBoard(liveCards(), lb.name, Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 10))}`, "info");
+      ctx.ui.notify(`Leads (you are "${lb.name}"):\n${formatBoard(liveCards(), lb.name, Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 10), lb.name)}`, "info");
     },
   });
 

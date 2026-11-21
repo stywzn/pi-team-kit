@@ -75,7 +75,25 @@ function sharedFiles(lane: Lane, plan: RunValue["plan"]): string[] {
 }
 
 /** Signals from one session file. `readRunValue` returns a finished team run's value from its receipt directory. */
-export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unknown = () => undefined, readPhases: (dir: string) => Record<string, number> | undefined = () => undefined): Signal[] {
+/** The command a timeout belongs to: the first segment that does real work, not `cd`, `export` or `set -e`. */
+export function mainCommand(cmd: string): string {
+  const segs = cmd.split(/&&|\|\||;|\n/).map((s) => s.trim()).filter(Boolean);
+  return segs.find((s) => !/^(cd|pushd|set|export|source|\.|echo|true)(\s|$)/.test(s)) ?? segs[0] ?? "";
+}
+
+/** Who a failed tool call is for: a tool's limit (pi or ptk), arguments the model got wrong, or the tool failing. */
+export function errorSource(body: string): "limit" | "arguments" | "failed" {
+  if (/output token|max_?tokens|keep a message under|at most \d+|too (long|large|many)|over \d+ characters/i.test(body)) return "limit";
+  if (/validat|must be|is required|required property|expected|invalid|not a |unknown (option|parameter|tool)|is not one of|not found/i.test(body)) return "arguments";
+  return "failed";
+}
+
+export function sessionSignals(
+  jsonl: string,
+  readRunValue: (dir: string) => unknown = () => undefined,
+  readPhases: (dir: string) => Record<string, number> | undefined = () => undefined,
+  readLanes: (dir: string) => number | undefined = () => undefined,
+): Signal[] {
   const out: Signal[] = [];
   let project = "unknown";
   const calls = new Map<string, { name: string; args: Record<string, unknown> }>();
@@ -111,7 +129,9 @@ export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unk
       const minutes = Number.isNaN(runStart) ? 0 : Math.max(0, (t - runStart) / 60_000);
       const lanes = value?.lanes ?? [];
       const phases = readPhases(receipt[1].trim());
-      add("run", t, "team run", 0, { lanes: lanes.length, tasks: value?.plan?.tasks?.length ?? lanes.reduce((n, l) => n + (l.tasks?.length ?? 1), 0), ...(phases ? { phases } : {}) });
+      // A run stopped before it returned (or whose status.json was cleaned up) has no value: count its started lanes.
+      const started = lanes.length ? lanes.length : (readLanes(receipt[1].trim()) ?? 0);
+      add("run", t, "team run", 0, { lanes: started, tasks: value?.plan?.tasks?.length ?? (lanes.length ? lanes.reduce((n, l) => n + (l.tasks?.length ?? 1), 0) : started), ...(phases ? { phases } : {}) });
       const maxRounds = Math.max(1, ...lanes.map((l) => l.rounds || 1));
       for (const lane of lanes) {
         if (lane.rounds > 1) {
@@ -146,7 +166,7 @@ export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unk
       const call = calls.get(String(m.toolCallId ?? ""));
       const cmd = typeof call?.args.command === "string" ? call.args.command : "";
       const stopped = body.match(/\[ptk\] Stopped after (\d+)s/);
-      if (stopped) add("timeout", t, head(cmd.split(/&&|\|\||;|\n/)[0] || tool, 60), Number(stopped[1]) / 60);
+      if (stopped) add("timeout", t, head(mainCommand(cmd) || tool, 60), Number(stopped[1]) / 60);
       if (tool === "team_run" && m.isError === true) runStart = Number.NaN; // refused or not confirmed: no run started
       const block = m.isError === true ? BLOCKS.find(([, re]) => re.test(body.trim())) : undefined;
       if (block) add("block", t, block[0], 1);
@@ -154,7 +174,7 @@ export function sessionSignals(jsonl: string, readRunValue: (dir: string) => unk
         if (/^FAILED /m.test(body)) add("conflict", t, "a lane's patch did not apply", 10);
         if (/^gate `.*`: FAILED/m.test(body)) add("gate-failed", t, "lanes passed alone, the combined code failed the gate", 10);
         if (/^NOT removed/m.test(body)) add("not-removed", t, "worker worktrees left behind", 1);
-      } else if (m.isError === true && tool !== "bash") add("tool-error", t, `${tool}: ${head(body.split("\n").find((l) => l.trim()) ?? "", 70)}`, 1);
+      } else if (m.isError === true && tool !== "bash") add("tool-error", t, `${tool} (${errorSource(body)}): ${head(body.split("\n").find((l) => l.trim()) ?? "", 70)}`, 1);
     }
   }
   return out;
@@ -166,6 +186,7 @@ export function frictionFromFiles(
   project?: string,
   readRun: (dir: string) => unknown = () => undefined,
   readPhases: (dir: string) => Record<string, number> | undefined = () => undefined,
+  readLanes: (dir: string) => number | undefined = () => undefined,
 ): { signals: Signal[]; sessions: number } {
   const signals: Signal[] = [];
   let sessions = 0;
@@ -184,7 +205,7 @@ export function frictionFromFiles(
     }
     if (project && basename(cwd.replace(/[\\/]+$/, "")) !== project) continue;
     sessions++;
-    signals.push(...sessionSignals(text, readRun, readPhases));
+    signals.push(...sessionSignals(text, readRun, readPhases, readLanes));
   }
   return { signals, sessions };
 }
@@ -313,4 +334,24 @@ export function runPhases(runDir: string): Record<string, number> | undefined {
     }
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+/** Lanes a run started (its <lane>-work children), from workflow-children.jsonl: known also for runs that never returned. */
+export function runLanes(runDir: string): number | undefined {
+  let text: string;
+  try {
+    text = readFileSync(join(runDir, "workflow-children.jsonl"), "utf8");
+  } catch {
+    return undefined;
+  }
+  const keys = new Set<string>();
+  for (const line of text.split("\n")) {
+    try {
+      const e = JSON.parse(line) as { key?: unknown };
+      if (typeof e.key === "string" && /-work$/.test(e.key)) keys.add(e.key);
+    } catch {
+      /* partial line */
+    }
+  }
+  return keys.size || undefined;
 }

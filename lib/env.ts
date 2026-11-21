@@ -161,8 +161,28 @@ function repoInfo(probe: Probe): EnvFacts["repo"] {
   return { root: probe.repoRoot, branch, remote };
 }
 
+const SKIP_DIRS = /^(\.|node_modules$|venv$|env$|dist$|build$|out$|target$|vendor$|__pycache__$|site-packages$)/;
+
 function project(probe: Probe, python: string | undefined): { project: string[]; testCommand?: string } {
   const root = probe.repoRoot ?? probe.cwd;
+  const top = projectAt(probe, python, root);
+  if (top.testCommand) return top;
+  // A monorepo keeps its projects one folder down (app/, web/): find their test commands there.
+  const subs = probe
+    .list(root)
+    .filter((d) => !SKIP_DIRS.test(d) && /^[\w.@+-]+$/.test(d))
+    .slice(0, 40)
+    .map((d) => ({ dir: d, found: projectAt(probe, python, join(root, d)) }))
+    .filter((s) => s.found.project.length || s.found.testCommand);
+  if (!subs.length) return top;
+  const tested = subs.filter((s) => s.found.testCommand);
+  const lines = [...top.project, `Sub-projects: ${subs.map((s) => `${s.dir}/ (${s.found.project[0] ?? "tests only"})`).join("; ")}`];
+  // cd and && mean the same in sh and cmd.exe; every sub-project is one level down, so cd .. returns to the root.
+  const testCommand = tested.length ? tested.map((s) => `cd ${s.dir} && ${s.found.testCommand}`).join(" && cd .. && ") : undefined;
+  return { project: lines, testCommand };
+}
+
+function projectAt(probe: Probe, python: string | undefined, root: string): { project: string[]; testCommand?: string } {
   const has = (f: string) => probe.exists(join(root, f));
   const lines: string[] = [];
   let testCommand: string | undefined;

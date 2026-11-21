@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
+import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, splitStatus, stashCommand, taskWarnings, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
 
 const task = (key: string, files: string[]): TeamTask => ({ key, title: `Task ${key}`, brief: `Do the ${key} change and add a test for it.`, files });
 
@@ -338,4 +338,60 @@ test("lane gates that only fail because fewer tests ran go back to the full gate
   assert.equal(await keep("pytest tests", ["tests/test_a.py"]), "pytest tests");
   assert.equal(await keep("npx playwright test", ["e2e/login.spec.ts"]), "npx playwright test e2e/login.spec.ts", "playwright's own test subcommand is not a path");
   assert.equal(await keep("uv run python -m pytest -q", ["tests/test_a.py"]), "uv run python -m pytest -q tests/test_a.py");
+});
+
+test("dependsOn: checked, and a task runs in its dependency's lane, after it", async () => {
+  const dep = (key: string, files: string[], dependsOn?: string[]): TeamTask => ({ ...task(key, files), ...(dependsOn ? { dependsOn } : {}) });
+  assert.throws(() => validateTasks([dep("a", ["a.py"], ["nope"]), dep("b", ["b.py"], ["b"])]), (e: Error) => /no task with key "nope"/.test(e.message) && /cannot depend on itself/.test(e.message));
+  assert.throws(() => validateTasks([dep("a", ["a.py"], ["b"]), dep("b", ["b.py"], ["a"])]), /a -> b -> a is a cycle|b -> a -> b is a cycle/);
+  const tasks = validateTasks([dep("Bench", ["bench/run.py"], ["Core API"]), dep("core-api", ["src/api.py"]), dep("docs", ["README.md"])]);
+  assert.deepEqual(tasks[0].dependsOn, ["core-api"], "keys are normalised like task keys");
+  const lanes = planLanes(tasks);
+  assert.deepEqual(lanes.map((l) => l.tasks.map((t) => t.key)), [["core-api", "bench"], ["docs"]], "the dependency comes first");
+  assert.equal(lanes[0].key, "core-api-plus1");
+  const pass = { structuredOutput: { verdict: "pass", summary: "", findings: [] } };
+  const { calls } = await simulate({ lanes }, (key) => (key.includes("verify") ? pass : {}));
+  assert.match(calls.find((c) => c.key === "core-api-plus1-work")!.item.task, /Your tasks \(in this order: later ones build on earlier ones\):\n1\. Task core-api/);
+  assert.doesNotMatch(calls.find((c) => c.key === "docs-work")!.item.task, /in this order/);
+  // The planner's tasks go through the same rules inside the workflow, with renamed keys followed.
+  const planned = [
+    { key: "Bench", title: "Bench", brief: "Run the bench", files: ["bench/run.py"], dependsOn: ["Core API", "missing", "bench"] },
+    { key: "Core API", title: "Core", brief: "Change the API", files: ["src/api.py"] },
+    { key: "docs", title: "Docs", brief: "Docs", files: ["README.md"] },
+  ];
+  const { result } = await simulate({ lanes: [] }, (key) => (key === "plan" ? { structuredOutput: { tasks: planned, questions: [], notes: "" } } : key.includes("verify") ? pass : {}));
+  assert.deepEqual(result.lanes.map((l: { tasks: string[] }) => l.tasks), [["core-api", "bench"], ["docs"]]);
+});
+
+test("a monorepo gate (cd app && runner) is narrowed to the lane's files inside that folder", async () => {
+  const pass = { structuredOutput: { verdict: "pass", summary: "", findings: [] } };
+  const gateFor = (gate: string, files: string[]) =>
+    simulate({ lanes: planLanes([task("l", files)]), gate, laneTests: true }, (key) => (key.includes("verify") ? pass : {})).then((r) => r.calls.find((c) => c.key === "l-work")!.item.gate!.command);
+  assert.equal(await gateFor("cd virtual-instrument && python3 -m pytest -q", ["virtual-instrument/tests/test_scpi.py", "virtual-instrument/scpi.py"]), "cd virtual-instrument && python3 -m pytest -q tests/test_scpi.py");
+  assert.equal(await gateFor("cd virtual-instrument && python3 -m pytest -q", ["web/a.test.ts"]), "cd virtual-instrument && python3 -m pytest -q", "no test file inside the folder: as written");
+  assert.equal(await gateFor("cd a && pytest -q && cd .. && cd b && npm test", ["a/test_x.py"]), "cd a && pytest -q && cd .. && cd b && npm test", "several sub-projects: as written");
+  assert.equal(await gateFor("cd a; pytest -q", ["a/test_x.py"]), "cd a; pytest -q");
+});
+
+test("taskWarnings: long briefs and paths that only exist one folder down", () => {
+  const tree = new Set(["virtual-instrument", "virtual-instrument/docs", "virtual-instrument/docs/api.md", "src", "src/a.py", "docs"]);
+  const exists = (rel: string) => tree.has(rel);
+  const t = (files: string[], brief = "Change the thing and test it.") => ({ key: "k", title: "K", brief, files });
+  const w = (files: string[], raw = files, brief?: string) => taskWarnings([t(files, brief)], [raw], exists, ["virtual-instrument", "src", "docs"]);
+  assert.deepEqual(w(["src/a.py", "src/new.py", "tests/**"]), [], "existing paths, new files in existing folders and globs are fine");
+  assert.match(taskWarnings([t(["api.md"])], [["api.md"]], (r) => r === "virtual-instrument/api.md", ["virtual-instrument"]).join(), /"api.md" is not at the repo root, but virtual-instrument\/ exists.*write virtual-instrument\/api.md/);
+  const wrong = w(["guide/intro.md"], ["guide/intro.md"]);
+  assert.deepEqual(wrong, []);
+  const amb = taskWarnings([t(["docs/api.md"])], [["docs/api.md"]], exists, ["virtual-instrument", "src"]);
+  assert.deepEqual(amb, [], "docs/ exists at the root, so docs/api.md is a new file there");
+  const missingTop = taskWarnings([t(["manual/api.md"])], [["manual/api.md"]], (r) => r === "virtual-instrument/manual" || tree.has(r), ["virtual-instrument", "src"]);
+  assert.match(missingTop[0], /"manual\/api.md" is not at the repo root, but virtual-instrument\/manual\/ exists.*write virtual-instrument\/manual\/api.md/);
+  assert.deepEqual(taskWarnings([t(["manual/api.md"])], [["./manual/api.md"]], (r) => r === "virtual-instrument/manual", ["virtual-instrument"]), [], "./ means it");
+  assert.match(w(["src/a.py"], ["src/a.py"], "x".repeat(3500)).join(), /the brief is 3500 characters/);
+});
+
+test("splitStatus / stashCommand: only tracked changes block a run, with a command to set them aside", () => {
+  const z = [" M src/a.py", "M  README.md", "R  new name.py", "old name.py", "?? build/", "?? out.log", "?? .pi/subagents/x.json", ""].join("\0");
+  assert.deepEqual(splitStatus(z), { tracked: ["src/a.py", "README.md", "new name.py"], untracked: ["build/", "out.log"] });
+  assert.equal(stashCommand(["src/a.py", "new name.py"]), "git stash push -m ptk-team-run -- src/a.py 'new name.py'");
 });
