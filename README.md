@@ -147,6 +147,8 @@ npm install && npm test
 PTK_E2E_WORKER_MODEL=deepseek/deepseek-flash bash test/e2e/rework.sh
 ```
 
+合并队列和有依赖的任务（约 2 分钟）：`bash test/e2e/deps.sh`；嵌套 worker：`bash test/e2e/nested.sh`；不花 token 的 worker 监控检查：`node test/e2e/watch.mjs`。`winui` 的真窗口测试默认跳过，在 Windows 或 WSL 里用 `PTK_GUI_TESTS=1 npm test` 打开（测试窗口最小化，不抢键盘）。
+
 ## 许可
 
 MIT
