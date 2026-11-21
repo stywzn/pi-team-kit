@@ -919,6 +919,29 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (r.missingShell) return "no bash found to run it. On Windows install Git for Windows (pi's bash tool needs it too).";
     return !r.timedOut && looksUnrunnable(r.code, r.output) ? `\`${pre.program} --version\` said:\n${r.output.trim().slice(0, 500)}` : undefined;
   }
+  /**
+   * A run branch at HEAD and its worktree outside the repo (the checkout stays clean, as pi-subagents requires),
+   * prepared like a worker's (virtualenv, ignored local files): the merge queue applies each passed lane there.
+   */
+  async function createIntegration(root: string): Promise<{ branch: string; dir: string; script: string } | undefined> {
+    const stamp = Date.now().toString(36);
+    const branch = `ptk/run-${stamp}`;
+    const dir = join(tmpdir(), "ptk-integration", `${basename(root).replace(/[^\w.-]+/g, "_")}-${stamp}`);
+    try {
+      mkdirSync(dirname(dir), { recursive: true });
+      const r = await pi.exec("git", ["worktree", "add", "-q", "-b", branch, dir, "HEAD"], { cwd: root, timeout: 120_000 });
+      if (r.code !== 0) return undefined;
+      const ignored = (rel: string) => spawnSync("git", ["-C", dir, "check-ignore", "-q", "--", rel], { stdio: "ignore", windowsHide: true, timeout: 10_000 }).status === 0;
+      try {
+        prepareWorktree(root, dir, state.config.team.linkIntoWorktrees, ignored);
+      } catch {
+        /* the gate may still run without them */
+      }
+      return { branch, dir, script: join(PACKAGE_ROOT, "bin", "merge-lane.mjs") };
+    } catch {
+      return undefined;
+    }
+  }
   /** Top-level folders of the repo, for spotting owned paths that only exist one level down (monorepos). */
   const topDirs = (root: string): string[] => {
     try {
@@ -941,7 +964,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     title: Type.String(),
     brief: Type.String({ description: "Self-contained instructions, not a design document: what to change, where, and the check that proves it is done. The worker sees nothing else." }),
     files: Type.Array(Type.String(), { description: "Paths or globs this task owns, relative to the repo root (in a monorepo: app/docs/x.md, not docs/x.md). Tasks sharing a path run in one lane." }),
-    dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Keys of tasks whose result this one needs (it runs or builds on their code). They run in the same lane first: each worker only sees HEAD." })),
+    dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Keys of tasks whose result this one needs (it runs or builds on their code). It starts once they are merged, from the run branch, so it sees their change (with team.mergeQueue off: it runs in their lane, after them)." })),
     verify: Type.Optional(
       Type.Object(
         { cmd: Type.String({ description: "focused command, e.g. pytest tests/test_login.py::test_lock -q" }), expect: Type.String({ description: 'what it prints when done, e.g. "1 passed"' }) },
@@ -1139,7 +1162,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       await rpc("ping", {}, 5_000);
       const t = state.config.team;
       const tasks = params.tasks?.length ? validateTasks(params.tasks as TeamTask[], t.maxTasks) : [];
-      const lanes = planLanes(tasks, t.maxParallel);
+      let lanes = planLanes(tasks, t.maxParallel, !t.mergeQueue);
       // Checked by code, not asked for in prose: a task without a check, a brief that does not say where, a
       // placeholder, a path that is not in the repo, or a check that cannot run here goes back to the lead now,
       // before any worker spends an hour on it.
@@ -1195,13 +1218,18 @@ export default function piTeamKit(pi: ExtensionAPI) {
           "",
           `Gate: ${gate || "(none: verifier only)"}${gate && t.laneTests ? " (each lane runs only its own test files; the full gate runs after integration)" : ""}`,
           `Models: ${modelText}`,
-          lanes.length ? `Lanes: ${lanes.map((l) => l.key).join(", ")}` : "Tasks: the team-planner splits the goal",
+          lanes.length ? `Lanes: ${lanes.map((l) => l.key + (l.after?.length ? ` (after ${l.after.join(", ")})` : "")).join(", ")}` : "Tasks: the team-planner splits the goal",
+          ...(t.mergeQueue ? ["Merge queue: each lane that passes is merged at once into a run branch, one at a time, with the full gate on the combined code; a lane that needs another starts after it is merged."] : []),
           `Up to ${t.maxParallel} workers, ${Math.round(t.maxRounds)} review round(s) max, deadline ${t.runTimeoutMin} min (${t.childTimeoutMin} min per worker run). It runs unattended after you confirm.`,
           ...warnings.map((w) => `Warning: ${w}`),
         ].join(piWebLiveness() ? "\n\n" : "\n"); // pi-web renders the dialog as markdown, where one newline is a space
         const ok = await ctx.ui.confirm("Start this team run?", summary);
         if (!ok) throw new Error("The user did not confirm the brief. Ask what to change, update the brief, then call team_run again.");
       }
+      // The merge queue's branch and worktree, made only now that the run is confirmed. Without it (no worktree
+      // support, a failure), lanes are only reviewed as before and dependent tasks share a lane.
+      const integration = t.mergeQueue ? await createIntegration(root) : undefined;
+      if (t.mergeQueue && !integration && tasks.length) lanes = planLanes(tasks, t.maxParallel, true);
       const plan = {
         goal: fullGoal,
         lanes,
@@ -1218,6 +1246,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         laneTests: t.laneTests,
         maxLanes: t.maxParallel,
         constraints: (params.constraints ?? []).map((c) => c.trim()).filter(Boolean).slice(0, 10),
+        ...(integration ? { integration } : {}),
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),
@@ -1227,10 +1256,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
       });
       lastTeamRepo = root;
       teamRunUntil = Date.now() + (t.runTimeoutMin + 10) * 60_000;
-      saveLead(root, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}) } }, ctx.sessionManager.getSessionFile());
+      saveLead(root, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}), ...(integration ? { integration: { branch: integration.branch, dir: integration.dir } } : {}) } }, ctx.sessionManager.getSessionFile());
       const elsewhere = root !== findRepoRoot(ctx.cwd) ? `Repository: ${root} (this session runs elsewhere; team_integrate uses it too).\n` : "";
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
-      const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]`);
+      const laneLines = lanes.map((l) => `- ${l.key}: ${l.tasks.map((x) => x.title).join(" + ")} [${l.files.join(", ")}]${l.after?.length ? ` after ${l.after.join(", ")}` : ""}`);
       const roles = Object.entries(plan.models ?? {}).filter(([, m]) => m).map(([r, m]) => `${r}=${m}`).join(", ");
       return {
         content: [
@@ -1329,6 +1358,15 @@ export default function piTeamKit(pi: ExtensionAPI) {
           }
           removed++;
           if (wt.branch) await pi.exec("git", ["branch", "-D", wt.branch], { cwd: root, timeout: 30_000 });
+        }
+        // The merge queue's run branch and worktree: its lanes are in the checkout now.
+        const int = openRun?.integration;
+        if (int && /^ptk\/run-[a-z0-9]+$/.test(int.branch)) {
+          const w = existsSync(int.dir) ? await pi.exec("git", ["worktree", "remove", "--force", int.dir], { cwd: root, timeout: 30_000 }) : { code: 0, stderr: "", stdout: "" };
+          if (w.code === 0) {
+            await pi.exec("git", ["branch", "-D", int.branch], { cwd: root, timeout: 30_000 });
+            lines.push(`removed the merge-queue branch ${int.branch}`);
+          } else failed.push({ path: int.dir, reason: `git worktree remove failed: ${(w.stderr || w.stdout).trim().split("\n")[0]}` });
         }
         await pi.exec("git", ["worktree", "prune"], { cwd: root, timeout: 30_000 });
         if (removed) lines.push(`removed ${removed} worker worktree(s) and their branches`);

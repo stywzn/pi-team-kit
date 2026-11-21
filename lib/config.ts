@@ -106,6 +106,10 @@ export interface PtkConfig {
      *  refused at `blockAfter` or after twice `stallMin` minutes without a change, until it changes a file, runs a check
      *  or asks the lead. A command that just failed is refused while nothing changed. `enabled: false` turns it off. */
     watch: { enabled: boolean; nudgeAfter: number; blockAfter: number; stallMin: number };
+    /** Merge queue: each lane that passes is merged at once into a run branch (worktree outside the repo), one at a time,
+     *  with the full gate run on the combined code before the commit; a task that depends on another starts from that
+     *  branch once the other is merged. false: lanes are only reviewed, and dependent tasks share a lane. */
+    mergeQueue: boolean;
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -186,6 +190,7 @@ export const DEFAULTS: PtkConfig = {
     auto: { enabled: true, files: 6, nudgeCalls: 40 },
     nested: { enabled: true, max: 3 },
     watch: { enabled: true, nudgeAfter: 12, blockAfter: 25, stallMin: 20 },
+    mergeQueue: true,
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -331,6 +336,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.nested.enabled = config.team.nested.enabled !== false;
   config.team.nested.max = clamp(Math.round(Number(config.team.nested.max) || 0), 2, 4);
   config.team.watch.enabled = config.team.watch.enabled !== false;
+  config.team.mergeQueue = config.team.mergeQueue !== false;
   config.team.watch.nudgeAfter = clamp(Math.round(Number(config.team.watch.nudgeAfter) || 0), 3, 200);
   config.team.watch.blockAfter = clamp(Math.round(Number(config.team.watch.blockAfter) || 0), config.team.watch.nudgeAfter + 1, 400);
   config.team.watch.stallMin = clamp(Math.round(Number(config.team.watch.stallMin) || 0), 5, 240);

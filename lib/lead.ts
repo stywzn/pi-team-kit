@@ -15,6 +15,8 @@ export interface LeadRun {
   runId?: string;
   /** Playbook the run followed, so its use is recorded when it is integrated. */
   playbook?: string;
+  /** The run's merge-queue branch and worktree, removed after a passing team_integrate. */
+  integration?: { branch: string; dir: string };
   result?: string;
 }
 

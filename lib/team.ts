@@ -27,6 +27,8 @@ export interface Lane {
   key: string;
   tasks: TeamTask[];
   files: string[];
+  /** Lanes whose change this one needs: it starts once they are merged, from the integration branch. */
+  after?: string[];
 }
 
 export interface TeamPlan {
@@ -51,6 +53,14 @@ export interface TeamPlan {
   maxLanes?: number;
   /** Rules for every task, copied word for word to each worker and verifier (e.g. unique test data, cleanup in teardown). */
   constraints?: string[];
+  /**
+   * The merge queue: a branch and its worktree (outside the repo) that each lane is merged into as soon as it passes,
+   * one at a time, with the full gate run on the combined code before the commit (bin/merge-lane.mjs does the apply).
+   * A lane that depends on another starts from this branch after that one is merged. Absent: lanes are only reviewed,
+   * and dependent tasks share a lane.
+   */
+  integration?: { branch: string; dir: string; script: string };
+  mergerAgent?: string;
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -237,20 +247,24 @@ export function patternsOverlap(a: string, b: string): boolean {
 /**
  * Merge tasks that share files into one lane (one worker), so parallel lanes never edit the same file. More lanes
  * than maxLanes would only queue, and each lane costs a worker and a verifier: the smallest are merged until it fits.
+ * A task that depends on another: with the merge queue (depsInOneLane false) it gets its own lane that starts after
+ * the other's lane is merged (after); without it, both go to one lane, in order. Lanes that would wait on each other
+ * in a circle are merged into one.
  */
-export function planLanes(tasks: TeamTask[], maxLanes = Infinity): Lane[] {
+export function planLanes(tasks: TeamTask[], maxLanes = Infinity, depsInOneLane = true): Lane[] {
   const parent = tasks.map((_, i) => i);
   const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const dep = (a: TeamTask, b: TeamTask) => Boolean(a.dependsOn?.includes(b.key));
   for (let i = 0; i < tasks.length; i++)
     for (let j = i + 1; j < tasks.length; j++)
-      if (tasks[i].files.some((a) => tasks[j].files.some((b) => patternsOverlap(a, b))) || tasks[i].dependsOn?.includes(tasks[j].key) || tasks[j].dependsOn?.includes(tasks[i].key))
+      if (tasks[i].files.some((a) => tasks[j].files.some((b) => patternsOverlap(a, b))) || (depsInOneLane && (dep(tasks[i], tasks[j]) || dep(tasks[j], tasks[i]))))
         parent[find(j)] = find(i);
   const groups = new Map<number, TeamTask[]>();
   tasks.forEach((t, i) => {
     const root = find(i);
     groups.set(root, [...(groups.get(root) ?? []), t]);
   });
-  const list = [...groups.values()];
+  let list = [...groups.values()];
   while (list.length > Math.max(1, maxLanes)) {
     // The two smallest lanes become one; the later one joins the earlier, so task order is kept.
     const order = list.map((g, i) => i).sort((a, b) => list[a].length - list[b].length || a - b);
@@ -258,14 +272,49 @@ export function planLanes(tasks: TeamTask[], maxLanes = Infinity): Lane[] {
     list[a] = [...list[a], ...list[b]];
     list.splice(b, 1);
   }
-  return list.map((group) => {
+  list = mergeLaneCycles(list);
+  const keyOf = (group: TeamTask[]) => {
     const ordered = dependencyOrder(group);
+    return ordered.length === 1 ? ordered[0].key : `${ordered[0].key}-plus${ordered.length - 1}`;
+  };
+  const laneOf = new Map<string, number>();
+  list.forEach((g, i) => g.forEach((t) => laneOf.set(t.key, i)));
+  return list.map((group, i) => {
+    const ordered = dependencyOrder(group);
+    const after = [...new Set(group.flatMap((t) => (t.dependsOn ?? []).map((d) => laneOf.get(d)).filter((j): j is number => j !== undefined && j !== i)))].map((j) => keyOf(list[j]));
     return {
-      key: ordered.length === 1 ? ordered[0].key : `${ordered[0].key}-plus${ordered.length - 1}`,
+      key: keyOf(group),
       tasks: ordered,
       files: [...new Set(ordered.flatMap((t) => t.files))],
+      ...(after.length ? { after } : {}),
     };
   });
+}
+
+/** Lanes that would wait on each other in a circle become one lane, until no circle is left. */
+function mergeLaneCycles(list: TeamTask[][]): TeamTask[][] {
+  for (;;) {
+    const laneOf = new Map<string, number>();
+    list.forEach((g, i) => g.forEach((t) => laneOf.set(t.key, i)));
+    const edges = list.map((g, i) => [...new Set(g.flatMap((t) => (t.dependsOn ?? []).map((d) => laneOf.get(d)).filter((j): j is number => j !== undefined && j !== i)))]);
+    const state: number[] = list.map(() => 0);
+    let cycle: number[] | undefined;
+    const walk = (i: number, path: number[]): void => {
+      if (cycle || state[i] === 2) return;
+      if (state[i] === 1) {
+        cycle = path.slice(path.indexOf(i));
+        return;
+      }
+      state[i] = 1;
+      for (const j of edges[i]) walk(j, [...path, i]);
+      state[i] = 2;
+    };
+    list.forEach((_, i) => walk(i, []));
+    if (!cycle) return list;
+    const keep = Math.min(...cycle);
+    const merged = list.filter((_, i) => cycle!.includes(i)).flat();
+    list = list.map((g, i) => (i === keep ? merged : g)).filter((_, i) => i === keep || !cycle!.includes(i));
+  }
 }
 
 /** The pi-subagents workflow script for a plan. Data is embedded as JSON; logic is fixed. */
@@ -454,11 +503,12 @@ function overlap(a, b) {
   return pa.indexOf(pb) === 0 || pb.indexOf(pa) === 0;
 }
 function lanesFor(tasks) {
+  var together = !PLAN.integration; // without the merge queue a task and what it depends on share a lane
   var parent = tasks.map(function (_, i) { return i; });
   function find(i) { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; }
   function dep(a, b) { return (a.dependsOn || []).indexOf(b.key) >= 0; }
   for (var i = 0; i < tasks.length; i++) for (var j = i + 1; j < tasks.length; j++)
-    if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); }) || dep(tasks[i], tasks[j]) || dep(tasks[j], tasks[i])) parent[find(j)] = find(i);
+    if (tasks[i].files.some(function (a) { return tasks[j].files.some(function (b) { return overlap(a, b); }); }) || (together && (dep(tasks[i], tasks[j]) || dep(tasks[j], tasks[i])))) parent[find(j)] = find(i);
   var groups = [], index = {};
   tasks.forEach(function (t, i) { var r = find(i); if (!(r in index)) { index[r] = groups.length; groups.push([]); } groups[index[r]].push(t); });
   while (groups.length > Math.max(1, PLAN.maxLanes || Infinity)) {
@@ -467,11 +517,44 @@ function lanesFor(tasks) {
     groups[pair[0]] = groups[pair[0]].concat(groups[pair[1]]);
     groups.splice(pair[1], 1);
   }
-  return groups.map(function (g) {
-    g = depOrder(g);
-    var files = []; g.forEach(function (t) { t.files.forEach(function (f) { if (files.indexOf(f) < 0) files.push(f); }); });
-    return { key: g.length === 1 ? g[0].key : g[0].key + "-plus" + (g.length - 1), tasks: g, files: files };
+  groups = mergeCycles(groups);
+  function keyOf(g) { g = depOrder(g); return g.length === 1 ? g[0].key : g[0].key + "-plus" + (g.length - 1); }
+  var laneOf = laneIndex(groups);
+  return groups.map(function (g, gi) {
+    var ordered = depOrder(g);
+    var files = []; ordered.forEach(function (t) { t.files.forEach(function (f) { if (files.indexOf(f) < 0) files.push(f); }); });
+    var lane = { key: keyOf(g), tasks: ordered, files: files };
+    var after = laneEdges(g, gi, laneOf).map(function (j) { return keyOf(groups[j]); });
+    if (after.length) lane.after = after;
+    return lane;
   });
+}
+function laneIndex(groups) { var m = {}; groups.forEach(function (g, i) { g.forEach(function (t) { m[t.key] = i; }); }); return m; }
+function laneEdges(g, gi, laneOf) {
+  var out = [];
+  g.forEach(function (t) { (t.dependsOn || []).forEach(function (d) { var j = laneOf[d]; if (j !== undefined && j !== gi && out.indexOf(j) < 0) out.push(j); }); });
+  return out;
+}
+// Same as mergeLaneCycles() in lib/team.ts: lanes that would wait on each other in a circle become one.
+function mergeCycles(groups) {
+  for (;;) {
+    var laneOf = laneIndex(groups);
+    var edges = groups.map(function (g, i) { return laneEdges(g, i, laneOf); });
+    var state = groups.map(function () { return 0; }), cycle = null;
+    function walk(i, path) {
+      if (cycle || state[i] === 2) return;
+      if (state[i] === 1) { cycle = path.slice(path.indexOf(i)); return; }
+      state[i] = 1;
+      edges[i].forEach(function (j) { walk(j, path.concat([i])); });
+      state[i] = 2;
+    }
+    groups.forEach(function (_, i) { walk(i, []); });
+    if (!cycle) return groups;
+    var keep = Math.min.apply(null, cycle);
+    var merged = [];
+    groups.forEach(function (g, i) { if (cycle.indexOf(i) >= 0) merged = merged.concat(g); });
+    groups = groups.map(function (g, i) { return i === keep ? merged : g; }).filter(function (_, i) { return i === keep || cycle.indexOf(i) < 0; });
+  }
 }
 // Dependencies first, otherwise the planner's order; a cycle keeps the planner's order.
 function depOrder(group) {
@@ -564,7 +647,8 @@ function verifyTask(lane, writer, round) {
     ? "The complete change is a patch. Read " + lane.origin + "/handoff.json, take groups[].children[].patch.path, and read that file. " +
       "Read surrounding code only when the patch is not enough.\n"
     : "This is a rework round. " + worktree +
-      "Read the owned files there (their current state includes every round) and compare them with the same files in the main checkout, which still holds the original version. " +
+      "Read the owned files there (their current state includes every round) and compare them with the same files in " +
+      (lane.baseRef && INT ? "the integration worktree " + INT.dir + ", which holds the version it started from. " : "the main checkout, which still holds the original version. ") +
       "The patch file in handoff.json shows round 1 only.\n";
   return "Verify one lane of a team run (round " + round + "). Overall goal: " + PLAN.goal + "\n\n" +
     "The lane's tasks:\n" + taskList(lane) + rules() + "\n\nFiles the lane owns:\n" + owned(lane) + "\n\n" + where +
@@ -666,6 +750,7 @@ function review(lane, writer, round) {
 
 function startLane(lane) {
   var item = withModel({ agent: PLAN.workerAgent, label: "Implement " + lane.key, task: workTask(lane), worktree: true }, "worker");
+  if (lane.baseRef) item.baseRef = lane.baseRef;
   var gate = laneGate(lane);
   if (gate) item.gate = gate;
   var key = lane.key + "-work";
@@ -702,13 +787,63 @@ if (!lanes.length) {
   if (issues.length) planned.unfixed = issues;
 }
 
-const results = await Promise.all(lanes.map(startLane));
+// A lane starts when the lanes it needs are merged (from the integration branch, so it sees their change); a lane
+// that passes is merged at once, one at a time, with the full gate run on the combined code before the commit.
+var INT = PLAN.integration || null;
+var byKey = {}, outcome = {}, mergeOrder = [], mergeTail = Promise.resolve();
+lanes.forEach(function (l) { byKey[l.key] = l; });
+function laneOutcome(key) {
+  if (!outcome[key]) {
+    var lane = byKey[key];
+    outcome[key] = Promise.all((lane.after || []).filter(function (k) { return byKey[k]; }).map(laneOutcome)).then(function (deps) {
+      var missing = deps.filter(function (d) { return !d.merged; }).map(function (d) { return d.lane; });
+      if (missing.length) return skipped(lane, missing);
+      if (INT && deps.length) lane.baseRef = "refs/heads/" + INT.branch;
+      return startLane(lane).then(function (r) { return INT && r.state === "passed" ? queueMerge(lane, r) : r; });
+    });
+  }
+  return outcome[key];
+}
+function skipped(lane, missing) {
+  var r = finish(lane, null, { summary: "Not started: it needs " + missing.join(", ") + ", which did not pass or could not be merged.", findings: [] }, 0, "skipped");
+  r.waitedFor = missing;
+  return r;
+}
+function q(s) { return '"' + s + '"'; }
+function queueMerge(lane, r) {
+  var p = mergeTail.then(function () { return mergeLane(lane, r); });
+  mergeTail = p.then(function () {}, function () {});
+  return p;
+}
+function mergeLane(lane, r) {
+  // Only paths pi-subagents and the extension wrote reach the command, and only when no shell could read them as code.
+  if (!r.runDir || /["%!\r\n]/.test(r.runDir + INT.script + INT.dir)) { r.merged = false; r.mergeError = "no usable run folder to merge from"; return r; }
+  var gate = !GATE ? "" : /\|\||;/.test(GATE.command) ? "(" + GATE.command + ")" : GATE.command;
+  var command = "node " + q(INT.script) + " " + q(r.runDir + "/handoff.json") + " " + lane.key + (gate ? " && " + gate : "") +
+    " && git -c user.name=pi-team-kit -c user.email=pi-team-kit@localhost commit -q --no-verify --allow-empty -m " + q("ptk: " + lane.key);
+  var key = lane.key + "-merge";
+  var item = withModel({ agent: PLAN.mergerAgent || "team-merger", label: "Merge " + lane.key, task: "Reply with exactly: ok", cwd: INT.dir,
+    gate: { command: command, timeoutMs: (GATE ? GATE.timeoutMs : 0) + 300000 } }, "worker");
+  return settle(key, runs.run(key, item)).then(function (m) {
+    r.merged = Boolean(m.ok);
+    if (m.ok) mergeOrder.push(lane.key);
+    else r.mergeError = clip(m.error || m.output, 1500);
+    return r;
+  });
+}
+
+const results = await Promise.all(lanes.map(function (l) { return laneOutcome(l.key); }));
+var mergedDirs = mergeOrder.map(function (k) { return results.filter(function (r) { return r.lane === k; })[0].runDir; });
 return {
   goal: PLAN.goal,
   gate: PLAN.gate || null,
   plan: planned,
   lanes: results,
-  next: "Call team_integrate with runDirs = the runDir of each passed lane, in this order. Lanes marked needs-human or failed need your decision."
+  integration: INT ? { branch: INT.branch, dir: INT.dir, merged: mergeOrder, runDirs: mergedDirs } : null,
+  next: INT
+    ? "Passed lanes were merged one at a time into branch " + INT.branch + " (worktree " + INT.dir + "), with the full gate run on the combined code before each commit. " +
+      "Call team_integrate with runDirs = integration.runDirs, in that order. Lanes not merged (mergeError, skipped, needs-human, failed) need your decision."
+    : "Call team_integrate with runDirs = the runDir of each passed lane, in this order. Lanes marked needs-human or failed need your decision."
 };
 `;
 
