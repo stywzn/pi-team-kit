@@ -24,6 +24,7 @@ import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorkt
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
 import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
 import { SoloWork } from "../lib/solo.ts";
+import { ownedFiles, WorkerWatch } from "../lib/progress.ts";
 import { checkedKind, PY_CHECK, restoredNote, syntaxError } from "../lib/filecheck.ts";
 import { approvePartCall, partTask, validateParts, type Part } from "../lib/nested.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
@@ -450,6 +451,33 @@ export default function piTeamKit(pi: ExtensionAPI) {
       content: [...(trimmed ? [{ type: "text" as const, text: trimmed }] : (event.content ?? [])), ...(extra.length ? [{ type: "text" as const, text: `\n[ptk] ${extra.join("\n[ptk] ")}` }] : [])],
       structuredContent: event.structuredContent,
     };
+  });
+
+  // ---------- worker watch: is a team worker really working, or circling? (lib/progress.ts) ----------
+  // Decided by code from the worker's own tool calls: long reading without a change gets a note, then more reading
+  // is refused until it changes something, runs a check or asks the lead; a command that just failed is refused
+  // while nothing changed; an edit outside the task's files is refused with "ask contact_supervisor".
+  let watch: WorkerWatch | undefined;
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (watch || !process.env.PI_SUBAGENT_CHILD || !state.config.team.watch.enabled) return;
+    if (detectRole(process.env, event.systemPrompt ?? "") !== "worker") return;
+    // A rework round starts with the fix request; the file list is in the first task of the session.
+    watch = new WorkerWatch(state.config.team.watch, ownedFiles(firstTask(ctx)) ?? ownedFiles(event.prompt ?? ""));
+  });
+  pi.on("tool_call", async (event, ctx) => {
+    if (!watch) return;
+    const input = event.input as { command?: unknown; path?: unknown };
+    const rel = (event.toolName === "edit" || event.toolName === "write") && typeof input.path === "string" ? relative(ctx.cwd, resolve(ctx.cwd, input.path)).replace(/\\/g, "/") : undefined;
+    const verdict = watch.before(event.toolName, { command: typeof input.command === "string" ? input.command : undefined }, rel);
+    if (verdict.block) return { block: true, reason: `[ptk] ${verdict.block}` };
+  });
+  pi.on("tool_result", async (event) => {
+    if (!watch) return;
+    const command = (event.input as { command?: unknown }).command;
+    const body = (event.content ?? []).map((c: { type: string; text?: string }) => (c.type === "text" ? (c.text ?? "") : "")).join("\n");
+    const note = watch.after(event.toolName, { command: typeof command === "string" ? command : undefined }, Boolean(event.isError), body);
+    if (!note) return;
+    return { content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${note}` }], structuredContent: event.structuredContent };
   });
 
   // ---------- subagent runs: deadline, hand-off before it, and what a run left behind when it did not finish ----------

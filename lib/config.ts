@@ -102,6 +102,10 @@ export interface PtkConfig {
     /** Nested workers, two levels at most: a team worker may hand up to `max` independent parts of its own task to
      *  sub-workers working at the same time in its worktree (subtasks tool). Same deadline and hand-off. */
     nested: { enabled: boolean; max: number };
+    /** A team worker watched by code (lib/progress.ts): a note after `nudgeAfter` read-only calls in a row, more reading
+     *  refused at `blockAfter` or after twice `stallMin` minutes without a change, until it changes a file, runs a check
+     *  or asks the lead. A command that just failed is refused while nothing changed. `enabled: false` turns it off. */
+    watch: { enabled: boolean; nudgeAfter: number; blockAfter: number; stallMin: number };
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -181,6 +185,7 @@ export const DEFAULTS: PtkConfig = {
     checkpointMin: 10,
     auto: { enabled: true, files: 6, nudgeCalls: 40 },
     nested: { enabled: true, max: 3 },
+    watch: { enabled: true, nudgeAfter: 12, blockAfter: 25, stallMin: 20 },
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -325,6 +330,10 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.auto.enabled = config.team.auto.enabled !== false;
   config.team.nested.enabled = config.team.nested.enabled !== false;
   config.team.nested.max = clamp(Math.round(Number(config.team.nested.max) || 0), 2, 4);
+  config.team.watch.enabled = config.team.watch.enabled !== false;
+  config.team.watch.nudgeAfter = clamp(Math.round(Number(config.team.watch.nudgeAfter) || 0), 3, 200);
+  config.team.watch.blockAfter = clamp(Math.round(Number(config.team.watch.blockAfter) || 0), config.team.watch.nudgeAfter + 1, 400);
+  config.team.watch.stallMin = clamp(Math.round(Number(config.team.watch.stallMin) || 0), 5, 240);
   return { config, files, warnings };
 }
 
