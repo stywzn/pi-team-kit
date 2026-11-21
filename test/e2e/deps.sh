@@ -103,7 +103,7 @@ check(lanes.get("report", {}).get("state") == "passed", f"report passed its own 
 steps = []
 for st in glob.glob(os.path.join(run_dir or "", "status.json")):
     steps = json.load(open(st)).get("steps") or []
-mergers = [s for s in steps if s.get("agent") == "team-merger"]
+mergers = [s for s in steps if s.get("agent") == "team-merger" and str(s.get("label") or s.get("sessionName") or "").lower().startswith(("merge", "team-merger: merge"))]
 check(sum(1 for s in mergers if s.get("status") in ("complete", "completed")) == 3, f"three team-merger steps finished: {[s.get('status') for s in mergers]}")
 check("removed the merge-queue branch" in integrate_out, "team_integrate removed the run branch")
 for f in ["stats.py", "test_stats.py", "report.py", "test_report.py"]:

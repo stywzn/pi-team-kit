@@ -8,7 +8,7 @@ import { basename, dirname, join } from "node:path";
 
 export interface LeadRun {
   startedAt: string;
-  status: "running" | "integrated" | "integration-failed";
+  status: "running" | "integrated" | "integration-failed" | "ended";
   lanes: string[];
   gate: string;
   /** pi-subagents async run id, when known, to check on a run that is still going. */
@@ -36,6 +36,18 @@ export interface LeadState {
   runs: LeadRun[];
   /** Free-text handoff brief written by /handoff. */
   handoff?: string;
+  /** Recorded by code after every lead turn, so a takeover knows what is verified and what is only claimed. */
+  progress?: LeadProgress;
+}
+
+export interface LeadProgress {
+  at: string;
+  /** Files with uncommitted changes in the repo then. */
+  uncommitted: string[];
+  /** The checks the lead ran (tests, builds, linters), latest last, with their result. */
+  checks: { command: string; ok: boolean; at: string }[];
+  /** Code files the lead changed after its last check: changed, not verified. */
+  unchecked: string[];
 }
 
 export function leadStatePath(dataDir: string, repoRoot: string): string {
@@ -69,7 +81,7 @@ export function updateLeadState(prev: LeadState | undefined, repo: string, patch
     if (open) Object.assign(open, patch.finishRun);
   }
   const { addRun: _a, finishRun: _f, ...rest } = patch;
-  return { version: 1, repo, runs: runs.slice(-10), ...(prev ? { brief: prev.brief, handoff: prev.handoff, session: prev.session } : {}), ...rest, updatedAt: now.toISOString() };
+  return { version: 1, repo, runs: runs.slice(-10), ...(prev ? { brief: prev.brief, handoff: prev.handoff, session: prev.session, progress: prev.progress } : {}), ...rest, updatedAt: now.toISOString() };
 }
 
 /** Pull a run id out of whatever pi-subagents returned for an async spawn. */
@@ -82,8 +94,15 @@ export function ageText(iso: string, now = Date.now()): string {
   return min < 60 ? `${min} min ago` : min < 48 * 60 ? `${Math.round(min / 60)} h ago` : `${Math.round(min / 1440)} days ago`;
 }
 
+/** What a takeover is told besides the saved state: the ledger, a smoke check run just now, the repo's state now. */
+export interface TakeoverFacts {
+  ledger?: string;
+  smoke?: { command: string; ok: boolean; tail: string; timedOut?: boolean };
+  uncommittedNow?: string[];
+}
+
 /** The first message for a lead session that takes over. It asks for a status check, not new work. */
-export function continuationMessage(s: LeadState, now = Date.now()): string {
+export function continuationMessage(s: LeadState, now = Date.now(), facts: TakeoverFacts = {}): string {
   const lines = [`I'm handing you a task from an earlier lead session in this repository (last active ${ageText(s.updatedAt, now)}).`];
   if (s.brief) {
     lines.push("", `Goal: ${s.brief.goal}`, `Done when: ${s.brief.doneWhen}`);
@@ -96,9 +115,25 @@ export function continuationMessage(s: LeadState, now = Date.now()): string {
       lines.push(`- ${r.startedAt.slice(0, 16).replace("T", " ")} ${r.status}: lanes ${r.lanes.join(", ") || "(planner)"}; gate ${r.gate ? `\`${r.gate}\`` : "none"}${r.runId ? `; run ${r.runId}` : ""}${r.result ? `\n  ${r.result.split("\n").slice(0, 3).join(" | ")}` : ""}`);
   }
   if (s.handoff) lines.push("", "Handoff notes from the previous session:", s.handoff);
+  const p = s.progress;
+  if (p) {
+    lines.push("", `Where the previous session left the code (recorded by code ${ageText(p.at, now)}, not by the model):`);
+    if (p.checks.length) lines.push("Verified: checks it ran, latest last:", ...p.checks.slice(-5).map((c) => `- \`${c.command.slice(0, 160)}\` ${c.ok ? "passed" : "FAILED"} (${ageText(c.at, now)})`));
+    else lines.push("Verified: no check was run in that session.");
+    if (p.unchecked.length) lines.push(`Changed after its last check (claimed, not verified): ${p.unchecked.slice(0, 15).join(", ")}`);
+    if (p.uncommitted.length) lines.push(`Uncommitted then: ${p.uncommitted.slice(0, 15).join(", ")}${p.uncommitted.length > 15 ? ` and ${p.uncommitted.length - 15} more` : ""}`);
+  }
+  if (facts.uncommittedNow) lines.push(`Uncommitted now: ${facts.uncommittedNow.length ? facts.uncommittedNow.slice(0, 15).join(", ") : "nothing"}`);
+  if (facts.smoke)
+    lines.push(
+      "",
+      `Smoke check just now: \`${facts.smoke.command}\` ${facts.smoke.ok ? "passed" : facts.smoke.timedOut ? "did not finish in time" : "FAILED"}.`,
+      ...(facts.smoke.ok ? [] : [facts.smoke.tail]),
+    );
+  if (facts.ledger) lines.push("", facts.ledger);
   lines.push(
     "",
-    "First check where things actually stand (git status and diff; for a run still marked running: subagent({ action: \"status\", id })). Then tell me in a few lines what is done, what is not, and what you propose next. Do not start new work until I confirm.",
+    "First check where things actually stand (git status and diff; for a run still marked running: subagent({ action: \"status\", id })). Count only what a check verified as done; anything changed after the last check is claimed, not done, until you check it. Then tell me in a few lines what is done, what is not, and what you propose next. Do not start new work until I confirm.",
   );
   return lines.join("\n");
 }

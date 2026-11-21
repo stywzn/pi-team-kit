@@ -14,6 +14,9 @@ const ROLE_MARKERS: [SessionRole, string][] = [
 /** A sub-worker (second level): works like a worker but may not start sub-workers itself. */
 export const SUBWORKER_MARKER = "You are a sub-worker in a team run.";
 
+/** The fresh-context reviewer of a lead's uncommitted change (agents/team-reviewer.md): reads, never changes. */
+export const REVIEWER_MARKER = "You review an uncommitted change with fresh eyes.";
+
 /** Which kind of session is running, from the subagent environment flag and the system prompt. */
 export function detectRole(env: NodeJS.ProcessEnv, systemPrompt: string): SessionRole {
   for (const [role, marker] of ROLE_MARKERS) if (systemPrompt.includes(marker)) return role;

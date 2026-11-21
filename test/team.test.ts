@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { buildTeamScript, cleanupTargets, patchesFromHandoff, patternsOverlap, planLanes, roleModels, splitStatus, stashCommand, taskProblems, taskWarnings, validateTasks, worktreeFromHandoff, type TeamPlan, type TeamTask } from "../lib/team.ts";
+import { withAll } from "./fakeruns.ts";
 
 const task = (key: string, files: string[]): TeamTask => ({ key, title: `Task ${key}`, brief: `Do the ${key} change and add a test for it.`, files });
 
@@ -90,7 +91,7 @@ async function simulate(plan: Partial<TeamPlan>, respond: (key: string, item: It
       return { runId: `run-${n}`, artifactPaths: [], output: `State: failed\nDir: /runs/${n}\n` };
     },
   };
-  const result = await new AsyncFunction("runs", buildTeamScript(full))(runs);
+  const result = await new AsyncFunction("runs", buildTeamScript(full))(withAll(runs));
   return { result, calls };
 }
 

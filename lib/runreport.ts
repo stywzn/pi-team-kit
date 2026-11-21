@@ -128,3 +128,40 @@ export function formatRunReport(items: ReportItem[]): string {
   lines.push("Tell the user what was left, then decide with them: keep and finish it, or undo it (git checkout / git clean on those files).");
   return lines.join("\n");
 }
+
+/**
+ * What a finished team run tells the lead beyond pass/fail, taken from its result by code: a gate that already
+ * failed on the unchanged code (no worker started), lanes stopped by an environment problem, and the workers'
+ * discoveries (root causes, environment facts, workarounds) for the lead to check and keep. Empty when none.
+ */
+export function teamNotes(value: unknown): string {
+  const v = (value ?? {}) as { state?: unknown; baseline?: { error?: unknown; envProblem?: { kind?: unknown; line?: unknown } | null }; lanes?: unknown };
+  const lines: string[] = [];
+  if (v.state === "baseline-failed") {
+    const env = v.baseline?.envProblem;
+    lines.push(
+      `[ptk] The team run started no worker: its gate already fails on the unchanged code${env?.kind ? ` (looks like an environment problem: ${String(env.kind)})` : ""}.`,
+      `  ${clip(String(v.baseline?.error ?? "").replace(/\s+/g, " "), 600)}`,
+      "  Fix that (or tell the user what is missing), then run again; run with baseline: false only when the goal is to fix exactly these failures.",
+    );
+  }
+  const lanes = Array.isArray(v.lanes) ? (v.lanes as Array<{ lane?: unknown; envProblem?: { kind?: unknown; line?: unknown } | null; discoveries?: unknown }>) : [];
+  const env = lanes.filter((l) => l?.envProblem && typeof l.envProblem === "object");
+  if (env.length) {
+    lines.push("[ptk] Lanes stopped by the environment (no code change in a lane fixes these; fix the environment once, then rerun them):");
+    for (const l of env) lines.push(`- ${String(l.lane ?? "?")}: ${String(l.envProblem?.kind ?? "?")}: ${clip(String(l.envProblem?.line ?? ""), 200)}`);
+  }
+  const causes = Array.isArray((value as { causes?: unknown })?.causes) ? ((value as { causes: Array<{ cause?: unknown; lanes?: unknown; env?: unknown }> }).causes) : [];
+  if (causes.length) {
+    lines.push("[ptk] The same failure in several lanes: one problem each, fix it once, then rerun those lanes (their further rounds were stopped):");
+    for (const c of causes) lines.push(`- ${c.env ? "environment: " : ""}${clip(String(c.cause ?? ""), 240)} - lanes ${Array.isArray(c.lanes) ? c.lanes.join(", ") : "?"}`);
+  }
+  const found = lanes.flatMap((l) => (Array.isArray(l?.discoveries) ? (l.discoveries as unknown[]).map((d) => `- ${String(l.lane ?? "?")}: ${clip(String(d), 300)}`) : []));
+  if (found.length) {
+    lines.push(
+      "[ptk] Workers' discoveries (claims from their reports, not checked): check each against the code; save lasting environment facts and pitfalls with remember (they reach every later session and worker), and act on root causes that touch other work.",
+      ...found.slice(0, 30),
+    );
+  }
+  return lines.join("\n");
+}

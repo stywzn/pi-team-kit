@@ -7,7 +7,7 @@
 //   ptk caps [--apply]          per-role context windows through pi's model overrides
 //   ptk demo [dir]              create a throwaway repo to try /team on
 //   ptk plan <tasks.json> [--script]   show how tasks become lanes (and the workflow script)
-//   ptk leads [n]               lead sessions running on this machine, their status and the last n messages
+//   ptk leads [n]               lead sessions running on this machine, their status, claimed files, tasks and the last n messages
 //   ptk playbooks [check [dir]] list playbooks; check = enforce the length limits (for a team playbook repo's CI)
 //   ptk feedback [days] [--repo name]  where the tooling cost time (from pi's session files), to hand to an agent
 //   ptk web [-p port] [-H host] pi in the browser (pi-web): images, session list; the terminal keeps working
@@ -17,6 +17,8 @@ import { copyFileSync, cpSync, existsSync, readdirSync, readFileSync, writeFileS
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { formatBoard, formatLog, readCards, readLog } from "../lib/board.ts";
+import { formatLease, leaseDir, readLeases } from "../lib/leases.ts";
+import { formatTasks, readTasks } from "../lib/xtasks.ts";
 import { checkPlaybook, listPlaybooks } from "../lib/playbook.ts";
 import { formatFriction, frictionFromFiles, runLanes, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { readRunValue } from "../lib/harvest.ts";
@@ -227,7 +229,19 @@ switch (cmd) {
   }
   case "leads": {
     const dir = join(globalDataDir(), "board");
-    console.log(`${formatBoard(readCards(dir), "", Date.now(), homedir())}\n\nRecent messages:\n${formatLog(readLog(dir, Number(rest[0]) || 15))}`);
+    const cards = readCards(dir);
+    const leases = readLeases(leaseDir(dir), new Set(cards.map((c) => c.owner)));
+    const tasks = readTasks(dir);
+    console.log(
+      [
+        formatBoard(cards, "", Date.now(), homedir()),
+        ...(leases.length ? ["", "Claimed files:", ...leases.map((l) => `- ${formatLease(l)}`)] : []),
+        ...(tasks.length ? ["", "Tasks:", formatTasks(tasks)] : []),
+        "",
+        "Recent messages:",
+        formatLog(readLog(dir, Number(rest[0]) || 15)),
+      ].join("\n"),
+    );
     break;
   }
   case "playbooks": {

@@ -48,3 +48,23 @@ test("run ids are found in whatever the spawn returned", () => {
   assert.equal(findRunId({ details: { runId: "b04d9bae-e9c5-417b-9d71-d50aedacd57e" } }), "b04d9bae-e9c5-417b-9d71-d50aedacd57e");
   assert.equal(findRunId(undefined), undefined);
 });
+
+test("takeover: what was verified (checks with results) is told apart from what is only claimed, with a smoke check run now", async () => {
+  const { continuationMessage, updateLeadState } = await import("../lib/lead.ts");
+  const now = Date.parse("2026-11-21T12:00:00Z");
+  let s = updateLeadState(undefined, "/r", { brief: { goal: "add login lockout", doneWhen: "tests pass" } }, new Date(now - 3_600_000));
+  s = updateLeadState(s, "/r", { progress: { at: new Date(now - 600_000).toISOString(), uncommitted: ["src/login.py", "tests/test_login.py"], checks: [{ command: "pytest tests/test_login.py -q", ok: true, at: new Date(now - 900_000).toISOString() }, { command: "ruff check src", ok: false, at: new Date(now - 800_000).toISOString() }], unchecked: ["src/session.py"] } }, new Date(now - 600_000));
+  s = updateLeadState(s, "/r", { handoff: "next: rate limit" }, new Date(now - 500_000));
+  assert.ok(s.progress, "progress survives later updates");
+  const m = continuationMessage(s, now, { smoke: { command: "pytest -q", ok: false, tail: "FAILED tests/test_session.py::test_expire" }, uncommittedNow: ["src/login.py"], ledger: "Decisions already made (do not reopen them; if one blocks your task, ask the lead):\n- sessions stay server-side" });
+  assert.match(m, /recorded by code 10 min ago, not by the model/);
+  assert.match(m, /Verified: checks it ran, latest last:\n- `pytest tests\/test_login\.py -q` passed \(15 min ago\)\n- `ruff check src` FAILED/);
+  assert.match(m, /Changed after its last check \(claimed, not verified\): src\/session\.py/);
+  assert.match(m, /Uncommitted then: src\/login\.py, tests\/test_login\.py\nUncommitted now: src\/login\.py/);
+  assert.match(m, /Smoke check just now: `pytest -q` FAILED\.\nFAILED tests\/test_session\.py::test_expire/);
+  assert.match(m, /Decisions already made.*\n- sessions stay server-side/);
+  assert.match(m, /Count only what a check verified as done/);
+  const fresh = continuationMessage(updateLeadState(undefined, "/r", { progress: { at: new Date(now).toISOString(), uncommitted: [], checks: [], unchecked: [] } }, new Date(now)), now, { smoke: { command: "npm test", ok: true, tail: "" } });
+  assert.match(fresh, /Verified: no check was run in that session\./);
+  assert.match(fresh, /Smoke check just now: `npm test` passed\./);
+});

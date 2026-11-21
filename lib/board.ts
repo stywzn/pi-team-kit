@@ -21,6 +21,12 @@ export const MAX_UNREAD = 200;
 export const MAX_WAKE_HOPS = 2;
 /** Changing a file another lead changed this recently needs a message to that lead first. */
 export const OVERLAP_MS = 30 * 60_000;
+/** Messages one thread may hold (a question, its answer, the answer to that...): past this the leads stop and tell their users. */
+export const MAX_THREAD = 6;
+/** The same text to the same lead again within this time is refused as a duplicate. */
+export const DEDUPE_MS = 10 * 60_000;
+/** Receipts older than this are removed when the next message is sent. */
+const RECEIPT_KEEP_MS = 7 * 86_400_000;
 
 export interface ChangedFile {
   /** Relative to the repo root, forward slashes. */
@@ -59,6 +65,34 @@ export interface LeadMessage {
   /** Position in a chain of woken turns: 0 when a person started the sender's turn. */
   hops: number;
   at: string;
+  /** The first message of the conversation this one belongs to (its own id for a new one). */
+  thread: string;
+  /** Position in that thread: 1 for a new message, the answered one's + 1 for an answer. */
+  n: number;
+  /** The id of the message this one answers. */
+  re?: string;
+}
+
+/**
+ * What the sender can see about one message to one lead: queued (in the inbox), delivered (the receiving session
+ * took it in), answered (the receiver replied with re=<id>). One file per message and recipient:
+ *   <dir>/receipts/<id>.json
+ */
+export interface Receipt {
+  id: string;
+  from: string;
+  to: string;
+  thread: string;
+  n: number;
+  update: boolean;
+  /** The start of the text, for listings and duplicate checks. */
+  text: string;
+  at: string;
+  state: "queued" | "delivered" | "answered";
+  deliveredAt?: string;
+  answeredAt?: string;
+  /** The start of the answer. */
+  answer?: string;
 }
 
 const NAME = /^[a-z0-9][a-z0-9._-]{0,39}$/;
@@ -178,54 +212,170 @@ export interface SendResult {
   delivered: string[];
   /** Recipients that are not running now: they get the message when a session takes their name. */
   offline: string[];
+  /** Message id per recipient: answers name it (re), receipts are kept under it. */
+  ids: Record<string, string>;
+  thread: string;
+  n: number;
 }
+
+const receiptsDir = (dir: string) => join(dir, "receipts");
+/** Short, sortable ids: the time in base 36 (8 characters until 2059), then 4 random hex characters. */
+const newId = (now: number) => `${now.toString(36).padStart(8, "0")}${randomBytes(2).toString("hex")}`;
+const ID = /^[0-9a-z]{8,40}$/;
+
+export function readReceipt(dir: string, id: string): Receipt | undefined {
+  if (!ID.test(id)) return undefined;
+  try {
+    const r = JSON.parse(readFileSync(join(receiptsDir(dir), `${id}.json`), "utf8")) as Receipt;
+    return r && r.id === id && str(r.from) && str(r.to) ? r : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeReceipt(dir: string, r: Receipt) {
+  ensureDir(receiptsDir(dir));
+  writeAtomic(join(receiptsDir(dir), `${r.id}.json`), r);
+}
+
+/** The receiving session took the message in. */
+export function markDelivered(dir: string, ids: string[], now = Date.now()): void {
+  for (const id of ids) {
+    const r = readReceipt(dir, id);
+    if (!r || r.state !== "queued") continue;
+    try {
+      writeReceipt(dir, { ...r, state: "delivered", deliveredAt: new Date(now).toISOString() });
+    } catch {
+      /* a receipt is for the sender's information; never fail a delivery over it */
+    }
+  }
+}
+
+/** Receipts of messages `from` sent, newest first. */
+export function sentReceipts(dir: string, from: string, limit = 10): Receipt[] {
+  const d = receiptsDir(dir);
+  if (!existsSync(d)) return [];
+  const out: Receipt[] = [];
+  for (const f of readdirSync(d).filter((x) => x.endsWith(".json")).sort().reverse()) {
+    const r = readReceipt(dir, f.slice(0, -5));
+    if (r && r.from === from) out.push(r);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function pruneReceipts(dir: string, now: number) {
+  const d = receiptsDir(dir);
+  if (!existsSync(d)) return;
+  for (const f of readdirSync(d)) {
+    const ms = parseInt(f.slice(0, 8), 36);
+    if (Number.isFinite(ms) && now - ms > RECEIPT_KEEP_MS) rmSync(join(d, f), { force: true });
+  }
+}
+
+const sameText = (a: string, b: string) => a.replace(/\s+/g, " ").trim().toLowerCase() === b.replace(/\s+/g, " ").trim().toLowerCase();
 
 export function sendMessage(
   dir: string,
-  msg: { from: string; to: string; text: string; update: boolean; hops: number },
+  msg: { from: string; to: string; text: string; update: boolean; hops: number; re?: string; /** a lead name known from the board (a task's owner): its inbox is made if needed */ known?: boolean },
   now = Date.now(),
   staleMs = STALE_MS,
 ): SendResult {
   const text = msg.text.trim();
   if (!text) throw new Error("the message is empty");
   if (text.length > MAX_TEXT) throw new Error(`keep a message under ${MAX_TEXT} characters: say what changed and where, not the whole diff`);
+  // An answer joins the thread of the message it answers; only that message's receiver can answer it.
+  let thread = "";
+  let n = 1;
+  let answered: Receipt | undefined;
+  if (msg.re?.trim()) {
+    answered = readReceipt(dir, msg.re.trim());
+    if (!answered) throw new Error(`no message with id "${msg.re}" (the ids are in the messages you received)`);
+    if (answered.to !== msg.from) throw new Error(`message ${msg.re} was not sent to you, so you cannot answer it`);
+    thread = answered.thread;
+    n = answered.n + 1;
+    if (n > MAX_THREAD)
+      throw new Error(
+        `This thread has gone back and forth ${answered.n} times. Stop messaging about it: tell your user what is still unresolved between you and ${answered.from}, and let them decide.`,
+      );
+  }
   const live = readCards(dir, now, staleMs);
   let targets: string[];
   if (msg.to === "all") {
-    targets = live.map((c) => c.name).filter((n) => n !== msg.from);
+    targets = live.map((c) => c.name).filter((x) => x !== msg.from);
     if (!targets.length) throw new Error("no other lead is running right now");
   } else {
     if (!validName(msg.to)) throw new Error(`"${msg.to}" is not a lead name; use one from leads list, or "all"`);
     if (msg.to === msg.from) throw new Error("that is your own name");
-    if (!existsSync(cardFile(dir, msg.to)) && !existsSync(inboxDir(dir, msg.to)))
-      throw new Error(`no lead named "${msg.to}". Running now: ${live.map((c) => c.name).filter((n) => n !== msg.from).join(", ") || "none"}`);
+    if (!msg.known && !existsSync(cardFile(dir, msg.to)) && !existsSync(inboxDir(dir, msg.to)))
+      throw new Error(`no lead named "${msg.to}". Running now: ${live.map((c) => c.name).filter((x) => x !== msg.from).join(", ") || "none"}`);
     targets = [msg.to];
   }
-  const at = new Date(now).toISOString();
-  const base = { from: msg.from, to: msg.to, text, update: msg.update, hops: Math.max(0, Math.floor(msg.hops)), at };
+  // The same words to the same lead again, minutes later: a loop, not news.
+  const recent = sentReceipts(dir, msg.from, 30).filter((r) => now - Date.parse(r.at) < DEDUPE_MS && sameText(r.text, text.slice(0, 300)));
+  const dup = targets.filter((t) => recent.some((r) => r.to === t));
+  if (dup.length && dup.length === targets.length) {
+    const r = recent.find((x) => dup.includes(x.to))!;
+    throw new Error(`You sent exactly this to ${dup.join(", ")} at ${r.at.slice(11, 16)} (state: ${r.state}). Do not send it again; wait for the answer, or say something new.`);
+  }
+  targets = targets.filter((t) => !dup.includes(t));
   const full = targets.filter((t) => existsSync(inboxDir(dir, t)) && readdirSync(inboxDir(dir, t)).length >= MAX_UNREAD);
   if (full.length && msg.to !== "all") throw new Error(`${full.join(", ")} has ${MAX_UNREAD} unread messages and is probably gone for good; stop writing to it`);
   targets = targets.filter((t) => !full.includes(t));
+  const at = new Date(now).toISOString();
+  const ids: Record<string, string> = {};
+  for (const t of targets) ids[t] = newId(now);
+  if (!thread) thread = ids[targets[0]] ?? newId(now);
+  const base = { from: msg.from, to: msg.to, text, update: msg.update, hops: Math.max(0, Math.floor(msg.hops)), at, thread, n, ...(answered ? { re: answered.id } : {}) };
   for (const t of targets) {
     const inbox = inboxDir(dir, t);
     ensureDir(inbox);
-    const id = `${String(now).padStart(13, "0")}-${process.pid}-${rand()}`;
-    writeAtomic(join(inbox, `${id}.json`), { id, ...base });
+    writeAtomic(join(inbox, `${ids[t]}.json`), { id: ids[t], ...base });
+    try {
+      writeReceipt(dir, { id: ids[t], from: msg.from, to: t, thread, n, update: msg.update, text: text.slice(0, 300), at, state: "queued" });
+    } catch {
+      /* the message is out; its receipt is a convenience */
+    }
   }
-  appendLog(dir, { id: `${now}-${rand()}`, ...base });
+  if (answered) {
+    try {
+      writeReceipt(dir, { ...answered, state: "answered", answeredAt: at, answer: text.slice(0, 300) });
+    } catch {
+      /* ignore */
+    }
+  }
+  appendLog(dir, { id: ids[targets[0]] ?? newId(now), ...base });
+  try {
+    pruneReceipts(dir, now);
+  } catch {
+    /* ignore */
+  }
   const liveNames = new Set(live.map((c) => c.name));
-  return { delivered: targets.filter((t) => liveNames.has(t)), offline: targets.filter((t) => !liveNames.has(t)) };
+  return { delivered: targets.filter((t) => liveNames.has(t)), offline: targets.filter((t) => !liveNames.has(t)), ids, thread, n };
 }
 
 /** What the sender is told: who has it now, and who will only see it later. Never "sent" to a lead that is not running. */
 export function sendSummary(r: SendResult): string {
   const parts: string[] = [];
-  if (r.delivered.length) parts.push(`Delivered to ${r.delivered.join(", ")} (running: they see it before their next step).`);
+  const id = (t: string) => (r.ids[t] ? ` [${r.ids[t]}]` : "");
+  if (r.delivered.length) parts.push(`Delivered to ${r.delivered.map((t) => t + id(t)).join(", ")} (running: they see it before their next step; leads list shows when it is answered).`);
   if (r.offline.length)
     parts.push(
-      `NOT read yet: ${r.offline.join(", ")} ${r.offline.length > 1 ? "are" : "is"} not running. The message waits in the inbox and is shown when a session takes that name (usually the next lead in that repo, or /continue there).`,
+      `NOT read yet: ${r.offline.map((t) => t + id(t)).join(", ")} ${r.offline.length > 1 ? "are" : "is"} not running. The message waits in the inbox and is shown when a session takes that name (usually the next lead in that repo, or /continue there).`,
     );
+  if (r.n > 1) parts.push(`(message ${r.n} of at most ${MAX_THREAD} in this thread)`);
   return parts.join(" ");
+}
+
+/** For the sender: what happened to its recent messages. */
+export function formatReceipts(rs: Receipt[], now = Date.now()): string {
+  if (!rs.length) return "(you sent no messages yet)";
+  return rs
+    .map((r) => {
+      const state = r.state === "answered" ? `answered ${ageText(r.answeredAt ?? r.at, now)}: "${short(r.answer ?? "", 120)}"` : r.state === "delivered" ? `read, not answered yet${r.update ? " (an update request: they should answer)" : ""}` : "waiting in the inbox (not taken in yet)";
+      return `- [${r.id}] to ${r.to}, ${ageText(r.at, now)}: "${short(r.text, 80)}" - ${state}`;
+    })
+    .join("\n");
 }
 
 /**
@@ -248,7 +398,17 @@ export function readInbox(dir: string, name: string): { messages: LeadMessage[];
     }
     if (m && str(m.from) && str(m.text) && str(m.at)) {
       files.push(file);
-      messages.push({ ...m, update: m.update === true, hops: Number.isFinite(m.hops) ? m.hops : 0, text: m.text.slice(0, MAX_TEXT) });
+      const id = str(m.id) ? m.id : f.slice(0, -5);
+      messages.push({
+        ...m,
+        id,
+        update: m.update === true,
+        hops: Number.isFinite(m.hops) ? m.hops : 0,
+        text: m.text.slice(0, MAX_TEXT),
+        thread: str(m.thread) ? m.thread : id,
+        n: Number.isFinite(m.n) && m.n > 0 ? Math.floor(m.n) : 1,
+        ...(str(m.re) ? { re: m.re } : {}),
+      });
       continue;
     }
     // Unreadable: kept aside, not dropped, so the receiver is told and a person can look at it.
@@ -403,7 +563,7 @@ export function formatLog(messages: LeadMessage[], me?: string): string {
   const mine = (m: LeadMessage) => me !== undefined && (m.to === me || m.to === "all" || m.from === me);
   return messages.length
     ? messages
-        .map((m) => `- ${m.at.slice(11, 16)} ${m.from} → ${m.to}${m.update ? " (update)" : ""}: ${mine(m) ? m.text.trim() : short(m.text.replace(/\s+/g, " "), 160)}`)
+        .map((m) => `- ${m.at.slice(11, 16)} ${m.from} → ${m.to}${m.update ? " (update)" : ""}${m.re ? ` (answer to ${m.re})` : ""}: ${mine(m) ? m.text.trim() : short(m.text.replace(/\s+/g, " "), 160)}`)
         .join("\n")
     : "(no messages yet)";
 }
@@ -424,11 +584,13 @@ export function formatIncoming(messages: LeadMessage[]): string {
   ];
   for (const m of messages) {
     const from = validName(m.from) ? m.from : "(unknown lead)";
-    lines.push("", `From ${from} at ${m.at.slice(11, 16)}${m.to === "all" ? " (to all leads)" : ""}:`, safe(m.text));
+    const id = ID.test(m.id) ? m.id : "";
+    lines.push("", `From ${from} at ${m.at.slice(11, 16)}${m.to === "all" ? " (to all leads)" : ""}${id ? ` [id ${id}]` : ""}${m.re ? `, answering your message ${ID.test(m.re) ? m.re : "?"}` : ""}${m.n > 1 ? ` (message ${m.n} of at most ${MAX_THREAD} in this thread)` : ""}:`, safe(m.text));
     if (m.update)
       lines.push(
-        `${from} asks you to update: check whether this affects your work. If it does, update your own code, docs and tests now, within your task and your files. Then set your status (leads status) and reply to ${from} in one line with what you changed (leads send). If it does not affect you, just reply that.`,
+        `${from} asks you to update: check whether this affects your work. If it does, update your own code, docs and tests now, within your task and your files. Then set your status (leads status) and answer ${from} in one line with what you changed: leads send to=${from}${id ? ` re=${id}` : ""}. If it does not affect you, answer that.`,
       );
+    else if (id && !m.re) lines.push(`(To answer, use leads send to=${from} re=${id}; no answer is needed if it only informs you.)`);
   }
   lines.push(CLOSE_TAG);
   return lines.join("\n");

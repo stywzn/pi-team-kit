@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.11.0] - 2026-11-22
+
+From what still cost the most time in real runs: information that never reached the workers (or the lead), one stuck point (a broken test, a service that is down) hit by every lane, sessions overwriting each other's files, unverified changes by the lead, and handovers between lead sessions. Ideas taken from mcp_agent_mail (file leases, read/ack receipts, threads), Claude Code agent teams (one writer per file, notify when idle, stop long back-and-forth), beads (a ready list across sessions), Anthropic's long-running harness (progress recorded by code, a smoke test when a session takes over) and circuit breakers keyed by the failure.
+
+Stuck points and the environment:
+- Baseline: before any worker starts, the full gate runs once on the unchanged code, at the same time as the planner, in a clean worktree of its own (never in the lead's checkout). When it already fails there, no worker starts and the lead gets the output (`team.baseline`). `baseline: false` (a run that fixes exactly those failures) still runs it: code failures go to the workers as known, an environment problem still stops the run.
+- Preflight: commands the tests need to succeed (a service, a tool) are checked on the host before the confirmation (`team.preflight`). A saved fact whose check fails is shown as a warning.
+- Environment failures (a port taken, a service not reachable, Docker down, a command or package missing, no network, a full disk, out of memory, a missing setting, a locked file) are recognised from the output: the session is told not to change code to get around it but to report it (workers to the lead, the lead to the user). The same one twice in a lane's gate stops that lane for the lead. Matches that may also be code (a missing module, a missing setting, a locked file) are hints only and never stop anything.
+- The same failure in two lanes is one problem: no more rounds for it, the result groups lanes by cause, and while an environment problem has stopped two lanes, lanes not started yet are not started. Only a failure with its check's output (or a certain environment problem) counts, compared by that output; a lane that recovers leaves the cause.
+- Failed checks now reach the workers with their output: every child is launched through `runs.all`, which returns a failed child's whole result (pi-subagents' `runs.run` only threw "Acceptance verification 'gate' failed"). The same-failure test, the environment check, the merge error and the baseline all use the real output.
+- Each lane has its own ports and database suffix (`PTK_LANE`, `PTK_PORT_BASE`, `PTK_PORT_SPAN`, `PTK_DB_SUFFIX`), set in its worker's environment and in its gate's (pi-subagents' verify env: nothing is put in front of the command, so Windows paths with spaces and %VAR% in a gate work) (`team.laneEnv`).
+
+Files and sessions:
+- Stale writes: every session remembers the content of the files it read or wrote; a whole-file write of a file that changed on disk since, or that it never read, is refused (`guard.staleWrites`). Edits are not limited.
+- File leases: `leads claim` / `leads release`; another lead's edit of a claimed file is refused until it is released or expires, and a shell command that changed one gets a note. A team run claims its lanes' files and its checkout for its lead (`leads.leases`).
+- Lead lock: while its team run is going, the lead's edits of that checkout are refused and a shell change gets "put it back now" (`team.leadLock`). Released by team_integrate, or when the run ends with nothing to integrate (its empty run branch is then removed too). A run the lead waited for inside its turn (bg_wait) is now reported and cleaned up before the turn ends.
+
+Information up and down:
+- Decision ledger (`ledger` tool): decisions, approaches that were tried and failed, and rules, one line each, per repository; in front of the lead every turn and passed word for word to every planner, worker and verifier.
+- Workers report Discoveries (root causes, environment facts, workarounds, interface choices); the code takes them from the report and hands them to the lead, who saves the lasting ones with remember.
+- `tell_lanes`: a worker may tell the other lanes of its run once about something they need now (an environment fact, an interface they call); shown with their next tool result, at most three per worker.
+
+Verifying the lead's own work:
+- A lead that changed code files and ran no check since gets one message before its turn ends to run the narrowest check; more than three changed code files in one request also asks for a fresh-context, read-only review of the diff (agent `team-reviewer`) (`team.selfCheck`).
+
+Handover and lead-to-lead:
+- After every lead turn the code records the uncommitted files, the checks that ran with their result, and the files changed after the last check. `/continue` runs a smoke check first and tells verified apart from claimed, with the ledger.
+- Lead messages have ids, threads and receipts (queued, read, answered with `re=<id>`), visible in `leads list`; the same text again within ten minutes is refused; a thread stops after six messages and the leads tell their users. `leads await` tells you once when another lead goes idle.
+- Cross-lead tasks: `leads task` (with `after` = other leads' task ids) and `leads done`; leads whose tasks waited for it are told and woken, also when they are offline (the message waits for the next session with that name).
+
 ## [0.10.0] - 2026-11-21
 
 From real enterprise runs: 5 lanes, 68 minutes, none done and 2 failed; 4 lanes, 53 minutes, one done. Workers read code instead of executing, briefs had no anchors or checks, dependent tasks ran in parallel, nobody noticed a worker circling, and the run waited for its slowest lane. Ideas taken from GSD (task fields, analysis-paralysis guard), obra/superpowers (plan granularity, evidence before claims), poteto (a correction becomes a check, error text written as an instruction), DeepSeek Harness (stop and ask instead of guessing) and merge queues (bors, Zuul).

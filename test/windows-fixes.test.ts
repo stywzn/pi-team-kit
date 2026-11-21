@@ -8,6 +8,7 @@ import { backslashSources, findRepoRoot, gitCommonDir, localProjectDataDir } fro
 import { factStatus, mergeFactFiles } from "../lib/facts.ts";
 import { gatePreflight, gateProgram, isPathLike, looksUnrunnable } from "../lib/guard.ts";
 import { buildTeamScript, integrationGate, parseWorktreeList, pathKey, planWorktreeCleanup, resolveTeamRepo, validateTasks } from "../lib/team.ts";
+import { withAll } from "./fakeruns.ts";
 
 test("team runs work when pi was started outside the repo (home folder, another drive)", () => {
   const home = mkdtempSync(join(tmpdir(), "ptk-home-"));
@@ -177,7 +178,7 @@ test("A8: more tasks than the limit is an error, never a silent cut", async () =
     },
     status: async () => ({}),
   };
-  const result = await new AsyncFunction("runs", script)(runs);
+  const result = await new AsyncFunction("runs", script)(withAll(runs));
   assert.deepEqual(calls, ["plan"], "no worker starts");
   assert.equal(result.state, "needs-input");
   assert.match(result.questions[0], /3 tasks; the limit is 2/);

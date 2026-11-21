@@ -3,6 +3,8 @@
 // Planning, lane building and script generation are plain functions so they are unit-tested;
 // the workflow script itself only wires runs.run calls together.
 
+import { ENV_FAILURE_JS } from "./envfail.ts";
+
 export interface TeamTask {
   key: string;
   title: string;
@@ -61,6 +63,19 @@ export interface TeamPlan {
    */
   integration?: { branch: string; dir: string; script: string };
   mergerAgent?: string;
+  /** Run the full gate once on the unchanged code before any worker starts. "stop" (or true): when it fails there,
+   *  start no worker. "env": the lead said this run fixes those failures, so only an environment problem stops it
+   *  (no lane fixes a missing service with code); other failures go to the workers as known. */
+  baseline?: boolean | "stop" | "env";
+  /** Each lane's own ports and database suffix (see team.laneEnv); run = this run's stamp. */
+  laneEnv?: { portBase: number; portSpan: number; run: string };
+  /** Unused since lane variables travel in the gate's env (kept so older callers still type-check). */
+  windows?: boolean;
+  /** A clean worktree at HEAD for the baseline check (the merge queue's, or one made just for it). Without it the
+   *  baseline is skipped: it never runs in the lead's checkout, where a gate's output files would make it unclean. */
+  baselineDir?: string;
+  /** Workers may tell the other lanes once about something they need now (tell_lanes). */
+  broadcast?: boolean;
 }
 
 const KEY = /^[a-z0-9][a-z0-9-]{0,30}$/;
@@ -328,7 +343,7 @@ const GATE = PLAN.gate ? { command: PLAN.gate, timeoutMs: PLAN.gateTimeoutSec * 
 function resumeAcceptance(lane) {
   var g = laneGate(lane);
   return g
-    ? { level: "verified", preserveStagedIndex: true, verify: [{ id: "gate", command: g.command, timeoutMs: g.timeoutMs }] }
+    ? { level: "verified", preserveStagedIndex: true, verify: [gateCheck(g)] }
     : { level: "checked", preserveStagedIndex: true };
 }
 const VERDICT_SCHEMA = ${JSON.stringify(VERDICT_SCHEMA)};
@@ -419,6 +434,20 @@ function forLead(output) { return String(output || "").replace(/(^|\n)Evidence:[
 function blockedReport(w) { return /(^|\n)\s*Status:\s*BLOCKED\b/i.test(String((w && w.output) || "")); }
 function owned(lane) { return lane.files.map(function (f) { return "- " + f; }).join("\n"); }
 function runDir(r) { return (r && r.artifactPaths && r.artifactPaths[0]) || ""; }
+${ENV_FAILURE_JS}
+// What a worker found that the lead should know beyond its task (root causes, environment facts, workarounds,
+// interface choices): taken from its report by code, kept across rounds, handed to the lead with the result.
+function discoveriesOf(output) {
+  var m = /(^|\n)[ \t]*Discoveries:[ \t]*([\s\S]*?)(?=\n[ \t]*(Evidence|Concerns|Changed files|Status):|$)/i.exec(String(output || ""));
+  if (!m) return [];
+  return m[2].split(/\r?\n/).map(function (l) { return l.replace(/^\s*([-*\u2022]|\d+[.)])\s*/, "").trim(); })
+    .filter(function (l) { return l && !/^(none|n\/a|nothing( new)?|no discoveries|-)\.?$/i.test(l); }).slice(0, 8).map(function (l) { return clip(l, 300); });
+}
+function noteDiscoveries(lane, w) {
+  var have = lane.discoveries || [];
+  discoveriesOf(w && w.output).forEach(function (d) { if (have.indexOf(d) < 0) have.push(d); });
+  lane.discoveries = have.slice(-12);
+}
 
 // A failed child makes runs.run reject with only a message. Look the run up by key so it can still be resumed.
 function settle(key, promise) {
@@ -430,6 +459,44 @@ function settle(key, promise) {
     }, function () { return { ok: false, error: error, runId: null, artifactPaths: [], output: "" }; });
   });
 }
+
+// runs.all reports a failed child as { ok: false } with its whole result, the output of its checks included; runs.run
+// only throws "Acceptance verification 'gate' failed." without it. So every child is launched as a batch of one, and a
+// failed check's output (the test failures) reaches the worker, the same-failure test and the environment check.
+function runChild(key, item) {
+  var one = { key: key };
+  for (var k in item) if (Object.prototype.hasOwnProperty.call(item, k)) one[k] = item[k];
+  var p;
+  try { p = runs.all([one]).then(function (rs) { return rs[0]; }); } catch (e) { p = Promise.reject(e); }
+  return settle(key, p).then(function (r) {
+    if (r && !r.ok) {
+      var out = checkOutput(r);
+      if (out) { r.checkOutput = out; r.checkBody = checkBody(r); }
+    }
+    return r;
+  });
+}
+function tailText(s, n) { s = String(s || "").trim(); return s.length > n ? "...\n" + s.slice(-n) : s; }
+function checkOutput(r) {
+  var failed = [];
+  (r.results || []).forEach(function (x) {
+    ((x && x.acceptance && x.acceptance.verifyRuns) || []).forEach(function (v) { if (v && v.status !== "passed") failed.push(v); });
+  });
+  return failed.map(function (v) {
+    return "Check " + (v.id || "?") + " (" + clip(v.command, 300) + "): " + (v.status || "failed") + (v.exitCode !== undefined && v.exitCode !== null ? ", exit " + v.exitCode : "") +
+      "\n" + tailText([v.stdout, v.stderr].filter(Boolean).join("\n"), 3000);
+  }).join("\n\n");
+}
+// Only what the failed checks printed: what a failure is recognised by (the command line differs per lane).
+function checkBody(r) {
+  var out = [];
+  (r.results || []).forEach(function (x) {
+    ((x && x.acceptance && x.acceptance.verifyRuns) || []).forEach(function (v) { if (v && v.status !== "passed") out.push([v.stdout, v.stderr].filter(Boolean).join("\n")); });
+  });
+  return out.join("\n");
+}
+// What a failed child left to go by: its checks' output when there is one, else its error and report.
+function failText(w) { return w ? [w.checkOutput, w.error, w.checkOutput ? "" : w.output].filter(Boolean).join("\n") : ""; }
 
 // Each lane checks only the test files it owns when the gate is a test runner that takes file arguments
 // (pytest, unittest, jest, vitest, playwright test). The full gate still runs once on the combined code.
@@ -460,15 +527,46 @@ function narrowGate(gate, files) {
   if (!tests.every(function (f) { return /^[\w@+=:,.\/-]+$/.test(f); })) return gate;
   return gate + " " + tests.join(" ");
 }
+function laneGateBase(lane) {
+  if (!GATE) return undefined;
+  return lane.fullGate ? GATE.command : narrowGate(GATE.command, lane.files);
+}
+// The gate as the host runs it for this lane, with the lane's own ports and database suffix in its environment
+// (pi-subagents' verify env: no quoting, and %VAR% / $VAR in the gate itself see them).
 function laneGate(lane) {
   if (!GATE) return undefined;
-  return { command: lane.fullGate ? GATE.command : narrowGate(GATE.command, lane.files), timeoutMs: GATE.timeoutMs };
+  var e = laneEnv(lane);
+  return e ? { command: laneGateBase(lane), timeoutMs: GATE.timeoutMs, env: e } : { command: laneGateBase(lane), timeoutMs: GATE.timeoutMs };
+}
+function gateCheck(g) {
+  var c = { id: "gate", command: g.command, timeoutMs: g.timeoutMs };
+  if (g.env) c.env = g.env;
+  return c;
+}
+// Each lane's own resources, so lanes running at the same time never fight over one port or one test database.
+// Keys and values are plain words (lane keys are [a-z0-9-], the rest digits), safe in sh and cmd.exe alike.
+function laneEnv(lane) {
+  if (!PLAN.laneEnv) return null;
+  var i = lane.index || 0, base = PLAN.laneEnv.portBase + i * PLAN.laneEnv.portSpan;
+  var e = { PTK_RUN: String(PLAN.laneEnv.run), PTK_LANE: lane.key, PTK_LANE_INDEX: String(i), PTK_PORT_BASE: String(base), PTK_PORT_SPAN: String(PLAN.laneEnv.portSpan), PTK_DB_SUFFIX: "_" + lane.key.replace(/[^a-z0-9]+/g, "_") };
+  // plain words only: they also travel in the worker's task text and its environment
+  Object.keys(e).forEach(function (k) { if (!/^[\w.-]+$/.test(e[k])) delete e[k]; });
+  return e;
+}
+function laneResources(lane) {
+  var e = laneEnv(lane);
+  if (!e) return "";
+  var last = Number(e.PTK_PORT_BASE) + Number(e.PTK_PORT_SPAN) - 1;
+  return "\nThis lane's own resources (other lanes run at the same time): ports " + e.PTK_PORT_BASE + "-" + last + " (PTK_PORT_BASE, PTK_PORT_SPAN), database or schema suffix " + e.PTK_DB_SUFFIX +
+    " (PTK_DB_SUFFIX), lane name PTK_LANE=" + e.PTK_LANE + ". They are set in your environment and in the gate's. Anything you start or create for testing (a server, a database, a temp folder) uses them, so lanes never collide; " +
+    "where the code picks a port or a database name, read these variables (with the old value as the default) instead of hard-coding another one.\n" +
+    "[ptk-lane-env] " + Object.keys(e).map(function (k) { return k + "=" + e[k]; }).join(" ") + "\n";
 }
 // A lane that deletes or renames one of its test files cannot pass a gate naming that file: when the lane's
 // own gate fails because a named file or module is missing, later rounds run the full gate instead.
 function missingNamedFile(lane, text) {
-  var narrowed = laneGate(lane);
-  if (!narrowed || narrowed.command === GATE.command) return false;
+  var narrowed = laneGateBase(lane);
+  if (!narrowed || narrowed === GATE.command) return false;
   text = String(text || "");
   // Coverage thresholds and "no tests found" only trip because fewer tests ran: the full gate is the fair check.
   if (/coverage[^\n]*(not reached|not met|fail)|fail[-_ ]?under|required test coverage|no tests? (were )?(ran|found|collected)|no test files found|no test suite found/i.test(text)) return true;
@@ -478,7 +576,8 @@ function missingNamedFile(lane, text) {
     return base && (text.indexOf(base) >= 0 || text.indexOf(base.replace(/\.[^.]+$/, "")) >= 0);
   });
 }
-function gateText(lane) { var g = laneGate(lane); return g ? JSON.stringify(g.command) : ""; }
+// Shown to the worker without the lane's variables: they are in its environment already.
+function gateText(lane) { var g = laneGateBase(lane); return g ? JSON.stringify(g) : ""; }
 // What the verifier checks, given to the worker up front so the first round can already pass.
 var CHECKLIST = "it does what the tasks ask; no obvious bug or missing edge case; tests changed when behaviour changed; " +
   "no file changed outside the owned list";
@@ -620,7 +719,9 @@ function planTask() {
 function workTask(lane) {
   return "You are one worker in a team run. Overall goal: " + PLAN.goal + "\n\n" +
     "Your tasks" + (lane.tasks.some(function (t) { return t.dependsOn && t.dependsOn.length; }) ? " (in this order: later ones build on earlier ones)" : "") + ":\n" + taskList(lane) + rules() + "\n\n" +
-    "Files you own (edit only these; new files only inside them):\n" + owned(lane) + "\n\n" +
+    "Files you own (edit only these; new files only inside them):\n" + owned(lane) + "\n" + laneResources(lane) + "\n" +
+    (PLAN.knownFailure ? "The gate already fails on the unchanged code, before any change (this run is meant to fix that):\n" + clip(PLAN.knownFailure, 1500) + "\nIf your task is not about these failures, leave them alone: they are not caused by you.\n\n" : "") +
+    (PLAN.broadcast && lanes.length > 1 ? "If you find something the other lanes need right now (an environment fact such as a port that is taken, or an interface they call that you changed), tell them once with tell_lanes. Only for that, at most once.\n" : "") +
     "Rules: other workers are editing other files in parallel. If you must touch a file you do not own, or the brief is ambiguous, " +
     "call contact_supervisor with reason need_decision and wait for the answer. Do not commit, push, or switch branches. " +
     "Keep the change minimal and match the existing style.\n" +
@@ -629,8 +730,11 @@ function workTask(lane) {
     "Never re-run without a change and never retry a fix that already failed. A test that passes alone but fails with the others is leaking state: " +
     "give it its own data and clean up in teardown; never add sleeps or retries. If you cannot get past a failure after three real attempts, stop and " +
     "report BLOCKED with what you tried and the likely cause; the lead takes it to a person.\n" +
+    "A failure from the environment (a port taken, a service down, a tool or package missing, no network, a missing setting) is not yours to work around: " +
+    "check it once, then call contact_supervisor with the exact error, or report BLOCKED with it. Never change code, tests or config to get around it.\n" +
     "Before you report, check your change the way the verifier will: " + CHECKLIST + ".\n" +
     "Finish with exactly these parts:\nStatus: DONE, DONE_WITH_CONCERNS or BLOCKED\nChanged files: ...\n" +
+    "Discoveries: what the lead should know beyond your task, one line each: a root cause you found, an environment fact (a port, a service, a command that works here and one that does not), a workaround, an interface choice other code will rely on; \"none\" if nothing\n" +
     "Evidence: for each task, the command you ran and the last lines of its output (read by the verifier only)\nConcerns: open risks; for BLOCKED, what you tried and the likely cause";
 }
 
@@ -666,8 +770,10 @@ function fixTask(lane, review, round, same) {
     "Fix exactly these, stay inside your files" + (GATE ? ", re-run " + gateText(lane) : "") + ". Report again in the same parts; under Evidence, for each fix: what changed and the command that shows it.";
 }
 
-function gateFixTask(lane, writer, same) {
-  return "Your run did not pass its checks" + (GATE ? " (gate " + gateText(lane) + ")" : "") + ". Details:\n" + clip(writer.error || writer.output, 3000) + "\n" +
+function gateFixTask(lane, writer, same, env) {
+  return "Your run did not pass its checks" + (GATE ? " (gate " + gateText(lane) + ")" : "") + ". Details:\n" + clip(failText(writer), 3500) + "\n" +
+    (env ? "This looks like an environment problem (" + env.kind + ": " + JSON.stringify(env.line) + "): " + env.check + ". Do not change code to get around it: " +
+      "check it once; if it is the environment, report BLOCKED with the exact error (the lead fixes the environment). If it really is your code, fix that.\n" : "") +
     (same
       ? "This is the same failure as last round: the last change did not reach the cause, so do not try it again. Read the failure and the code path, " +
         "write down the cause and the evidence, then fix that. If it cannot be avoided inside your files, report BLOCKED with what you tried; the lead takes it to a person."
@@ -675,6 +781,7 @@ function gateFixTask(lane, writer, same) {
 }
 
 function finish(lane, writer, review, rounds, state) {
+  if (state === "passed") leaveCause(lane);
   return {
     lane: lane.key,
     tasks: lane.tasks.map(function (t) { return t.key; }),
@@ -685,13 +792,41 @@ function finish(lane, writer, review, rounds, state) {
     runId: (writer && writer.runId) || null,
     // The first writer run owns the worktree and handoff.json; resumed rounds work in that same worktree.
     runDir: lane.origin || null,
-    error: (writer && writer.error) || null,
+    error: (writer && (writer.checkOutput ? clip(writer.checkOutput, 1500) : writer.error)) || null,
     summary: clip((review && review.summary) || forLead(writer && writer.output), 800),
     findings: (review && review.findings) || [],
     // Why earlier rounds were sent back: the lessons a playbook is made of (/harvest reads them).
     history: lane.history || [],
+    discoveries: lane.discoveries || [],
+    envProblem: lane.envProblem || null,
+    sameCause: lane.sameCause || null,
     report: clip(forLead(writer && writer.output), 1200)
   };
+}
+
+// The same failure in two lanes is one problem: the lead fixes it once. Further rounds for it stop, and while an
+// environment problem has stopped two lanes, lanes that have not started yet are not started.
+var CAUSES = {};
+// Only a certain environment problem, or a failure with its check's output, can be a shared cause: a timeout or a
+// provider error without output says nothing about the code. A lane that recovers leaves its cause (leaveCause).
+function noteCause(lane, writer, env) {
+  var useEnv = env && env.certain;
+  if (!useEnv && !writer.checkBody) return null;
+  var key = useEnv ? "env:" + env.kind + ":" + String(env.line).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trim() : "sig:" + failSig(writer.checkBody);
+  leaveCause(lane);
+  var c = CAUSES[key] || (CAUSES[key] = { env: Boolean(useEnv), text: useEnv ? env.kind + ": " + env.line : clip(writer.checkBody, 300), lanes: [] });
+  if (c.lanes.indexOf(lane.key) < 0) c.lanes.push(lane.key);
+  lane.cause = key;
+  return c;
+}
+function leaveCause(lane) {
+  if (!lane.cause || !CAUSES[lane.cause]) return;
+  CAUSES[lane.cause].lanes = CAUSES[lane.cause].lanes.filter(function (k) { return k !== lane.key; });
+  lane.cause = null;
+}
+function envBlock() {
+  for (var k in CAUSES) if (CAUSES[k].env && CAUSES[k].lanes.length >= 2) return CAUSES[k];
+  return null;
 }
 
 function noteRound(lane, entry) {
@@ -703,28 +838,45 @@ function resumeItem(lane, writer, label, task) {
 }
 
 function afterWrite(lane, writer, round) {
+  noteDiscoveries(lane, writer);
   // The worker found it cannot get past something inside its files: the lead decides (with a person), no review round.
   if (blockedReport(writer)) {
+    var benv = envFailure(writer.output);
+    if (benv) lane.envProblem = benv;
     noteRound(lane, { round: round, blocked: clip(forLead(writer.output), 300) });
     return finish(lane, writer, { summary: "Worker blocked: " + clip(forLead(writer.output), 700), findings: [] }, round, "needs-human");
   }
   if (writer.ok) return review(lane, writer, round);
-  var sig = failSig(writer.error || writer.output);
+  var sig = failSig(writer.checkBody || writer.error || writer.output);
   var same = lane.lastGateSig === sig;
   lane.lastGateSig = sig;
-  var entry = { round: round, gate: clip(writer.error || writer.output, 300) };
+  var entry = { round: round, gate: clip(writer.checkOutput || writer.error || writer.output, 300) };
   if (same) entry.same = true;
+  var env = envFailure(failText(writer));
+  if (env) entry.env = env.kind;
   noteRound(lane, entry);
-  if (missingNamedFile(lane, (writer.error || "") + "\n" + (writer.output || ""))) lane.fullGate = true;
-  if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, null, round, "failed");
+  if (missingNamedFile(lane, failText(writer) + "\n" + (writer.output || ""))) lane.fullGate = true;
+  var cause = noteCause(lane, writer, env);
+  var others = cause ? cause.lanes.filter(function (k) { return k !== lane.key; }) : [];
+  if (others.length) {
+    lane.sameCause = others;
+    if (env) lane.envProblem = env;
+    return finish(lane, writer, { summary: "Stopped: the same failure as lane " + others.join(", ") + " (" + cause.text + "). It is one problem for the lead to fix once; no more rounds for it here.", findings: [] }, round, "needs-human");
+  }
+  // The same certain environment problem twice: no change inside the lane's files fixes it, so the lead gets it now.
+  if (env && env.certain && same) {
+    lane.envProblem = env;
+    return finish(lane, writer, { summary: "Stopped: the same environment problem twice (" + env.kind + ": " + env.line + "). " + env.check + ".", findings: [] }, round, "needs-human");
+  }
+  if (round >= PLAN.maxRounds || !writer.runId) { if (env) lane.envProblem = env; return finish(lane, writer, null, round, "failed"); }
   var key = lane.key + "-gatefix-" + round;
-  return settle(key, runs.run(key, resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer, same))))
+  return runChild(key, (resumeItem(lane, writer, "Fix checks: " + lane.key, gateFixTask(lane, writer, same, env))))
     .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
 }
 
 function review(lane, writer, round) {
   var key = lane.key + "-verify-" + round;
-  return settle(key, runs.run(key, withModel({ agent: PLAN.verifierAgent, label: "Verify " + lane.key + " #" + round, task: verifyTask(lane, writer, round), outputSchema: VERDICT_SCHEMA }, "verifier")))
+  return runChild(key, (withModel({ agent: PLAN.verifierAgent, label: "Verify " + lane.key + " #" + round, task: verifyTask(lane, writer, round), outputSchema: VERDICT_SCHEMA }, "verifier")))
     .then(function (v) {
       if (!v.ok && !v.structuredOutput) return finish(lane, writer, { summary: "Verifier failed: " + v.error, findings: [] }, round, "needs-human");
       var out = v.structuredOutput || {};
@@ -743,7 +895,7 @@ function review(lane, writer, round) {
       noteRound(lane, entry);
       if (round >= PLAN.maxRounds || !writer.runId) return finish(lane, writer, out, round, "needs-human");
       var fixKey = lane.key + "-fix-" + round;
-      return settle(fixKey, runs.run(fixKey, resumeItem(lane, writer, "Rework " + lane.key + " #" + round, fixTask(lane, { findings: important, summary: out.summary }, round, same))))
+      return runChild(fixKey, (resumeItem(lane, writer, "Rework " + lane.key + " #" + round, fixTask(lane, { findings: important, summary: out.summary }, round, same))))
         .then(function (next) { if (!next.runId) next.runId = writer.runId; return afterWrite(lane, next, round + 1); });
     });
 }
@@ -752,18 +904,31 @@ function startLane(lane) {
   var item = withModel({ agent: PLAN.workerAgent, label: "Implement " + lane.key, task: workTask(lane), worktree: true }, "worker");
   if (lane.baseRef) item.baseRef = lane.baseRef;
   var gate = laneGate(lane);
-  if (gate) item.gate = gate;
+  // the explicit form of the gate shorthand (verified, one check), which also takes the lane's env
+  if (gate) item.acceptance = { level: "verified", verify: [gateCheck(gate)] };
   var key = lane.key + "-work";
-  return settle(key, runs.run(key, item)).then(function (w) {
+  return runChild(key, item).then(function (w) {
     lane.origin = runDir(w);
     return afterWrite(lane, w, 1);
   });
 }
 
+// The full gate once on the unchanged code, at the same time as planning: when it already fails there, every lane
+// would hit the same failure (or "fix" it in its own way), so no worker starts and the lead gets the output.
+var INT = PLAN.integration || null;
+function baselineCheck() {
+  var dir = PLAN.baselineDir || (INT && INT.dir);
+  if (!PLAN.baseline || !GATE || !dir) return Promise.resolve(null);
+  var item = withModel({ agent: PLAN.mergerAgent || "team-merger", label: "Baseline: gate on the unchanged code", task: "Baseline check before the team run: do nothing, answer with the acceptance report.",
+    acceptance: { level: "verified", criteria: [], evidence: ["manual-notes"], verify: [{ id: "baseline", command: GATE.command, timeoutMs: GATE.timeoutMs }] } }, "worker");
+  item.cwd = dir;
+  return runChild("baseline", item).then(function (b) { return b.ok ? null : { error: clip(failText(b), 3000) }; });
+}
+var baselineRun = baselineCheck();
 var lanes = PLAN.lanes;
 var planned = null;
 if (!lanes.length) {
-  var p = await settle("plan", runs.run("plan", withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
+  var p = await runChild("plan", (withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
   var out = p.structuredOutput || {};
   var tasks = cleanTasks(out.tasks);
   PLAN.constraints = (PLAN.constraints || []).concat(strings(out.constraints, 10));
@@ -777,7 +942,7 @@ if (!lanes.length) {
   // The same checks team_run makes on the lead's tasks: one round to fix them, then the plan goes ahead as it is.
   var issues = tasks.length ? planProblems(tasks) : [];
   if (issues.length) {
-    var p2 = await settle("plan-fix", runs.run("plan-fix", withModel({ agent: PLAN.plannerAgent, label: "Fix the plan", task: planTask() +
+    var p2 = await runChild("plan-fix", (withModel({ agent: PLAN.plannerAgent, label: "Fix the plan", task: planTask() +
       "\n\nYour previous plan:\n" + clip(JSON.stringify(out), 12000) + "\n\nFix these problems and return the whole plan again:\n- " + issues.join("\n- "), outputSchema: PLAN_SCHEMA }, "planner")));
     var fixed = p2.structuredOutput && cleanTasks(p2.structuredOutput.tasks);
     if (fixed && fixed.length && fixed.length <= PLAN.maxTasks) { out = p2.structuredOutput; tasks = fixed; issues = planProblems(tasks); strings(out.constraints, 10).forEach(function (c) { if (PLAN.constraints.indexOf(c) < 0) PLAN.constraints.push(c); }); }
@@ -787,17 +952,36 @@ if (!lanes.length) {
   if (issues.length) planned.unfixed = issues;
 }
 
+var baseline = await baselineRun;
+var benv = baseline ? envFailure(baseline.error) : null;
+// The lead may say the run is there to fix what the gate already fails on; an environment problem is never that.
+if (baseline && PLAN.baseline === "env" && !(benv && benv.certain)) { PLAN.knownFailure = baseline.error; baseline = null; }
+if (baseline) {
+  return {
+    goal: PLAN.goal, gate: PLAN.gate || null, state: "baseline-failed", plan: planned, lanes: [],
+    baseline: { error: baseline.error, envProblem: benv },
+    integration: INT ? { branch: INT.branch, dir: INT.dir, merged: [], runDirs: [] } : null,
+    next: "The gate " + JSON.stringify(PLAN.gate) + " already fails on the unchanged code (HEAD), before any change, so no worker was started: every lane would hit the same failure. " +
+      (benv ? "It looks like an environment problem (" + benv.kind + "): " + benv.check + ". Fix the environment (or tell the user what is missing), then run again; baseline: false does not cover an environment problem. " : "Fix that first (or ask the user), then run again. If the goal is to fix exactly these failures, run again with baseline: false.")
+  };
+}
+
 // A lane starts when the lanes it needs are merged (from the integration branch, so it sees their change); a lane
 // that passes is merged at once, one at a time, with the full gate run on the combined code before the commit.
-var INT = PLAN.integration || null;
 var byKey = {}, outcome = {}, mergeOrder = [], mergeTail = Promise.resolve();
-lanes.forEach(function (l) { byKey[l.key] = l; });
+lanes.forEach(function (l, i) { byKey[l.key] = l; l.index = i; });
 function laneOutcome(key) {
   if (!outcome[key]) {
     var lane = byKey[key];
     outcome[key] = Promise.all((lane.after || []).filter(function (k) { return byKey[k]; }).map(laneOutcome)).then(function (deps) {
       var missing = deps.filter(function (d) { return !d.merged; }).map(function (d) { return d.lane; });
       if (missing.length) return skipped(lane, missing);
+      var blocked = envBlock();
+      if (blocked) {
+        var r = finish(lane, null, { summary: "Not started: the environment problem " + blocked.text + " already stopped lanes " + blocked.lanes.join(", ") + ". Fix it, then run this lane again.", findings: [] }, 0, "skipped");
+        r.blockedBy = blocked.text;
+        return r;
+      }
       if (INT && deps.length) lane.baseRef = "refs/heads/" + INT.branch;
       return startLane(lane).then(function (r) { return INT && r.state === "passed" ? queueMerge(lane, r) : r; });
     });
@@ -825,15 +1009,18 @@ function mergeLane(lane, r) {
   // The merge, the full gate and the commit are one host-run check of this child; it only answers with its report.
   var item = withModel({ agent: PLAN.mergerAgent || "team-merger", label: "Merge " + lane.key, task: "Merge step for lane " + lane.key + ": do nothing, answer with the acceptance report.", cwd: INT.dir,
     acceptance: { level: "verified", criteria: [], evidence: ["manual-notes"], verify: [{ id: "merge", command: command, timeoutMs: (GATE ? GATE.timeoutMs : 0) + 300000 }] } }, "worker");
-  return settle(key, runs.run(key, item)).then(function (m) {
+  return runChild(key, item).then(function (m) {
     r.merged = Boolean(m.ok);
     if (m.ok) mergeOrder.push(lane.key);
-    else r.mergeError = clip(m.error || m.output, 1500);
+    else r.mergeError = clip(failText(m), 1500);
     return r;
   });
 }
 
 const results = await Promise.all(lanes.map(function (l) { return laneOutcome(l.key); }));
+var DISCOVERY_NEXT = results.some(function (r) { return r.discoveries && r.discoveries.length; })
+  ? " Lanes list discoveries (what workers found beyond their task): check each against the code, save the lasting ones (environment facts, pitfalls) with remember, and act on root causes that touch other work."
+  : "";
 var mergedDirs = mergeOrder.map(function (k) { return results.filter(function (r) { return r.lane === k; })[0].runDir; });
 return {
   goal: PLAN.goal,
@@ -841,10 +1028,11 @@ return {
   plan: planned,
   lanes: results,
   integration: INT ? { branch: INT.branch, dir: INT.dir, merged: mergeOrder, runDirs: mergedDirs } : null,
+  causes: Object.keys(CAUSES).filter(function (k) { return CAUSES[k].lanes.length >= 2; }).map(function (k) { return { cause: CAUSES[k].text, env: CAUSES[k].env, lanes: CAUSES[k].lanes }; }),
   next: INT
     ? "Passed lanes were merged one at a time into branch " + INT.branch + " (worktree " + INT.dir + "), with the full gate run on the combined code before each commit. " +
-      "Call team_integrate with runDirs = integration.runDirs, in that order. Lanes not merged (mergeError, skipped, needs-human, failed) need your decision."
-    : "Call team_integrate with runDirs = the runDir of each passed lane, in this order. Lanes marked needs-human or failed need your decision."
+      "Call team_integrate with runDirs = integration.runDirs, in that order. Lanes not merged (mergeError, skipped, needs-human, failed) need your decision." + DISCOVERY_NEXT
+    : "Call team_integrate with runDirs = the runDir of each passed lane, in this order. Lanes marked needs-human or failed need your decision." + DISCOVERY_NEXT
 };
 `;
 

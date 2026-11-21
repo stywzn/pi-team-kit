@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildTeamScript, planLanes, type TeamPlan, type TeamTask } from "../lib/team.ts";
+import { withAll } from "./fakeruns.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const script = join(here, "..", "bin", "merge-lane.mjs");
@@ -115,7 +116,7 @@ async function run(plan: Partial<TeamPlan>, respond: (key: string) => Record<str
     },
     status: async (key: string) => ({ runId: `run-${byKey.get(key)}`, artifactPaths: [], output: "" }),
   };
-  const result = await new AsyncFunction("runs", buildTeamScript(full))(runs);
+  const result = await new AsyncFunction("runs", buildTeamScript(full))(withAll(runs));
   return { result, calls, order };
 }
 

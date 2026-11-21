@@ -31,6 +31,9 @@ export interface PtkConfig {
     sudoNonInteractive: boolean;
     /** Keep only the summary of a passing test run's output: the full log would ride along in every later turn. */
     trimPassingTests: boolean;
+    /** Refuse a whole-file write of an existing file this session has not read, or that changed on disk since it last
+     *  read or wrote it (another session, a worker, a script): the write would throw those changes away. */
+    staleWrites: boolean;
   };
   facts: {
     enabled: boolean;
@@ -110,6 +113,28 @@ export interface PtkConfig {
      *  with the full gate run on the combined code before the commit; a task that depends on another starts from that
      *  branch once the other is merged. false: lanes are only reviewed, and dependent tasks share a lane. */
     mergeQueue: boolean;
+    /** Before any worker starts, run the full gate once on the unchanged code (HEAD). When it already fails there,
+     *  no worker starts and the lead gets the output: every lane would hit the same failure. team_run's `baseline:
+     *  false` skips it for a run whose job is to fix exactly those failures. */
+    baseline: boolean;
+    /** Shell commands that must pass before a team run starts, checked on the host before the confirmation: the
+     *  services and tools the tests need (e.g. "pg_isready -h localhost", "docker compose ps --status running db"). */
+    preflight: string[];
+    /** While its team run is going, the lead does not change that checkout: workers that start later branch from it
+     *  and the result is applied onto it. Other leads are held off it by a lease (leads.leases). */
+    leadLock: boolean;
+    /** The lead's own code changes must be checked: before a turn ends with changed code files and no check run since,
+     *  it gets one message to run the narrowest check; past `reviewAfter` changed code files in one request it is also
+     *  asked for a fresh-context review (agent team-reviewer). 0 = never ask for the review. */
+    selfCheck: { enabled: boolean; reviewAfter: number };
+    /** Each lane's own resources, set in its worker's environment and its gate's: PTK_LANE, PTK_LANE_INDEX, ports
+     *  PTK_PORT_BASE..+PTK_PORT_SPAN-1 (portBase + index * portSpan) and PTK_DB_SUFFIX, so lanes running at the same
+     *  time never fight over one port or one test database. The project's tests and servers read them where they
+     *  choose a port or a database name. */
+    laneEnv: { enabled: boolean; portBase: number; portSpan: number };
+    /** A worker may tell the other lanes of its run once, mid-run, about something they need now (an environment fact,
+     *  an interface they call): tell_lanes. Shown to them with their next tool result. */
+    broadcast: boolean;
     plannerAgent: string;
     workerAgent: string;
     verifierAgent: string;
@@ -136,6 +161,9 @@ export interface PtkConfig {
     wake: boolean;
     /** This lead's name on the board; "" = the repository (or folder) name. */
     name: string;
+    /** File leases: a lead claims files (leads claim) and another lead's edit/write of them is refused until released
+     *  or expired; a team run claims its lanes' files and its checkout for the lead that started it. */
+    leases: boolean;
   };
   /** Playbooks: short lessons for a kind of task, saved by /harvest and loaded as skills (lib/playbook.ts). */
   playbooks: {
@@ -161,6 +189,7 @@ export const DEFAULTS: PtkConfig = {
     preferFastSearch: "block",
     sudoNonInteractive: true,
     trimPassingTests: true,
+    staleWrites: true,
   },
   // Checks run in the background at session start, so a few seconds cost nothing; too short a limit only produces "unknown".
   facts: { enabled: true, checkTimeoutMs: 5000, maxFacts: 40 },
@@ -191,6 +220,12 @@ export const DEFAULTS: PtkConfig = {
     nested: { enabled: true, max: 3 },
     watch: { enabled: true, nudgeAfter: 12, blockAfter: 25, stallMin: 20 },
     mergeQueue: true,
+    baseline: true,
+    preflight: [],
+    leadLock: true,
+    selfCheck: { enabled: true, reviewAfter: 3 },
+    laneEnv: { enabled: true, portBase: 20000, portSpan: 100 },
+    broadcast: true,
     plannerAgent: "team-planner",
     workerAgent: "team-worker",
     verifierAgent: "team-verifier",
@@ -200,7 +235,7 @@ export const DEFAULTS: PtkConfig = {
     laneTests: true,
     linkIntoWorktrees: [".venv", "venv", ".env", ".env.local", "node_modules"],
   },
-  leads: { enabled: true, wake: true, name: "" },
+  leads: { enabled: true, wake: true, name: "", leases: true },
   playbooks: { dir: "", dirs: [], confirm: true },
 };
 
@@ -340,6 +375,17 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env, in
   config.team.watch.nudgeAfter = clamp(Math.round(Number(config.team.watch.nudgeAfter) || 0), 3, 200);
   config.team.watch.blockAfter = clamp(Math.round(Number(config.team.watch.blockAfter) || 0), config.team.watch.nudgeAfter + 1, 400);
   config.team.watch.stallMin = clamp(Math.round(Number(config.team.watch.stallMin) || 0), 5, 240);
+  config.team.baseline = config.team.baseline !== false;
+  config.team.leadLock = config.team.leadLock !== false;
+  config.team.preflight = config.team.preflight.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim()).slice(0, 10);
+  config.team.selfCheck.enabled = config.team.selfCheck.enabled !== false;
+  config.team.laneEnv.enabled = config.team.laneEnv.enabled !== false;
+  config.team.laneEnv.portSpan = clamp(Math.round(Number(config.team.laneEnv.portSpan) || 0), 10, 1000);
+  config.team.laneEnv.portBase = clamp(Math.round(Number(config.team.laneEnv.portBase) || 0), 1024, 65535 - 8 * config.team.laneEnv.portSpan);
+  config.team.broadcast = config.team.broadcast !== false;
+  config.team.selfCheck.reviewAfter = clamp(Math.round(Number(config.team.selfCheck.reviewAfter) || 0), 0, 1000);
+  config.guard.staleWrites = config.guard.staleWrites !== false;
+  config.leads.leases = config.leads.leases !== false;
   return { config, files, warnings };
 }
 

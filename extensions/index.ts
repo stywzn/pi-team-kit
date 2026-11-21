@@ -22,9 +22,9 @@ import { formatEvidence, gitEvidence, leadEvidence, readRunValue, recentSessions
 import { formatFriction, frictionFromFiles, runLanes, runPhases, sessionFiles } from "../lib/feedback.ts";
 import { activateVenv, describePrep, isWorkerWorktree, mainCheckout, preferWorktreeCode, prepareWorktree } from "../lib/worktree.ts";
 import { digestBlock, findDigest, listDigests, saveDigest } from "../lib/digest.ts";
-import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
+import { formatRunReport, lanesNotPassed, noticeRuns, parseNumstat, runFacts, teamNotes, type Changed, type NoticeRun, type ReportItem } from "../lib/runreport.ts";
 import { SoloWork } from "../lib/solo.ts";
-import { ownedFiles, WorkerWatch } from "../lib/progress.ts";
+import { isReadOnlyCommand, ownedFiles, WorkerWatch } from "../lib/progress.ts";
 import { checkedKind, PY_CHECK, restoredNote, syntaxError } from "../lib/filecheck.ts";
 import { approvePartCall, partTask, validateParts, type Part } from "../lib/nested.ts";
 import { fileUrl, linkFilePaths, piWebUrl } from "../lib/link.ts";
@@ -53,6 +53,9 @@ import {
   formatBoard,
   formatIncoming,
   formatLog,
+  formatReceipts,
+  markDelivered,
+  sentReceipts,
   MAX_STATUS,
   MAX_WAKE_HOPS,
   OVERLAP_MS,
@@ -81,8 +84,15 @@ import { classifyCommand, commandTimeoutSec, sleepSeconds, gatePreflight, inspec
 import { PLAIN_TALK_RULES, unexplainedAcronyms } from "../lib/plain.ts";
 import { buildTeamScript, cleanupTargets, integrationGate, parseWorktreeList, patchesFromHandoff, pathKey, patternsOverlap, planLanes, planWorktreeCleanup, resolveTeamRepo, roleModels, splitStatus, stashCommand, taskProblems, taskWarnings, THINKING_LEVELS, validateTasks, worktreeFromHandoff, type TeamTask } from "../lib/team.ts";
 import { addTool, discoverTools, formatToolList, toolArgv, type ToolEntry } from "../lib/toolbox.ts";
-import { buildNotification, compactThreshold, detectRole, sessionNameFrom, SUBWORKER_MARKER, terminalTitle, type SessionRole } from "../lib/session.ts";
-import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState } from "../lib/lead.ts";
+import { buildNotification, compactThreshold, detectRole, REVIEWER_MARKER, sessionNameFrom, SUBWORKER_MARKER, terminalTitle, type SessionRole } from "../lib/session.ts";
+import { ageText, continuationMessage, findRunId, leadStatePath, readLeadState, updateLeadState, writeLeadState, type TakeoverFacts } from "../lib/lead.ts";
+import { checkoutKey, claimConflicts, DEFAULT_LEASE_MIN, formatLease, leaseBlockReason, leaseConflict, leaseDir, MAX_LEASE_MIN, newLease, readLeases, removeLeases, writeLease, type Lease } from "../lib/leases.ts";
+import { SeenFiles } from "../lib/stale.ts";
+import { addTask, finishTask, formatTasks, pruneTasks, readTasks, readyMessage, taskState } from "../lib/xtasks.ts";
+import { appendBroadcast, BROADCAST_LIMITS, broadcastNote, newBroadcasts, readBroadcasts } from "../lib/broadcast.ts";
+import { addEntry, dropEntry, formatLedger, ledgerBlock, ledgerDir, readLedger, type LedgerKind } from "../lib/ledger.ts";
+import { envFailure, envFailureNote } from "../lib/envfail.ts";
+import { DEFAULT_SELF_CHECK, LeadSelfCheck, reviewerMayRun } from "../lib/selfcheck.ts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** customType of messages from other leads, so a run they start can be told apart from one a person started. */
@@ -343,9 +353,29 @@ export default function piTeamKit(pi: ExtensionAPI) {
         "Once the user has confirmed, work to the end without asking again: the user may be away. Take the conservative option on minor decisions and list them in your final report. " +
         "Stop and ask only before something destructive or irreversible (deleting data, force-pushing, touching production, spending money). " +
         "When a playbook skill (lessons from earlier projects of the same kind) matches the task, read it first: ask its Ask-first items while clarifying, follow its Steps, take its Done-when into doneWhen, and pass playbook=<name> to team_run.";
+    if (role === "lead") {
+      // The ledger stays in front of the lead every turn, also after compaction and in a new session.
+      const repoNow = workRepo(state.cwd);
+      const entries = repoNow ? readLedger(ledgerFor(repoNow)) : [];
+      if (entries.length) sections["decisions"] = `The decision ledger of ${repoNow} (ledger tool; every worker and verifier of a team run gets it too):\n${ledgerBlock(entries)}`;
+    }
     if (role === "lead" && lb.name) {
       const peers = peersSection(liveCards(), lb.name, Date.now(), homedir());
-      if (peers) sections["leads"] = peers;
+      const held = liveLeases().filter((l) => l.owner !== lb.owner);
+      if (peers)
+        sections["leads"] =
+          peers +
+          (state.config.leads.leases ? " Before changing files another lead may also be changing, claim them with leads claim; release them when done." : "") +
+          (held.length ? `\nFiles other leads claimed (your edits of them are refused until released):\n${held.slice(0, 10).map((l) => `- ${formatLease(l)}`).join("\n")}` : "");
+      // This lead's tasks on the board and what they wait for (leads task / done), so a waiting one is not forgotten.
+      try {
+        const all = readTasks(lb.dir);
+        const mine = all.filter((t) => t.lead === lb.name && t.state === "open");
+        if (mine.length)
+          sections["lead-tasks"] = `Your tasks on the lead board (mark each done with leads done when it is; leads waiting for it are told):\n${mine.map((t) => `- [${t.id}] ${t.title} - ${taskState(t, all)}`).join("\n")}`;
+      } catch {
+        /* the board is a convenience */
+      }
     }
     if (c.plainTalk.enabled) {
       const reminder = state.lastUnexplained.length
@@ -444,6 +474,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const extra = [...(info?.notes ?? [])];
     if (event.isError && looksLikeTimeout(body))
       extra.push(`Stopped after ${info?.timeout ?? "?"}s by the ptk guard. If it is a server or watcher, use toolbox bg. If it is real work, rerun with a larger timeout (max ${state.config.guard.maxTimeoutSec}s) or narrow it (one test file, one package).`);
+    // A port taken, a service down, a tool missing: not fixed by changing code (lib/envfail.ts).
+    const env = event.isError ? envFailure(body) : undefined;
+    if (env) extra.push(envFailureNote(env, role));
     // A passing test run's whole log would ride along in every later turn: keep its summary only.
     const trimmed = state.config.guard.trimPassingTests ? trimPassingTest(String((event.input as { command?: unknown }).command ?? ""), body, event.isError) : undefined;
     if (!extra.length && !trimmed) return;
@@ -541,17 +574,28 @@ export default function piTeamKit(pi: ExtensionAPI) {
       return undefined;
     }
   };
-  const reportRun = async (run: NoticeRun): Promise<ReportItem[]> => {
+  const reportRun = async (run: NoticeRun, notes: string[]): Promise<ReportItem[] | undefined> => {
     if (!run.asyncDir) return [];
     let status: unknown;
     try {
       status = JSON.parse(readFileSync(join(run.asyncDir, "status.json"), "utf8"));
     } catch {
-      return [];
+      return undefined; // not readable yet: tried again at the next turn
     }
     if (run.agent === "workflow") {
+      const value = (status as { workflow?: { value?: unknown } }).workflow?.value;
+      const cwd = runFacts(status).cwd;
+      const root = (cwd && findRepoRoot(cwd)) || lastTeamRepo;
+      // Only the notice of this lead's own team run ends it: another workflow finishing (or a paused one) must not
+      // release the checkout or remove a merge-queue worktree that is still in use.
+      const lf = root ? leadFile(root) : undefined;
+      const open = lf ? [...(readLeadState(lf.file)?.runs ?? [])].reverse().find((r) => r.status === "running") : undefined;
+      const teamShaped = Array.isArray((value as { lanes?: unknown } | undefined)?.lanes);
+      if (open && teamShaped && run.status !== "paused" && (!open.runId || open.runId === run.runId)) await teamRunFinished(root, value);
+      const note = teamNotes(value);
+      if (note) notes.push(note);
       const items: ReportItem[] = [];
-      for (const lane of lanesNotPassed((status as { workflow?: { value?: unknown } }).workflow?.value)) {
+      for (const lane of lanesNotPassed(value)) {
         const wt = laneWorktree(lane.runDir);
         const changed = (wt && (await changesIn(wt))) || [];
         const outside = lane.files.length ? changed.map((c) => c.path).filter((p) => !lane.files.some((f) => f === "**" || patternsOverlap(f, p))) : [];
@@ -579,25 +623,46 @@ export default function piTeamKit(pi: ExtensionAPI) {
       },
     ];
   };
+  /** The report on finished runs not reported yet (and the run's cleanup when nothing is left to integrate), or undefined. */
+  const pendingRunReport = async (ctx: ExtensionContext, started?: unknown): Promise<string | undefined> => {
+    const runs: NoticeRun[] = [];
+    const ev = started as { messageType?: string; message?: { customType?: string; details?: unknown } } | undefined;
+    if (ev?.messageType === "custom" && ev.message?.customType === "subagent-notify") runs.push(...noticeRuns(ev.message.details));
+    // A notice that arrived during a turn joined that turn (the lead waited for it with bg_wait): it is in the session.
+    for (const e of ctx.sessionManager.getEntries().slice(-40) as Array<{ type?: string; customType?: string; details?: unknown; timestamp?: string }>)
+      if (e.type === "custom_message" && e.customType === "subagent-notify" && Date.parse(e.timestamp ?? "") >= openedAt) runs.push(...noticeRuns(e.details));
+    const items: ReportItem[] = [];
+    const notes: string[] = [];
+    for (const run of runs) {
+      // A paused run is not over: its later completion (same run id) is the one to report.
+      if (run.status === "paused" || reportedRuns.has(run.runId)) continue;
+      reportedRuns.add(run.runId);
+      const got = await reportRun(run, notes);
+      if (got === undefined) reportedRuns.delete(run.runId);
+      else items.push(...got);
+    }
+    if (!items.length && !notes.length) return undefined;
+    return [...(items.length ? [formatRunReport(items)] : []), ...notes].join("\n\n");
+  };
   pi.on("before_agent_start", async (event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD) return;
     try {
-      const runs: NoticeRun[] = [];
-      const ev = event as { messageType?: string; message?: { customType?: string; details?: unknown } };
-      if (ev.messageType === "custom" && ev.message?.customType === "subagent-notify") runs.push(...noticeRuns(ev.message.details));
-      // A notice that arrived during a turn joined that turn; it is picked up from the session at the next one.
-      for (const e of ctx.sessionManager.getEntries().slice(-40) as Array<{ type?: string; customType?: string; details?: unknown; timestamp?: string }>)
-        if (e.type === "custom_message" && e.customType === "subagent-notify" && Date.parse(e.timestamp ?? "") >= openedAt) runs.push(...noticeRuns(e.details));
-      const items: ReportItem[] = [];
-      for (const run of runs) {
-        if (reportedRuns.has(run.runId)) continue;
-        reportedRuns.add(run.runId);
-        items.push(...(await reportRun(run)));
-      }
-      if (!items.length) return;
-      return { message: { customType: "ptk-run-report", content: formatRunReport(items), display: true } };
+      const content = await pendingRunReport(ctx, event);
+      return content ? { message: { customType: "ptk-run-report", content, display: true } } : undefined;
     } catch {
       return; // a report is a convenience; never block the turn
+    }
+  });
+  // The same before the lead's turn ends: a run it waited for inside the turn is reported (and cleaned up) now, and
+  // the lead continues once with it, instead of finishing on what the bare notice said.
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD || event.outcome !== "completed") return;
+    try {
+      const content = await pendingRunReport(ctx);
+      if (!content) return;
+      return { entries: [...event.entries, { type: "custom_message" as const, customType: "ptk-run-report", content, display: true }], continue: true };
+    } catch {
+      return;
     }
   });
 
@@ -649,6 +714,155 @@ export default function piTeamKit(pi: ExtensionAPI) {
       isError: true,
       structuredContent: event.structuredContent,
     };
+  });
+
+  // ---------- a whole-file write never throws away changes this session has not seen (lib/stale.ts) ----------
+  const seenFiles = new SeenFiles();
+  const toolPath = (cwd: string, p: unknown) => (typeof p === "string" && p.trim() ? resolve(cwd, p.trim().replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir())) : undefined);
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "write" || !state.config.guard.staleWrites) return;
+    const file = toolPath(ctx.cwd, (event.input as { path?: unknown }).path);
+    if (!file) return;
+    const why = seenFiles.writeProblem(file, relative(ctx.cwd, file) || file);
+    if (why) return { block: true, reason: `[ptk] ${why}` };
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.isError || (event.toolName !== "read" && event.toolName !== "write" && event.toolName !== "edit")) return;
+    const file = toolPath(ctx.cwd, (event.input as { path?: unknown }).path);
+    if (file) seenFiles.saw(file);
+  });
+
+  // ---------- the fresh-context reviewer reads, it does not change anything (agents/team-reviewer.md) ----------
+  let reviewer = false;
+  pi.on("before_agent_start", async (event) => {
+    reviewer = Boolean(process.env.PI_SUBAGENT_CHILD) && (event.systemPrompt ?? "").includes(REVIEWER_MARKER);
+  });
+  pi.on("tool_call", async (event) => {
+    if (!reviewer) return;
+    if (event.toolName === "edit" || event.toolName === "write") return { block: true, reason: "[ptk] A reviewer changes nothing: report the finding with path:line and the smallest fix." };
+    if (event.toolName !== "bash") return;
+    const command = String((event.input as { command?: unknown }).command ?? "");
+    if (!reviewerMayRun(command))
+      return { block: true, reason: "[ptk] A reviewer only reads (git diff, git status, cat, rg) and may run the project's tests or linters (not formatters, not --fix); this command could change files." };
+  });
+
+  // ---------- the lead checks its own code changes (lib/selfcheck.ts) ----------
+  // Changed code and no check since: one message before the turn ends to run the narrowest check; a bigger change
+  // (more than team.selfCheck.reviewAfter code files in one request) also gets a fresh-context review.
+  const selfCheck = new LeadSelfCheck(DEFAULT_SELF_CHECK);
+  pi.on("input", async (event) => {
+    if (event.source !== "extension") selfCheck.userInput();
+  });
+  pi.on("tool_call", async (event) => {
+    if (process.env.PI_SUBAGENT_CHILD || event.toolName !== "subagent") return;
+    const input = event.input as { agent?: unknown; tasks?: Array<{ agent?: unknown }> };
+    if (input.agent === "team-reviewer" || input.tasks?.some?.((t) => t?.agent === "team-reviewer")) selfCheck.reviewStarted();
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD || role !== "lead") return;
+    const input = event.input as { path?: unknown; command?: unknown };
+    if ((event.toolName === "edit" || event.toolName === "write") && !event.isError) {
+      const file = toolPath(ctx.cwd, input.path);
+      if (file) selfCheck.edited(relative(ctx.cwd, file) || file, findRepoRoot(dirname(file)));
+    } else if ((event.toolName === "bash" || event.toolName === "powershell") && typeof input.command === "string") selfCheck.ran(input.command, Boolean(event.isError));
+    else if ((event.toolName === "team_run" || event.toolName === "team_integrate") && !event.isError) selfCheck.delegated();
+  });
+  pi.on("agent_before_settle", async (event) => {
+    if (process.env.PI_SUBAGENT_CHILD || role !== "lead" || event.outcome !== "completed" || compacting) return;
+    selfCheck.opts = state.config.team.selfCheck;
+    const repoNow = workRepo(state.cwd);
+    const testCmd = repoNow ? envFor(repoNow)?.testCommand : undefined;
+    const message = selfCheck.beforeEnd(
+      state.lastUserText,
+      testCmd ? `The test command detected here: \`${testCmd}\`.` : repoNow ? "No test command was detected in this repository: if nothing can check this change, say so in one line instead of searching for one." : "",
+    );
+    if (!message) return;
+    return { entries: [...event.entries, { type: "custom_message" as const, customType: "ptk-self-check", content: message, display: true }], continue: true };
+  });
+  // After every lead turn, code records where the work stands (uncommitted files, the checks that ran and their
+  // results, what changed after the last check), so a takeover (/continue) knows what is verified and what is claimed.
+  pi.on("agent_settled", async () => {
+    if (process.env.PI_SUBAGENT_CHILD || role !== "lead") return;
+    const root = workRepo(state.cwd);
+    if (!root) return;
+    try {
+      const d = await dirtyFiles(root);
+      const uncommitted = [...d.tracked, ...d.untracked].slice(0, 40);
+      const unchecked = selfCheck.uncheckedFiles().slice(0, 40);
+      if (!uncommitted.length && !selfCheck.checks.length && !unchecked.length && !readLeadState(leadStatePath(globalDataDir(), root))) return;
+      saveLead(root, { progress: { at: new Date().toISOString(), uncommitted, checks: selfCheck.checks.slice(-5), unchecked } });
+    } catch {
+      /* a record is a convenience */
+    }
+  });
+
+  // ---------- a team lane's own resources, and what its workers tell each other (lib/team.ts, lib/broadcast.ts) ----------
+  // The worker's task carries "[ptk-lane-env] PTK_LANE=... PTK_PORT_BASE=..." (team.laneEnv): set in this process's
+  // environment before its first command, so its commands and the sub-workers it starts use the lane's own ports and
+  // database suffix. The host sets the same ones in front of the lane's gate.
+  let laneVars = false;
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (laneVars || !process.env.PI_SUBAGENT_CHILD) return;
+    const m = /\[ptk-lane-env\] ([^\n]+)/.exec(`${firstTask(ctx)}\n${(event as { prompt?: string }).prompt ?? ""}`);
+    if (!m) return;
+    laneVars = true;
+    for (const kv of m[1].trim().split(/\s+/)) {
+      const [k, v] = kv.split("=");
+      if (/^PTK_[A-Z_]+$/.test(k ?? "") && /^[\w.-]+$/.test(v ?? "")) process.env[k] = v;
+    }
+  });
+  const broadcastFile = () => {
+    const d = localProjectDataDir(state.cwd);
+    return d ? join(d, "broadcast.jsonl") : undefined;
+  };
+  let toldLanes = false;
+  if (process.env.PI_SUBAGENT_CHILD)
+    pi.registerTool({
+      name: "tell_lanes",
+      label: "Tell the other lanes",
+      description:
+        "Team workers only, and rarely: tell the other lanes of this team run, once, about something they need now - an environment fact (a port that is taken and the one to use, a service that is down) or an interface they call that you changed. One or two sentences. Not for progress, not for questions (ask your lead with contact_supervisor), not for anything only you need.",
+      promptSnippet: "Tell the other lanes of this team run, once, about an environment fact or an interface change they need now",
+      parameters: Type.Object({
+        kind: StringEnum(["environment", "interface"] as const),
+        text: Type.String({ description: "the fact and what to do about it, under 300 characters" }),
+      }),
+      async execute(_id, params) {
+        if (!state.config.team.broadcast) throw new Error("tell_lanes is off here (team.broadcast in ptk.json)");
+        const run = process.env.PTK_RUN;
+        const lane = process.env.PTK_LANE;
+        if (!run || !lane) throw new Error("only a worker inside a team run lane can tell the other lanes");
+        if (toldLanes) throw new Error("you told the other lanes once already; anything else goes in your report (Discoveries) or to your lead (contact_supervisor)");
+        const file = broadcastFile();
+        if (!file) throw new Error("not inside a git repository");
+        appendBroadcast(file, { run, lane, kind: params.kind as "environment" | "interface", text: String(params.text ?? "") });
+        toldLanes = true;
+        return text("Told the other lanes of this run: they see it with their next tool result. Put it under Discoveries in your report too.");
+      },
+    });
+  // What other lanes of this run told: shown with the next tool result, at most a few per worker.
+  const lanesSeen = new Set<string>();
+  let lanesShown = 0;
+  let lanesMtime = 0;
+  pi.on("tool_result", async (event) => {
+    const run = process.env.PTK_RUN;
+    const lane = process.env.PTK_LANE;
+    if (!process.env.PI_SUBAGENT_CHILD || !run || !lane || lanesShown >= BROADCAST_LIMITS.shown || !state.config.team.broadcast) return;
+    const file = broadcastFile();
+    if (!file) return;
+    let mtime = 0;
+    try {
+      mtime = statSync(file).mtimeMs;
+    } catch {
+      return;
+    }
+    if (mtime <= lanesMtime) return;
+    lanesMtime = mtime;
+    const fresh = newBroadcasts(readBroadcasts(file), run, lane, 0, lanesSeen).slice(0, BROADCAST_LIMITS.shown - lanesShown);
+    if (!fresh.length) return;
+    for (const b of fresh) lanesSeen.add(`${b.at}|${b.lane}`);
+    lanesShown += fresh.length;
+    return { content: [...(event.content ?? []), { type: "text" as const, text: `\n[ptk] ${fresh.map(broadcastNote).join("\n[ptk] ")}` }], structuredContent: event.structuredContent };
   });
 
   // ---------- nested workers, two levels at most (lib/nested.ts) ----------
@@ -986,6 +1200,12 @@ export default function piTeamKit(pi: ExtensionAPI) {
     uses: Type.Optional(Type.Array(Type.String(), { description: "Fixtures, helpers or interfaces from other tasks this one builds on" })),
   });
 
+  /** The decision ledger of a repository (lib/ledger.ts). */
+  const ledgerFor = (root: string) => {
+    const common = gitCommonDir(root);
+    return ledgerDir(globalDataDir(), basename(common) === ".git" ? dirname(common) : common);
+  };
+
   const leadFile = (cwd: string) => {
     const root = findRepoRoot(cwd);
     return root ? { root, file: leadStatePath(globalDataDir(), root) } : undefined;
@@ -1135,6 +1355,87 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   };
 
+  // ---------- while its team run is going, the lead leaves that checkout alone (team.leadLock) ----------
+  // Workers that start later (dependent lanes, lanes beyond maxParallel) branch from this checkout, pi-subagents makes
+  // their worktrees only from a clean one, and team_integrate applies the result onto it. Real runs: the lead "helped"
+  // by filling in docs and code the workers were changing, and the two overwrote each other. Other leads are held off
+  // by the run's leases. Released by team_integrate, or when the run ends with nothing to integrate.
+  let runLock: { root: string; until: number } | undefined;
+  const lockedRoot = (abs: string): string | undefined => {
+    if (!runLock) return undefined;
+    if (Date.now() > runLock.until) {
+      runLock = undefined;
+      return undefined;
+    }
+    const k = pathKey(runLock.root);
+    const a = pathKey(abs);
+    return a === k || a.startsWith(`${k}/`) ? runLock.root : undefined;
+  };
+  pi.on("tool_call", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD || !state.config.team.leadLock || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const file = toolPath(ctx.cwd, (event.input as { path?: unknown }).path);
+    const root = file && lockedRoot(file);
+    if (!file || !root) return;
+    const rel = relative(root, file).replace(/\\/g, "/");
+    // A file git ignores (.env, build output) never makes the checkout unclean.
+    if (spawnSync("git", ["-C", root, "check-ignore", "-q", "--", rel], { stdio: "ignore", windowsHide: true, timeout: 10_000 }).status === 0) return;
+    return {
+      block: true,
+      reason:
+        `[ptk] ${rel}: your team run is going in ${root}. Workers that start later branch from this checkout and team_integrate applies the result onto it, so leave it unchanged until team_integrate (or until the run reports that nothing passed). ` +
+        "Meanwhile answer the workers' questions. Write down what you want to change and do it after team_integrate, or hand it to the next team run. If the user insists on it now, tell them it makes lanes that start later fail.",
+    };
+  });
+  pi.on("tool_result", async (event) => {
+    if (process.env.PI_SUBAGENT_CHILD || !state.config.team.leadLock || !runLock || (event.toolName !== "bash" && event.toolName !== "powershell")) return;
+    const command = String((event.input as { command?: unknown }).command ?? "");
+    if (isReadOnlyCommand(command) || Date.now() > runLock.until) return;
+    const root = runLock.root;
+    const d = await dirtyFiles(root).catch(() => undefined);
+    const files = d ? [...d.tracked, ...d.untracked] : [];
+    if (!files.length) return;
+    const note =
+      `[ptk] Your team run is going in ${root}, and its checkout now has changes: ${files.slice(0, 8).join(", ")}${files.length > 8 ? ` and ${files.length - 8} more` : ""}. ` +
+      `Workers that start later cannot branch from a changed checkout, and team_integrate needs it clean. Put it back now: ${stashCommand(files.slice(0, 50), d!.untracked.length > 0)} (git stash pop after team_integrate).`;
+    return { content: [...(event.content ?? []), { type: "text" as const, text: `\n${note}` }], structuredContent: event.structuredContent };
+  });
+  /** The run branch and worktree of the merge queue, removed only when they look exactly like ours. */
+  const removeIntegration = async (root: string, int: { branch: string; dir: string } | undefined): Promise<{ ok?: string; failed?: { path: string; reason: string } }> => {
+    if (!int || !/^ptk\/run-[a-z0-9]+$/.test(int.branch) || !resolve(int.dir).startsWith(join(tmpdir(), "ptk-integration"))) return {};
+    const w = existsSync(int.dir) ? await pi.exec("git", ["worktree", "remove", "--force", int.dir], { cwd: root, timeout: 30_000 }) : { code: 0, stderr: "", stdout: "" };
+    if (w.code !== 0) return { failed: { path: int.dir, reason: `git worktree remove failed: ${(w.stderr || w.stdout).trim().split("\n")[0]}` } };
+    await pi.exec("git", ["branch", "-D", int.branch], { cwd: root, timeout: 30_000 });
+    return { ok: `removed the merge-queue branch ${int.branch}` };
+  };
+  /** The run is back: the lead may change the checkout again and other leads may edit its files. */
+  const releaseRun = (root: string) => {
+    if (runLock && pathKey(runLock.root) === pathKey(root)) runLock = undefined;
+    if (!lb.name) return;
+    try {
+      removeLeases(leaseDir(lb.dir), lb.owner, (l) => l.kind === "team-run" && l.repo === repoKey(root));
+    } catch {
+      /* a lease left behind expires with the run's deadline */
+    }
+  };
+  /**
+   * A team run finished (its completion notice). With nothing to integrate (no lane passed, nothing merged, or the
+   * gate already failed on the unchanged code) nobody will call team_integrate: release the checkout and the leases,
+   * remove the empty run branch, and record the run as ended.
+   */
+  const teamRunFinished = async (root: string | undefined, value: unknown) => {
+    if (!root) return;
+    const v = (value ?? {}) as { lanes?: Array<{ state?: unknown }>; integration?: { merged?: unknown } | null };
+    const passed = Array.isArray(v.lanes) && v.lanes.some((l) => l?.state === "passed");
+    const merged = Array.isArray(v.integration?.merged) && (v.integration!.merged as unknown[]).length > 0;
+    if (v.integration ? merged : passed) return; // team_integrate comes next and releases them
+    releaseRun(root);
+    teamRunUntil = 0;
+    const lf = leadFile(root);
+    const open = lf ? [...(readLeadState(lf.file)?.runs ?? [])].reverse().find((r) => r.status === "running") : undefined;
+    await removeIntegration(root, open?.integration).catch(() => ({}));
+    saveLead(root, { finishRun: { status: "ended", result: "nothing passed to integrate" } });
+  };
+
   pi.registerTool({
     name: "team_run",
     label: "Team run",
@@ -1162,6 +1463,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
       repo: Type.Optional(Type.String({ description: "Path of the project's git repository, when this session was started in another folder" })),
       digests: Type.Optional(Type.Array(Type.String(), { description: "Topics of reader digests (digest tool) to hand to the planner and workers, so they skip reading the same material again" })),
       constraints: Type.Optional(Type.Array(Type.String(), { maxItems: 10, description: "Rules every task follows, given word for word to each worker and verifier (e.g. each test creates its own uniquely named data and cleans up in teardown; no sleeps)" })),
+      baseline: Type.Optional(Type.Boolean({ description: "false only when the goal is to fix failures the gate already has on the unchanged code. The full gate runs once on the unchanged code before any worker starts; a failure there stops the run (every lane would hit it). With false the failures go to the workers as known instead, but an environment problem (a service down, a tool missing) still stops the run: no lane fixes that with code, so fix it or ask the user." })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const root = repoFor(ctx.cwd, params.repo);
@@ -1198,6 +1500,22 @@ export default function piTeamKit(pi: ExtensionAPI) {
         const why = await programProblem(gate, root);
         if (why) throw new Error(`The gate \`${gate}\` cannot run here: ${why}\nPass a working gate (for example with python instead of python3, or py -3) or set team.gate in .pi/ptk.json.`);
       }
+      // The services and tools the tests need, checked now on the host: a missing database fails every lane after an
+      // hour of work, and workers then change code to get around it (team.preflight, e.g. "pg_isready -h localhost").
+      const preflight: string[] = [];
+      for (const cmd of t.preflight) {
+        const r = await runShell(cmd, root, 60, undefined, gateEnv(root));
+        if (r.code === 0) continue;
+        const env = envFailure(r.output);
+        preflight.push(`\`${cmd}\`: ${r.missingShell ? "no bash found" : `exit ${r.code ?? "?"}${r.timedOut ? " (timed out after 60s)" : ""}`}${env ? ` - ${env.kind}: ${env.check}` : ""}\n  ${clip(r.output.trim().split("\n").slice(-5).join("\n  "), 600)}`);
+      }
+      if (preflight.length)
+        throw new Error(`Preflight failed, so no worker was started (every lane would fail on it):\n${preflight.map((p) => `- ${p}`).join("\n")}\nFix the environment (start the service, install the tool) or tell the user what is missing; team.preflight in .pi/ptk.json lists these checks.`);
+      // Saved facts whose own check fails now (checked at session start): workers would be told something false.
+      if (root === state.repo) for (const f of state.facts.filter((x) => x.stale).slice(0, 5)) warnings.push(`saved fact "${f.id}" no longer holds (its check fails): ${f.text}. Fix or forget it (remember kind forget) so workers are not told it.`);
+      // baseline: false is for a run that fixes what the gate already fails on: the baseline still runs, and an
+      // environment problem there still stops the run (no lane fixes a missing service with code).
+      const baseline: "stop" | "env" | undefined = !t.baseline || !gate ? undefined : params.baseline === false ? "env" : "stop";
       const brief = {
         goal: params.goal.trim(),
         doneWhen: params.doneWhen.trim(),
@@ -1210,7 +1528,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
         .join("\n");
       // A playbook is short by construction, so it can travel with the goal to planner, workers and verifier.
       const digestBlock = digestsFor(root, params.digests ?? []);
-      const fullGoal = [briefText, pb ? playbookBrief(readFileSync(join(pb.dir, "SKILL.md"), "utf8"), pb.name).block : "", digestBlock].filter(Boolean).join("\n");
+      // The ledger travels with the goal too: decisions not to reopen, approaches not to retry, rules that hold.
+      const ledger = readLedger(ledgerFor(root));
+      const fullGoal = [briefText, ledgerBlock(ledger), pb ? playbookBrief(readFileSync(join(pb.dir, "SKILL.md"), "utf8"), pb.name).block : "", digestBlock].filter(Boolean).join("\n");
       const models = roleModels(t.models, effectiveThinking(), ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
       const modelText = (["planner", "worker", "verifier"] as const).map((r) => `${r} ${models[r] ?? `default (${AGENT_THINKING[r]})`}`).join(", ");
       if (t.confirm && ctx.hasUI) {
@@ -1218,9 +1538,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
           `Repository: ${root}`,
           ...briefText.split("\n"),
           ...(pb ? [`Playbook: ${pb.name} (${pb.uses} earlier use(s))`] : []),
+          ...(ledger.length ? [`Ledger: ${ledger.length} decision(s), tried approach(es) and rule(s) go to every worker and verifier`] : []),
           ...(params.digests?.length ? [`Reader digests: ${params.digests.join(", ")}`] : []),
           "",
           `Gate: ${gate || "(none: verifier only)"}${gate && t.laneTests ? " (each lane runs only its own test files; the full gate runs after integration)" : ""}`,
+          ...(baseline === "stop" ? ["Baseline: the full gate runs once on the unchanged code first; if it already fails there, no worker starts."] : []),
+          ...(baseline === "env" ? ["Baseline: the full gate runs once on the unchanged code first; the lead says this run fixes what fails there, so only an environment problem stops it."] : []),
+          ...(t.preflight.length ? [`Preflight passed: ${t.preflight.join("; ")}`] : []),
           `Models: ${modelText}`,
           lanes.length ? `Lanes: ${lanes.map((l) => l.key + (l.after?.length ? ` (after ${l.after.join(", ")})` : "")).join(", ")}` : "Tasks: the team-planner splits the goal",
           ...(t.mergeQueue ? ["Merge queue: each lane that passes is merged at once into a run branch, one at a time, with the full gate on the combined code; a lane that needs another starts after it is merged."] : []),
@@ -1232,7 +1556,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
       // The merge queue's branch and worktree, made only now that the run is confirmed. Without it (no worktree
       // support, a failure), lanes are only reviewed as before and dependent tasks share a lane.
-      const integration = t.mergeQueue ? await createIntegration(root) : undefined;
+      // Also made for the baseline alone (merge queue off): the baseline never runs in this checkout, where a gate's
+      // output files (coverage, a test database) would leave it unclean and no worker could branch from it.
+      const integration = t.mergeQueue || baseline ? await createIntegration(root) : undefined;
       if (t.mergeQueue && !integration && tasks.length) lanes = planLanes(tasks, t.maxParallel, true);
       const plan = {
         goal: fullGoal,
@@ -1250,7 +1576,13 @@ export default function piTeamKit(pi: ExtensionAPI) {
         laneTests: t.laneTests,
         maxLanes: t.maxParallel,
         constraints: (params.constraints ?? []).map((c) => c.trim()).filter(Boolean).slice(0, 10),
-        ...(integration ? { integration } : {}),
+        ...(integration && t.mergeQueue ? { integration } : {}),
+        ...(integration ? { baselineDir: integration.dir } : {}),
+        baseline,
+        // each lane's own ports and database suffix, in its worker's environment and its gate's
+        ...(t.laneEnv.enabled ? { laneEnv: { portBase: t.laneEnv.portBase, portSpan: t.laneEnv.portSpan, run: Date.now().toString(36) } } : {}),
+        windows: process.platform === "win32",
+        broadcast: t.broadcast,
       };
       const data = await rpc("spawn", {
         script: buildTeamScript(plan),
@@ -1260,6 +1592,20 @@ export default function piTeamKit(pi: ExtensionAPI) {
       });
       lastTeamRepo = root;
       teamRunUntil = Date.now() + (t.runTimeoutMin + 10) * 60_000;
+      // Until it is integrated: this lead leaves the checkout alone, other leads are held off its files and its checkout.
+      if (t.leadLock) runLock = { root, until: teamRunUntil };
+      if (lb.name && state.config.leads.leases) {
+        try {
+          const dir = leaseDir(lb.dir);
+          const reason = `team run: ${brief.goal.slice(0, 120)}`;
+          const minutes = t.runTimeoutMin + 10;
+          writeLease(dir, newLease({ owner: lb.owner, lead: lb.name, repo: repoKey(root), paths: ["**"], checkout: checkoutKey(root), reason, kind: "team-run" }, minutes, Date.now(), minutes));
+          const owned = [...new Set(lanes.flatMap((l) => l.files))];
+          if (owned.length) writeLease(dir, newLease({ owner: lb.owner, lead: lb.name, repo: repoKey(root), paths: owned, reason, kind: "team-run" }, minutes, Date.now(), minutes));
+        } catch {
+          /* leases are a protection, not a reason to fail a started run */
+        }
+      }
       saveLead(root, { brief, addRun: { startedAt: new Date().toISOString(), status: "running", lanes: lanes.map((l) => l.key), gate, runId: findRunId(data), ...(pb ? { playbook: pb.name } : {}), ...(integration ? { integration: { branch: integration.branch, dir: integration.dir } } : {}) } }, ctx.sessionManager.getSessionFile());
       const elsewhere = root !== findRepoRoot(ctx.cwd) ? `Repository: ${root} (this session runs elsewhere; team_integrate uses it too).\n` : "";
       if (lb.name) setLeadStatus(`team run going: ${brief.goal.slice(0, 140)}`);
@@ -1299,6 +1645,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     async execute(_id, params, signal, _onUpdate, ctx) {
       teamRunUntil = 0; // the run is back; a browser host may close this session when idle again
       const root = repoFor(ctx.cwd, params.repo);
+      releaseRun(root); // the lead may change the checkout again (a conflict below is resolved by hand)
       const dirty = await dirtyFiles(root);
       if (dirty.tracked.length) throw new Error(trackedError(dirty.tracked, "These tracked files have uncommitted changes; the lanes' patches apply onto a clean checkout:"));
       const lines: string[] = [];
@@ -1364,14 +1711,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
           if (wt.branch) await pi.exec("git", ["branch", "-D", wt.branch], { cwd: root, timeout: 30_000 });
         }
         // The merge queue's run branch and worktree: its lanes are in the checkout now.
-        const int = openRun?.integration;
-        if (int && /^ptk\/run-[a-z0-9]+$/.test(int.branch) && resolve(int.dir).startsWith(join(tmpdir(), "ptk-integration"))) {
-          const w = existsSync(int.dir) ? await pi.exec("git", ["worktree", "remove", "--force", int.dir], { cwd: root, timeout: 30_000 }) : { code: 0, stderr: "", stdout: "" };
-          if (w.code === 0) {
-            await pi.exec("git", ["branch", "-D", int.branch], { cwd: root, timeout: 30_000 });
-            lines.push(`removed the merge-queue branch ${int.branch}`);
-          } else failed.push({ path: int.dir, reason: `git worktree remove failed: ${(w.stderr || w.stdout).trim().split("\n")[0]}` });
-        }
+        const intDone = await removeIntegration(root, openRun?.integration);
+        if (intDone.ok) lines.push(intDone.ok);
+        if (intDone.failed) failed.push(intDone.failed);
         await pi.exec("git", ["worktree", "prune"], { cwd: root, timeout: 30_000 });
         if (removed) lines.push(`removed ${removed} worker worktree(s) and their branches`);
         // Say exactly what was left behind and why, so nobody reports "kept them" for a cleanup that failed.
@@ -1565,7 +1907,26 @@ export default function piTeamKit(pi: ExtensionAPI) {
       const s = lf && readLeadState(lf.file);
       if (!s) return ctx.ui.notify(`No earlier lead session recorded for ${lf ? lf.root : `${where} (not a git repository; name the project: /continue <repo path>)`}.`, "info");
       lastTeamRepo = lf.root;
-      const message = continuationMessage(s);
+      // Facts checked now by code, not taken from the record: the tests on the code as it is, and what is uncommitted.
+      const facts: TakeoverFacts = {};
+      const smoke = [...s.runs].reverse().find((r) => r.gate)?.gate || state.config.team.gate || envFor(lf.root)?.testCommand || "";
+      const going = s.runs.some((r) => r.status === "running");
+      if (smoke && going) ctx.ui.notify("A team run may still be going here: no smoke check now (it could leave files in the checkout that run needs clean).", "info");
+      if (smoke && !going) {
+        const secs = Math.min(300, state.config.team.gateTimeoutSec);
+        ctx.ui.notify(`Running the smoke check \`${smoke}\` (up to ${secs}s) before the takeover message...`, "info");
+        const r = await runShell(smoke, lf.root, secs, undefined, gateEnv(lf.root));
+        facts.smoke = { command: smoke, ok: r.code === 0, timedOut: r.timedOut, tail: clip(r.output.trim().split("\n").slice(-15).join("\n"), 1500) };
+      }
+      try {
+        const d = await dirtyFiles(lf.root);
+        facts.uncommittedNow = [...d.tracked, ...d.untracked];
+      } catch {
+        /* not a git checkout any more */
+      }
+      const ledger = readLedger(ledgerFor(lf.root));
+      if (ledger.length) facts.ledger = ledgerBlock(ledger);
+      const message = continuationMessage(s, Date.now(), facts);
       // Terminal or pi-web: let the person read it before sending. Other clients may ignore the editor text.
       if (ctx.mode === "tui" || (ctx.hasUI && piWebLiveness())) {
         ctx.ui.setEditorText(message);
@@ -1837,6 +2198,10 @@ export default function piTeamKit(pi: ExtensionAPI) {
     pendingWakeHops: undefined as number | undefined,
     /** When this lead last messaged each other lead: telling them first unlocks a file they changed. */
     told: new Map<string, number>(),
+    /** When an update request last reached this lead, and when it last set its status: an answer to an update
+     *  without a status change since gets a reminder. */
+    updateAskedAt: 0,
+    statusSetAt: 0,
     timer: undefined as ReturnType<typeof setInterval> | undefined,
     lastBeat: 0,
     ctx: undefined as ExtensionContext | undefined,
@@ -1901,6 +2266,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     }
   };
   const setLeadStatus = (s: string) => {
+    lb.statusSetAt = Date.now();
     lb.status = s.replace(/\s+/g, " ").trim().slice(0, MAX_STATUS);
     beat();
   };
@@ -1956,6 +2322,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
       }
       failedDeliveries = 0;
       ackInbox(box.files);
+      markDelivered(lb.dir, mail.map((m) => m.id)); // the senders see "read"
+      if (mail.some((m) => m.update)) lb.updateAskedAt = Date.now();
       try {
         if (lb.ctx?.hasUI) lb.ctx.ui.notify(`Message from lead ${[...new Set(mail.map((m) => m.from))].join(", ")}: ${mail[mail.length - 1].text.replace(/\s+/g, " ").slice(0, 140)}`, "info");
       } catch {
@@ -1977,15 +2345,33 @@ export default function piTeamKit(pi: ExtensionAPI) {
    * An edit/write target as (its repository, its path there). The file's own repository counts, not the
    * session folder's: a lead started in the home folder works in projects elsewhere.
    */
-  const fileInRepo = (p: unknown): { rel: string; repo: string } | undefined => {
+  const fileInRepo = (p: unknown): { rel: string; repo: string; root: string } | undefined => {
     if (typeof p !== "string") return undefined;
     const abs = resolve(state.cwd, p.replace(/^@/, "").replace(/^~(?=$|[\\/])/, homedir()));
     const root = findRepoRoot(dirname(abs));
     if (!root) return undefined;
     lb.roots.add(root);
     const rel = relative(root, abs);
-    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? { rel: rel.replace(/\\/g, "/"), repo: repoKey(root) } : undefined;
+    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? { rel: rel.replace(/\\/g, "/"), repo: repoKey(root), root } : undefined;
   };
+  /** Leases in force, held by running leads (lib/leases.ts). */
+  const liveLeases = (): Lease[] => {
+    if (!state.config.leads.leases) return [];
+    try {
+      return readLeases(leaseDir(lb.dir), new Set(liveCards().map((c) => c.owner)));
+    } catch {
+      return [];
+    }
+  };
+
+  // A file another lead claimed (leads claim, or its team run) cannot be edited until released: refused, not announced.
+  pi.on("tool_call", async (event) => {
+    if (!lb.name || (event.toolName !== "edit" && event.toolName !== "write")) return;
+    const target = fileInRepo((event.input as { path?: unknown }).path);
+    if (!target) return;
+    const held = leaseConflict(liveLeases(), lb.owner, target.repo, target.rel, checkoutKey(target.root));
+    if (held) return { block: true, reason: `[ptk] ${leaseBlockReason(held, target.rel)}` };
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     lb.ctx = ctx;
@@ -2015,6 +2401,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
           void deliverMail();
           if (Date.now() - lb.lastBeat > 30_000) beat();
           if (++ticks % 5 === 0) warnTwins();
+          if (idleWatch.size) checkIdleWatch();
         } catch {
           /* never let a bad card or file take down the process (pi-web hosts every session in it) */
         }
@@ -2022,6 +2409,23 @@ export default function piTeamKit(pi: ExtensionAPI) {
       lb.timer.unref?.();
     }
   });
+
+  // leads await: one message when another lead goes idle (or stops running), so nobody polls it in a loop.
+  const idleWatch = new Map<string, number>();
+  const checkIdleWatch = () => {
+    for (const [who, since] of idleWatch) {
+      const c = readCard(lb.dir, who);
+      const gone = !c || Date.now() - Date.parse(c.updatedAt) > 120_000;
+      if (!gone && c!.working && Date.now() - since < 12 * 3_600_000) continue;
+      idleWatch.delete(who);
+      const content = gone ? `[ptk] Lead ${who}, which you were waiting for, is no longer running.` : `[ptk] Lead ${who} has gone idle (status: ${c!.status || "none"}). You asked to be told (leads await).`;
+      try {
+        pi.sendMessage({ customType: "ptk-lead-idle", content, display: true }, { deliverAs: "steer", triggerTurn: true });
+      } catch {
+        /* the session is going away */
+      }
+    }
+  };
 
   // One conversation open in two places (a terminal and the browser, or two terminals): each keeps its own
   // copy and both append to the same session file. Said on both sides, once per other window.
@@ -2058,6 +2462,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (lb.name) {
       try {
         removeCard(lb.dir, lb.name, lb.owner); // unread mail stays for the next session with this name
+        removeLeases(leaseDir(lb.dir), lb.owner); // a lease holds only while its session runs; this one is gone
       } catch {
         /* ignore */
       }
@@ -2127,8 +2532,8 @@ export default function piTeamKit(pi: ExtensionAPI) {
     );
     return out;
   };
-  const shellRoots = (command: string, others: LeadCard[]): string[] => {
-    const shared = new Set(others.flatMap((c) => [c.repo, ...c.files.map((f) => f.repo ?? c.repo)]).filter(Boolean));
+  const shellRoots = (command: string, others: LeadCard[], leases: Lease[]): string[] => {
+    const shared = new Set([...others.flatMap((c) => [c.repo, ...c.files.map((f) => f.repo ?? c.repo)]), ...leases.filter((l) => l.owner !== lb.owner).map((l) => l.repo)].filter(Boolean));
     const named: string[] = [];
     for (const p of pathsInCommand(command)) {
       const abs = resolve(state.cwd, p.replace(/^~(?=$|[\\/])/, homedir()));
@@ -2150,7 +2555,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
     if (!lb.name) return;
     const others = liveCards().filter((c) => c.owner !== lb.owner);
     if (!others.length) return;
-    const roots = shellRoots(String((event.input as { command?: unknown }).command ?? ""), others);
+    const roots = shellRoots(String((event.input as { command?: unknown }).command ?? ""), others, liveLeases());
     if (!roots.length) return;
     if (shellSnaps.size > 20) shellSnaps.clear(); // calls another handler blocked never get a result
     const started = Date.now();
@@ -2165,7 +2570,9 @@ export default function piTeamKit(pi: ExtensionAPI) {
     const after = await snapshotAll([...before.roots.keys()]);
     const now = Date.now();
     const cards = liveCards();
+    const leases = liveLeases();
     const clash = new Map<string, string[]>();
+    const claimed: string[] = [];
     let changed = 0;
     for (const [root, snap] of before.roots) {
       const later = after.get(root);
@@ -2176,14 +2583,19 @@ export default function piTeamKit(pi: ExtensionAPI) {
       for (const f of changedBetween(snap, later, (rel) => fileState(root, rel))) {
         if (theirs(f)) continue;
         changed++;
+        const held = leaseConflict(leases, lb.owner, key, f, checkoutKey(root));
+        if (held && claimed.length < 10) claimed.push(`${f} (claimed by lead ${held.lead}${held.kind === "team-run" ? " for its team run" : ""})`);
         for (const c of overlaps(cards, lb.name, key, f, now)) if (now - (lb.told.get(c.name) ?? 0) > OVERLAP_MS) clash.set(c.name, [...(clash.get(c.name) ?? []), f]);
         lb.files = recordFile(lb.files, f, now, key);
       }
     }
     if (changed) beat();
-    if (!clash.size) return;
+    const claimNote = claimed.length
+      ? `[ptk] This command changed files another lead holds: ${claimed.join(", ")}. Put them back now (git checkout -- <file>, or remove a new one), then ask that lead with leads send; do not change claimed files with shell commands.`
+      : "";
+    if (!clash.size) return claimNote ? { content: [...event.content, { type: "text" as const, text: `\n\n${claimNote}` }] } : undefined;
     const names = [...clash.keys()].join(", ");
-    const note = `Note: this command changed ${[...clash].map(([n, fs]) => `${fs.slice(0, 5).join(", ")} (changed by lead ${n} in the last 30 minutes)`).join("; ")}. Tell ${names} now with the leads tool: what you changed and why, update=true if they must adjust.`;
+    const note = (claimNote ? `${claimNote}\n` : "") + `Note: this command changed ${[...clash].map(([n, fs]) => `${fs.slice(0, 5).join(", ")} (changed by lead ${n} in the last 30 minutes)`).join("; ")}. Tell ${names} now with the leads tool: what you changed and why, update=true if they must adjust.`;
     return { content: [...event.content, { type: "text" as const, text: `\n\n${note}` }] };
   });
 
@@ -2192,11 +2604,20 @@ export default function piTeamKit(pi: ExtensionAPI) {
       name: "leads",
       label: "Leads",
       description:
-        'Talk to the other lead sessions on this machine: pi sessions working on related tasks, in this repo or another. list: who is running, where, and their status. status: set the one line others see about you. send: tell another lead (or "all") what you changed; update=true asks them to check the impact and update their code, docs and status now (an idle session is woken for it).',
-      promptSnippet: "See the other lead sessions and tell them what you changed",
+        'Talk to the other lead sessions on this machine: pi sessions working on related tasks, in this repo or another. list: who is running, where, their status, claimed files, and what happened to your recent messages (read, answered). status: set the one line others see about you. send: tell another lead (or "all") what you changed; update=true asks them to check the impact and update their code, docs and status now (an idle session is woken for it); re=<id> answers a message you received (its id is shown with it). ' +
+        "claim: before changing files another lead may change too, claim them (paths, text = why, minutes): their edits of those files are refused until you release them or the claim expires. release: give claimed files back (all of them when paths is left out) as soon as you are done. " +
+        "await: be told once when another lead (to) finishes its current work and goes idle, instead of asking it repeatedly. " +
+        "task: put a task of yours on the board (text = the task, after = ids of other leads' tasks it waits for): when what it waits for is done, you are told at once. done: mark your task done (id, text = what was done); leads whose tasks waited for it are told and woken.",
+      promptSnippet: "See the other lead sessions, claim files, share tasks that wait on each other, and tell them what you changed",
       parameters: Type.Object({
-        action: StringEnum(["list", "status", "send"] as const),
-        text: Type.Optional(Type.String({ description: "status: your new one-line status. send: what changed and where, in one or two lines" })),
+        action: StringEnum(["list", "status", "send", "claim", "release", "await", "task", "done"] as const),
+        re: Type.Optional(Type.String({ description: "send: the id of the message you are answering" })),
+        id: Type.Optional(Type.String({ description: "done: the id of your task" })),
+        after: Type.Optional(Type.Array(Type.String(), { description: "task: ids of tasks (any lead's, from leads list) this one waits for" })),
+        text: Type.Optional(Type.String({ description: "status: your new one-line status. send: what changed and where, in one or two lines. claim: why, in a few words" })),
+        paths: Type.Optional(Type.Array(Type.String(), { description: "claim/release: files or globs, relative to the repository root (or absolute)" })),
+        minutes: Type.Optional(Type.Number({ description: `claim: how long, default ${DEFAULT_LEASE_MIN}, at most ${MAX_LEASE_MIN}` })),
+        repo: Type.Optional(Type.String({ description: "claim/release: the repository, when this session runs outside it" })),
         to: Type.Optional(Type.String({ description: 'send: a lead name from list, or "all"' })),
         update: Type.Optional(Type.Boolean({ description: "send: ask them to update their code, docs and status now" })),
       }),
@@ -2204,8 +2625,79 @@ export default function piTeamKit(pi: ExtensionAPI) {
         if (role !== "lead") throw new Error("only lead sessions use the board; report to your lead instead");
         if (!boardOn() || !lb.name) throw new Error("the lead board is off here (leads.enabled in ptk.json, a subagent session, or the home directory is not writable)");
         const now = Date.now();
-        if (params.action === "list")
-          return text(`${formatBoard(liveCards(), lb.name, now, homedir())}\n\nRecent messages:\n${formatLog(readLog(lb.dir, 8), lb.name)}`);
+        if (params.action === "list") {
+          const leases = liveLeases();
+          const claims = leases.length ? `\n\nClaimed files (edits by other leads are refused):\n${leases.map((l) => `- ${formatLease(l)}${l.owner === lb.owner ? " (yours)" : ""}`).join("\n")}` : "";
+          const tasks = readTasks(lb.dir);
+          return text(
+            `${formatBoard(liveCards(), lb.name, now, homedir())}${claims}${tasks.length ? `\n\nTasks (ready = waits for nothing open):\n${formatTasks(tasks, lb.name)}` : ""}\n\nYour recent messages:\n${formatReceipts(sentReceipts(lb.dir, lb.name, 8), now)}\n\nRecent messages on the board:\n${formatLog(readLog(lb.dir, 8), lb.name)}`,
+          );
+        }
+        if (params.action === "task") {
+          const t = addTask(lb.dir, { title: params.text ?? "", lead: lb.name, after: params.after ?? [] }, now);
+          const st = taskState(t, readTasks(lb.dir));
+          return text(`Task [${t.id}] is on the board: ${t.title} - ${st}.${st === "waiting" ? " You will be told (and woken if idle) when what it waits for is done; meanwhile do something else." : ""} Mark it done with leads done id=${t.id}; other leads can wait for it with after=[${t.id}].`);
+        }
+        if (params.action === "done") {
+          if (!params.id?.trim()) throw new Error("id: the id of your task (leads list)");
+          const { task, ready } = finishTask(lb.dir, params.id, lb.name, params.text ?? "", now);
+          const told: string[] = [];
+          const mine: string[] = [];
+          for (const r of ready) {
+            if (r.lead === lb.name) {
+              mine.push(`${r.id} "${r.title}"`);
+              continue;
+            }
+            try {
+              sendMessage(lb.dir, { from: lb.name, to: r.lead, text: readyMessage(task, r), update: true, hops: lb.turnHops, known: true }, now);
+              told.push(`${r.lead} (task ${r.id})`);
+            } catch (error) {
+              told.push(`${r.lead}: not told (${(error as Error).message})`);
+            }
+          }
+          try {
+            pruneTasks(lb.dir, now);
+          } catch {
+            /* ignore */
+          }
+          return text(`Task ${task.id} is done.${told.length ? ` Told: ${told.join(", ")}.` : ""}${mine.length ? ` Your own task(s) ${mine.join(", ")} can start now.` : ""}`);
+        }
+        if (params.action === "await") {
+          const who = params.to?.trim() ?? "";
+          if (!validName(who) || who === lb.name) throw new Error("to: the name of another running lead (leads list)");
+          const c = readCard(lb.dir, who);
+          if (!c || Date.now() - Date.parse(c.updatedAt) > 120_000) throw new Error(`lead ${who} is not running`);
+          if (!c.working) return text(`Lead ${who} is idle already (status: ${c.status || "none"}).`);
+          idleWatch.set(who, now);
+          return text(`You will get one message when lead ${who} goes idle (or stops running). Carry on meanwhile; do not poll it.`);
+        }
+        if (params.action === "claim" || params.action === "release") {
+          if (!state.config.leads.leases) throw new Error("file claims are off here (leads.leases in ptk.json)");
+          const root = params.repo?.trim() ? findRepoRoot(resolve(state.cwd, params.repo.trim().replace(/^~(?=$|[\\/])/, homedir()))) : (lb.root ?? lastTeamRepo);
+          if (!root) throw new Error("say which repository: repo = its path (this session is not inside one)");
+          const key = repoKey(root);
+          const rels = (params.paths ?? []).map((p) => {
+            const raw = p.trim().replace(/^@/, "");
+            return isAbsolute(raw) ? relative(root, raw).replace(/\\/g, "/") : raw;
+          });
+          const dir = leaseDir(lb.dir);
+          if (params.action === "release") {
+            const n = removeLeases(dir, lb.owner, (l) => l.kind === "claim" && l.repo === key && (!rels.length || l.paths.some((a) => rels.some((b) => patternsOverlap(a, b)))));
+            return text(n ? `Released ${n} claim(s) in ${root}.` : "You hold no matching claim.");
+          }
+          const lease = newLease({ owner: lb.owner, lead: lb.name, repo: key, paths: rels, reason: (params.text ?? "").trim().slice(0, 200), kind: "claim" }, params.minutes ?? DEFAULT_LEASE_MIN, now);
+          const conflictMsg = (held: Lease[]) => `Already claimed by another lead:\n${held.map((l) => `- ${formatLease(l)}`).join("\n")}\nAsk them with leads send (update=true) to release those files or to make your change.`;
+          const held = claimConflicts(liveLeases(), lb.owner, key, lease.paths, checkoutKey(root));
+          if (held.length) throw new Error(conflictMsg(held));
+          writeLease(dir, lease);
+          // Two leads claiming at the same moment: the earlier claim wins, the later one takes its own back.
+          const raced = claimConflicts(liveLeases(), lb.owner, key, lease.paths, checkoutKey(root)).filter((l) => l.at < lease.at || (l.at === lease.at && l.id < lease.id));
+          if (raced.length) {
+            removeLeases(dir, lb.owner, (l) => l.id === lease.id);
+            throw new Error(conflictMsg(raced));
+          }
+          return text(`Claimed ${lease.paths.join(", ")} in ${root} for ${Math.round((Date.parse(lease.until) - now) / 60_000)} minutes. Other leads' edits of these files are refused until you release them (leads release) or the claim expires: release them as soon as you are done.`);
+        }
         if (params.action === "status") {
           if (!params.text?.trim()) throw new Error("text is required: one line on what you are doing or what is done");
           setLeadStatus(params.text);
@@ -2213,10 +2705,48 @@ export default function piTeamKit(pi: ExtensionAPI) {
         }
         if (!params.to?.trim()) throw new Error('to is required: a lead name from leads list, or "all"');
         const update = params.update === true;
-        const r = sendMessage(lb.dir, { from: lb.name, to: params.to.trim(), text: params.text ?? "", update, hops: lb.turnHops }, now);
+        const r = sendMessage(lb.dir, { from: lb.name, to: params.to.trim(), text: params.text ?? "", update, hops: lb.turnHops, re: params.re }, now);
         for (const n of [...r.delivered, ...r.offline]) lb.told.set(n, now);
         const chain = update && r.delivered.length && lb.turnHops >= MAX_WAKE_HOPS ? " This reply chain is long enough, so idle leads are not woken; they see it on their next turn." : "";
-        return text(`${sendSummary(r)}${chain}`);
+        // Asked to update, answering, but the one line others see about this lead is unchanged since the request.
+        const stale = params.re && lb.updateAskedAt && lb.statusSetAt < lb.updateAskedAt ? ` Your status still says "${lb.status || "(none)"}": if this changed what you are doing, set it now with leads status.` : "";
+        return text(`${sendSummary(r)}${chain}${stale}`);
+      },
+    });
+
+  // ---------- the decision ledger (lib/ledger.ts): decisions and failed approaches, handed down to every worker ----------
+  if (!isChildProcess)
+    pi.registerTool({
+      name: "ledger",
+      label: "Ledger",
+      description:
+        "The decision ledger of a repository: shared by every lead session on it and given word for word to every planner, worker and verifier of its team runs. " +
+        "add: record a decision the user or you made (kind decision), an approach that was tried and did not work (kind tried), or a rule that holds here (kind rule); one line each. " +
+        "drop: remove an entry by id once it no longer holds. list: show it.",
+      promptSnippet: "Record decisions and failed approaches so workers and later sessions neither reopen nor retry them",
+      promptGuidelines: [
+        "When the user decides something, rejects an approach, or an approach was tried and failed, record it at once with ledger add (one line): workers and later lead sessions learn it only from there.",
+      ],
+      parameters: Type.Object({
+        action: StringEnum(["add", "drop", "list"] as const),
+        kind: Type.Optional(StringEnum(["decision", "tried", "rule"] as const)),
+        text: Type.Optional(Type.String({ description: "add: one line, under 240 characters: the decision itself, not the discussion" })),
+        why: Type.Optional(Type.String({ description: "add: why, in a few words" })),
+        id: Type.Optional(Type.String({ description: "drop: the entry's id. add: an existing id to replace that entry" })),
+        repo: Type.Optional(Type.String({ description: "the repository, when this session runs outside it" })),
+      }),
+      async execute(_id, params) {
+        if (role !== "lead") throw new Error("only lead sessions keep the ledger; tell your lead instead");
+        const root = params.repo?.trim() ? findRepoRoot(resolve(state.cwd, params.repo.trim().replace(/^~(?=$|[\\/])/, homedir()))) : workRepo(state.cwd);
+        if (!root) throw new Error("say which repository: repo = its path (this session is not inside one)");
+        const dir = ledgerFor(root);
+        if (params.action === "list") return text(`Ledger of ${root}:\n${formatLedger(readLedger(dir))}`);
+        if (params.action === "drop") {
+          if (!params.id?.trim()) throw new Error("id is required (ledger list shows them)");
+          return text(dropEntry(dir, params.id) ? `Dropped ${params.id}.` : `No entry ${params.id} (ledger list shows the ids).`);
+        }
+        const e = addEntry(dir, { kind: (params.kind ?? "decision") as LedgerKind, text: params.text ?? "", why: params.why, id: params.id, by: lb.name || "lead" });
+        return text(`Recorded [${e.id}] ${e.kind}: ${e.text}\nEvery planner, worker and verifier of the next team run in ${root} gets it, and so does every lead session there.`);
       },
     });
 
