@@ -161,6 +161,15 @@ test("merge queue: a lane whose gate fails on the combined code is not merged, a
   assert.deepEqual(result.integration.merged, ["docs"]);
 });
 
+test("security: a run folder a shell could read as code never reaches the merge command", async () => {
+  for (const bad of ["/runs/$(touch /tmp/pwned)", "/runs/`id`", '/runs/a" && rm -rf / && "', "/runs/%PATH%"]) {
+    const { result, calls } = await run({ lanes: planLanes([task("a", ["a.py"])], Infinity, false) }, (key) => (key === "a-work" ? { artifactPaths: [bad] } : {}));
+    assert.ok(!calls.some((c) => c.key === "a-merge"), bad);
+    assert.equal(result.lanes[0].merged, false);
+    assert.match(result.lanes[0].mergeError, /no usable run folder/);
+  }
+});
+
 test("without the merge queue nothing is merged in the run and the result says to integrate as before", async () => {
   const { result, calls } = await run({ integration: undefined, lanes: planLanes([task("a", ["a.py"])]) });
   assert.ok(!calls.some((c) => c.key.endsWith("-merge")));

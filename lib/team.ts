@@ -817,7 +817,7 @@ function queueMerge(lane, r) {
 }
 function mergeLane(lane, r) {
   // Only paths pi-subagents and the extension wrote reach the command, and only when no shell could read them as code.
-  if (!r.runDir || /["%!\r\n]/.test(r.runDir + INT.script + INT.dir)) { r.merged = false; r.mergeError = "no usable run folder to merge from"; return r; }
+  if (!r.runDir || /["%!\r\n$\`]/.test(r.runDir + INT.script + INT.dir)) { r.merged = false; r.mergeError = "no usable run folder to merge from"; return r; }
   var gate = !GATE ? "" : /\|\||;/.test(GATE.command) ? "(" + GATE.command + ")" : GATE.command;
   var command = "node " + q(INT.script) + " " + q(r.runDir + "/handoff.json") + " " + lane.key + (gate ? " && " + gate : "") +
     " && git -c user.name=pi-team-kit -c user.email=pi-team-kit@localhost commit -q --no-verify --allow-empty -m " + q("ptk: " + lane.key);

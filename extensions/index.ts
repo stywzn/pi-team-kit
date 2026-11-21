@@ -1365,7 +1365,7 @@ export default function piTeamKit(pi: ExtensionAPI) {
         }
         // The merge queue's run branch and worktree: its lanes are in the checkout now.
         const int = openRun?.integration;
-        if (int && /^ptk\/run-[a-z0-9]+$/.test(int.branch)) {
+        if (int && /^ptk\/run-[a-z0-9]+$/.test(int.branch) && resolve(int.dir).startsWith(join(tmpdir(), "ptk-integration"))) {
           const w = existsSync(int.dir) ? await pi.exec("git", ["worktree", "remove", "--force", int.dir], { cwd: root, timeout: 30_000 }) : { code: 0, stderr: "", stdout: "" };
           if (w.code === 0) {
             await pi.exec("git", ["branch", "-D", int.branch], { cwd: root, timeout: 30_000 });
