@@ -73,3 +73,18 @@ test("acronym check on a long reply is cheap", () => {
   const ms = avgMs(() => unexplainedAcronyms(reply), 50);
   assert.ok(ms < 20, `acronym check took ${ms.toFixed(2)} ms`);
 });
+
+test("the worker watch adds almost nothing to a tool call", async () => {
+  const { WorkerWatch, DEFAULT_WATCH, isReadOnlyCommand } = await import("../lib/progress.ts");
+  const w = new WorkerWatch(DEFAULT_WATCH, ["src/**", "tests/test_api.py"]);
+  let i = 0;
+  const ms = avgMs(() => {
+    const cmd = COMMANDS[i++ % COMMANDS.length];
+    w.before("bash", { command: cmd });
+    w.after("bash", { command: cmd }, i % 5 === 0, "FAILED tests/test_api.py::test_x - AssertionError: 1 != 2\n".repeat(20));
+    w.before("edit", {}, "src/app/main.py");
+    w.after("edit", {}, false, "ok");
+  }, 2000);
+  assert.ok(ms < 0.5, `four watch checks took ${ms.toFixed(3)} ms`);
+  assert.ok(avgMs(() => isReadOnlyCommand("cd app && rg -n parse src | head -20 && git log --oneline -5"), 2000) < 0.1);
+});
