@@ -681,14 +681,6 @@ if (!lanes.length) {
   var p = await settle("plan", runs.run("plan", withModel({ agent: PLAN.plannerAgent, label: "Plan the team run", task: planTask(), outputSchema: PLAN_SCHEMA }, "planner")));
   var out = p.structuredOutput || {};
   var tasks = cleanTasks(out.tasks);
-  // The same checks team_run makes on the lead's tasks: one round to fix them, then the plan goes ahead as it is.
-  var issues = tasks.length ? planProblems(tasks) : [];
-  if (issues.length) {
-    var p2 = await settle("plan-fix", runs.run("plan-fix", withModel({ agent: PLAN.plannerAgent, label: "Fix the plan", task: planTask() +
-      "\n\nYour previous plan:\n" + clip(JSON.stringify(out), 12000) + "\n\nFix these problems and return the whole plan again:\n- " + issues.join("\n- "), outputSchema: PLAN_SCHEMA }, "planner")));
-    var fixed = p2.structuredOutput && cleanTasks(p2.structuredOutput.tasks);
-    if (fixed && fixed.length) { out = p2.structuredOutput; tasks = fixed; issues = planProblems(tasks); }
-  }
   PLAN.constraints = (PLAN.constraints || []).concat(strings(out.constraints, 10));
   if (!tasks.length) {
     return { goal: PLAN.goal, state: "needs-input", questions: out.questions || [], notes: out.notes || p.error || "planner returned no tasks", lanes: [] };
@@ -696,6 +688,14 @@ if (!lanes.length) {
   if (tasks.length > PLAN.maxTasks) {
     // Never cut silently: hand the plan back so the lead can merge tasks or split the goal into two runs.
     return { goal: PLAN.goal, state: "needs-input", questions: ["The planner proposed " + tasks.length + " tasks; the limit is " + PLAN.maxTasks + ". Merge small tasks, or split the goal into two runs, then call team_run with tasks."], notes: out.notes || "", plan: { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }) }, lanes: [] };
+  }
+  // The same checks team_run makes on the lead's tasks: one round to fix them, then the plan goes ahead as it is.
+  var issues = tasks.length ? planProblems(tasks) : [];
+  if (issues.length) {
+    var p2 = await settle("plan-fix", runs.run("plan-fix", withModel({ agent: PLAN.plannerAgent, label: "Fix the plan", task: planTask() +
+      "\n\nYour previous plan:\n" + clip(JSON.stringify(out), 12000) + "\n\nFix these problems and return the whole plan again:\n- " + issues.join("\n- "), outputSchema: PLAN_SCHEMA }, "planner")));
+    var fixed = p2.structuredOutput && cleanTasks(p2.structuredOutput.tasks);
+    if (fixed && fixed.length && fixed.length <= PLAN.maxTasks) { out = p2.structuredOutput; tasks = fixed; issues = planProblems(tasks); strings(out.constraints, 10).forEach(function (c) { if (PLAN.constraints.indexOf(c) < 0) PLAN.constraints.push(c); }); }
   }
   lanes = lanesFor(tasks);
   planned = { tasks: tasks.map(function (t) { return { key: t.key, title: t.title, files: t.files }; }), questions: out.questions || [], notes: out.notes || "" };
